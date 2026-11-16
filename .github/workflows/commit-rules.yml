@@ -1,0 +1,28 @@
+name: Commit rules
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  commit-rules:
+    name: Commit rules and public clean
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the PR range needs full history
+
+      - name: No co-author lines in the PR range
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: bash scripts/check-commits.sh "origin/$BASE_REF..HEAD"
+
+      # Decision 11: patterns live only in the secret, never in public code.
+      # The script fails closed when the secret is missing.
+      - name: No private names in tracked files
+        env:
+          DMUX_PRIVATE_PATTERNS: ${{ secrets.PRIVATE_NAME_PATTERNS }}
+        run: bash scripts/check-public-clean.sh

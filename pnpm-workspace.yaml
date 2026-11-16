@@ -1,0 +1,8 @@
+# pnpm settings (pnpm 12 reads them here, not from package.json).
+# Explicitly reviewed build scripts: esbuild's binary check and the
+# WebDriver binary downloaders used by WebdriverIO. Everything else is
+# denied by default (strictDepBuilds).
+allowBuilds:
+  edgedriver: true
+  esbuild: true
+  geckodriver: true

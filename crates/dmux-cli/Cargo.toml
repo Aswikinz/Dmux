@@ -1,0 +1,12 @@
+[package]
+name = "dmux-cli"
+description = "Dmux command-line runner: capture, compare, run (Phase 0 skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dmux"
+path = "src/main.rs"
+
+[dependencies]
