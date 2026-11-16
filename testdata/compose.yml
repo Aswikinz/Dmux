@@ -1,0 +1,88 @@
+# Dmux mock databases, for rootless Podman.
+#
+#   podman compose -f testdata/compose.yml up -d                    # old 9.6 + new 17
+#   podman compose -f testdata/compose.yml --profile matrix up -d   # adds 9.4, 12, 15, 18
+#   podman compose -f testdata/compose.yml down -v                  # stop and wipe
+#
+# Every port is bound to 127.0.0.1, so nothing is reachable from the network.
+# The password is for these throwaway containers only. Old Postgres images
+# (9.4, 9.6) no longer get security fixes: never expose them or load real data.
+
+x-common: &common
+  restart: "no"
+  shm_size: 256mb
+  environment: &env
+    POSTGRES_USER: dmux_dev
+    POSTGRES_PASSWORD: dmux_dev_only
+    POSTGRES_DB: bank
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U dmux_dev -d bank"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+services:
+  # Old database: Postgres 9.6, LATIN1 encoding, C sort order.
+  # The different encoding and sort order from "new" are deliberate (PLAN.md 2.1).
+  old:
+    <<: *common
+    image: docker.io/library/postgres:9.6
+    container_name: dmux-old
+    environment:
+      <<: *env
+      POSTGRES_INITDB_ARGS: "--encoding=LATIN1 --locale=C"
+    ports: ["127.0.0.1:5433:5432"]
+    volumes: ["dmux-old:/var/lib/postgresql/data"]
+
+  # New database: Postgres 17, UTF-8, the image's default locale.
+  new:
+    <<: *common
+    image: docker.io/library/postgres:17
+    container_name: dmux-new
+    ports: ["127.0.0.1:5434:5432"]
+    volumes: ["dmux-new:/var/lib/postgresql/data"]
+
+  # Version matrix (Phase 0 and nightly-style checks).
+  old94:
+    <<: *common
+    profiles: ["matrix"]
+    image: docker.io/library/postgres:9.4
+    container_name: dmux-old94
+    environment:
+      <<: *env
+      POSTGRES_INITDB_ARGS: "--encoding=LATIN1 --locale=C"
+    ports: ["127.0.0.1:5435:5432"]
+    volumes: ["dmux-old94:/var/lib/postgresql/data"]
+
+  new12:
+    <<: *common
+    profiles: ["matrix"]
+    image: docker.io/library/postgres:12
+    container_name: dmux-new12
+    ports: ["127.0.0.1:5436:5432"]
+    volumes: ["dmux-new12:/var/lib/postgresql/data"]
+
+  new15:
+    <<: *common
+    profiles: ["matrix"]
+    image: docker.io/library/postgres:15
+    container_name: dmux-new15
+    ports: ["127.0.0.1:5438:5432"]
+    volumes: ["dmux-new15:/var/lib/postgresql/data"]
+
+  new18:
+    <<: *common
+    profiles: ["matrix"]
+    image: docker.io/library/postgres:18
+    container_name: dmux-new18
+    ports: ["127.0.0.1:5437:5432"]
+    # Postgres 18 images keep their data one level up.
+    volumes: ["dmux-new18:/var/lib/postgresql"]
+
+volumes:
+  dmux-old:
+  dmux-new:
+  dmux-old94:
+  dmux-new12:
+  dmux-new15:
+  dmux-new18:
