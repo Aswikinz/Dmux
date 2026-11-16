@@ -298,4 +298,24 @@ jobs:
         timeout-minutes: 15
         env:
           DMUX_APP_BINARY: target/release/dmux-app.exe
-        run: pnpm test:e2e
+        shell: pwsh
+        # WHY gsudo: the runner's Evergreen WebView2 Runtime (156 on the
+        # 2026-11 windows-2025 image) ignores WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+        # in ELEVATED processes from runtime 150 on — a security hardening,
+        # by design, no upstream fix coming (MicrosoftEdge/WebView2Feedback#5645,
+        # tauri-apps/wry#1782). msedgedriver hands the app its
+        # --remote-debugging-port through exactly that variable, and the runner
+        # shell is elevated (runneradmin, no split token), so the DevTools port
+        # never opens: "session not created: DevToolsActivePort file doesn't
+        # exist". Driver and runtime versions already match — the service reads
+        # the installed runtime from the registry ("source: evergreen") — so
+        # installing or updating the runtime cannot fix this. Run the suite at
+        # MEDIUM integrity instead, as Tauri's own CI does (green on this same
+        # image and runtime 156.0.4314.58); icacls lets the de-elevated process
+        # write the workspace (the app's WebView2 user-data folder is created
+        # next to the exe under target/). Environment alignment only: the smoke
+        # assertions, timeout and gate are unchanged.
+        run: |
+          winget install gerardog.gsudo --version 2.6.1 --accept-source-agreements --accept-package-agreements
+          icacls "$env:GITHUB_WORKSPACE" /grant "Everyone:(OI)(CI)F"
+          sudo --integrity Medium pnpm test:e2e
