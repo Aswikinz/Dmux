@@ -1,0 +1,20 @@
+# Decisions log
+
+Maya adds one entry per decision: what was decided and why, in two lines. Agents read
+this before starting and do not reopen a decision without the owner.
+
+| # | Date | Decision | Why |
+|---|------|----------|-----|
+| 1 | 2026-11-16 | The tool is named Dmux. | Owner's choice. Another open-source tool shares the name, so the app ID and package names must be distinct (for example `dmux-verify`). |
+| 2 | 2026-11-16 | Fingerprints use order-independent bucket sums, not chunks ordered by key. | Servers sort text differently, so ordered chunks give false failures. PLAN.md section 3. |
+| 3 | 2026-11-16 | Bucket sums add four 32-bit slices of each row's md5; XOR is not used. | XOR cancels pairs of duplicate rows. Proven in `testdata/phase0/prove.sh`. |
+| 4 | 2026-11-16 | Every value is converted to UTF-8 before hashing; floats and binary are hashed from bytes. | Encodings and printed forms differ between servers and versions. |
+| 5 | 2026-11-16 | Test databases run in rootless Podman, not Docker. | Owner's choice. |
+| 6 | 2026-11-16 | One Git worktree per task; only Maya commits; commits carry the owner's identity with no co-author lines. | Owner's choice; lets up to three agents build at once without clashing. |
+| 7 | 2026-11-16 | UI tests run in a browser with the engine mocked; only a small smoke test drives the real app, through `tauri-driver`. | Playwright cannot drive the Linux webview Tauri uses. |
+| 8 | 2026-11-16 | The comparison core is built by `arjun-core` on the stronger model and reviewed by both Daniel and Priya. | It is most of the risk of a false PASS. |
+| 9 | 2026-11-16 | Postgres 15 joins the test matrix (task T008); the cross-version set is 9.4, 9.6, 12, 15, 17, 18. | Owner approved: PLAN.md section 8 lists 15 but the compose matrix had only 12/17/18. |
+| 10 | 2026-11-16 | v1 keeps md5 row hashes; the threat model is accidental migration errors, not a malicious operator. | Owner approved after Priya's P2: md5 chosen-prefix collisions are practical but out of scope; every report and "How Dmux decides" states this limit, and the independent DBA review before first real use is the backstop. |
+| 11 | 2026-11-16 | The repo stays public, but no vendor name, product version, dictionary file name or derived detail may appear in any public file or in pushed Git history; scrub and rewrite the unpushed history before the first push (task T009). | Owner: "remove every trace before putting it to public". Public docs say "a core banking system"; the licensed material and its provenance stay in private/ only. A CI guard (patterns held in a GitHub secret, never in public code) blocks re-introduction. |
+| 12 | 2026-11-16 | AGENTS.md is local-only: never committed, never pushed. It is untracked, git-ignored and hook-blocked; wt-new.sh copies it into each task worktree so agents still load the rules. | Owner: "don't add agents.md into github, remove it before sending anything". T009's rewritten history must contain no AGENTS.md blob; SETUP.md describes it as local-only. |
+| 13 | 2026-11-16 | Merge/push approval is delegated to an independent Opus 5.5 review agent (openrouter/anthropic/claude-opus-5.5): Maya consults it at every gate, acts on its feedback, and proceeds on its approval; publication to GitHub requires its final approval of the whole Phase 0 result. | Owner: "don't ask for my permission to merge or anything, ask the opus 5.5 model, take its feedback and continue; once done get opus 5.5 approval and then publish". The owner still receives the T007 gate summary as a report. |

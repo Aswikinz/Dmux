@@ -1,0 +1,27 @@
+# Licensed material: never enters Git (AGENTS.md rule 8)
+private/
+
+# Local-only agent rules: never pushed (owner decision 12)
+AGENTS.md
+
+# Task working copies
+.worktrees/
+
+# Build artifacts
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+coverage/
+
+# End-to-end test artifacts
+.wdio*
+e2e/logs/
+e2e/artifacts/
+
+# Local noise
+*.log
+.DS_Store

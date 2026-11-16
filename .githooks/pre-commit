@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Dmux commit rules (SETUP.md section 4):
+#  - every commit carries the owner's Git identity, nobody else's
+#  - nothing under private/ is ever committed
+#  - AGENTS.md is local-only (owner decision), never committed
+#  - file names matching the locally configured private-name patterns are
+#    refused; the patterns themselves live in Git config, never in this
+#    public file (decision 11)
+set -euo pipefail
+
+NAME="$(git config dmux.ownerName || true)"
+EMAIL="$(git config dmux.ownerEmail || true)"
+if [ -z "$NAME" ] || [ -z "$EMAIL" ]; then
+  echo "commit refused: run scripts/setup-git.sh" >&2
+  exit 1
+fi
+
+IDENT="$(git var GIT_AUTHOR_IDENT)"
+case "$IDENT" in
+  "$NAME <$EMAIL> "*) ;;
+  *) echo "commit refused: author '$IDENT' is not the owner ($NAME <$EMAIL>)" >&2; exit 1 ;;
+esac
+
+# Comma-separated, case-insensitive extended regexes (local config only).
+PATTERNS="$(git config dmux.privateNamePattern || true)"
+ALT=""
+if [ -n "$PATTERNS" ]; then
+  IFS=',' read -ra PARTS <<< "$PATTERNS"
+  for p in "${PARTS[@]}"; do
+    p="$(printf '%s' "$p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$p" ] || continue
+    if [ -n "$ALT" ]; then ALT="$ALT|$p"; else ALT="$p"; fi
+  done
+fi
+
+BAD=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    private/*) echo "commit refused: private file '$f'" >&2; BAD=1 ;;
+    AGENTS.md) echo "commit refused: AGENTS.md is local-only, never committed (owner decision)" >&2; BAD=1 ;;
+  esac
+  if [ -n "$ALT" ] && printf '%s\n' "$(basename "$f")" | grep -qiE -e "$ALT"; then
+    echo "commit refused: private-name file '$f'" >&2; BAD=1
+  fi
+done <<< "$(git diff --cached --name-only --diff-filter=ACMR)"
+[ "$BAD" -eq 0 ] || exit 1
+

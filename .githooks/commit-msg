@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Dmux commit rules (SETUP.md section 4): co-author lines and tool-credit
+# lines are removed from every commit message.
+set -euo pipefail
+MSG="$1"
+sed -i -E '/^[[:space:]]*co-authored-by[[:space:]]*:/Id; /generated with/Id' "$MSG"
+# Trim trailing blank lines the deletions may have left (keep one final newline).
+printf '%s\n' "$(cat "$MSG")" > "$MSG"
