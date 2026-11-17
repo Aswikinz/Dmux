@@ -13,7 +13,11 @@ import type {
   IgnoreItem,
   Inventory,
   Mapping,
+  MappingEdit,
+  MappingItemRef,
   MappingMatch,
+  MappingRule,
+  RulePreview,
   ReportRequest,
   ReportResult,
   Results,
@@ -182,12 +186,152 @@ const makeMapping = (inventory: Inventory): Mapping => {
     });
   });
 
-  return {
+  const mapping: Mapping = {
     rules: ['identity mapping'],
+    ruleSpecs: [],
     matches,
     needsAttention,
     ignored: [],
+    suggestions: [],
+    unmatchedNew: [],
   };
+
+  // A differing inventory also has old tables with no partner, so the screen
+  // can show suggestions, the pairing picker and the duplicate-target refusal.
+  const differs = inventory.schemas.some((sc) =>
+    sc.children?.some((t) => t.status === 'missing'),
+  );
+  if (differs) {
+    const schema = 'demo_bank';
+    const unmatched = (table: string, column?: string): MappingItemRef => ({
+      schema,
+      table,
+      ...(column ? { column } : {}),
+    });
+    for (const table of ['legacy_ledger', 'ledger_old', 'audit_trail']) {
+      const ref = unmatched(table);
+      mapping.needsAttention.push({
+        id: `${schema}.${table}`,
+        oldName: `${schema}.${table}`,
+        newName: '',
+        confidence: 'fuzzy',
+        approved: false,
+        ref,
+      });
+    }
+    mapping.suggestions = [
+      { id: `${schema}.legacy_ledger`, ref: unmatched('legacy_ledger'), candidate: 'ledger_entries', confidence: 82 },
+      { id: `${schema}.ledger_old`, ref: unmatched('ledger_old'), candidate: 'ledger_entries', confidence: 61 },
+    ];
+    mapping.unmatchedNew = ['ledger_entries', 'audit_log', 'customer_notes'].map((table) => ({
+      id: `${schema}.${table}`,
+      ref: unmatched(table),
+    }));
+  }
+  return mapping;
+};
+
+/** Apply edits to a mock mapping with the same refusals the backend makes. */
+const editMockMapping = (mapping: Mapping, edits: MappingEdit[]): Mapping => {
+  let next: Mapping = {
+    ...mapping,
+    matches: [...mapping.matches],
+    needsAttention: [...mapping.needsAttention],
+    ignored: [...mapping.ignored],
+    suggestions: [...(mapping.suggestions ?? [])],
+    unmatchedNew: [...(mapping.unmatchedNew ?? [])],
+  };
+  for (const edit of edits) {
+    if (edit.kind === 'ignore') {
+      if (!edit.reason.trim()) throw new Error('a reason is required to ignore an item');
+      next = {
+        ...next,
+        matches: next.matches.filter((m) => m.id !== edit.path),
+        needsAttention: next.needsAttention.filter((m) => m.id !== edit.path),
+        suggestions: next.suggestions!.filter((x) => x.id !== edit.path),
+        ignored: [
+          ...next.ignored.filter((i) => i.id !== edit.path),
+          { id: edit.path, name: edit.path, reason: edit.reason.trim() },
+        ],
+      };
+    } else if (edit.kind === 'pair_table') {
+      const id = `${edit.schema}.${edit.table}`;
+      const target = `${edit.schema}.${edit.newTable}`;
+      const owner = next.matches.find((m) => m.newName === target && m.id !== id);
+      if (owner) {
+        throw new Error(
+          `${owner.oldName} is already paired with ${target}. Two old tables cannot map to one new table: unpair one of them first.`,
+        );
+      }
+      next = {
+        ...next,
+        matches: [
+          ...next.matches.filter((m) => m.id !== id),
+          {
+            id,
+            oldName: id,
+            newName: target,
+            confidence: 'confirmed',
+            approved: true,
+            ref: { schema: edit.schema, table: edit.table },
+          },
+        ],
+        needsAttention: next.needsAttention.filter((m) => m.id !== id),
+        suggestions: next.suggestions!.filter((x) => x.id !== id),
+        unmatchedNew: next.unmatchedNew!.filter(
+          (u) => !(u.ref.column === undefined && u.ref.table === edit.newTable),
+        ),
+        ignored: next.ignored.filter((i) => i.id !== id),
+      };
+    } else {
+      const id = `${edit.schema}.${edit.table}.${edit.column}`;
+      const owner = next.matches.find(
+        (m) => m.ref?.column !== undefined && m.ref.table === edit.table && m.newName === edit.newColumn && m.id !== id,
+      );
+      if (owner) {
+        throw new Error(
+          `${owner.oldName} is already paired with ${edit.newColumn}. Two old columns cannot map to one new column: unpair one of them first.`,
+        );
+      }
+      next = {
+        ...next,
+        matches: [
+          ...next.matches.filter((m) => m.id !== id),
+          {
+            id,
+            oldName: `${edit.table}.${edit.column}`,
+            newName: edit.newColumn,
+            confidence: 'confirmed',
+            approved: true,
+            ref: { schema: edit.schema, table: edit.table, column: edit.column },
+          },
+        ],
+        needsAttention: next.needsAttention.filter((m) => m.id !== id),
+        suggestions: next.suggestions!.filter((x) => x.id !== id),
+        unmatchedNew: next.unmatchedNew!.filter(
+          (u) => !(u.ref.column === edit.newColumn && u.ref.table === edit.table),
+        ),
+      };
+    }
+  }
+  return next;
+};
+
+/** How the mock counts the tables a rule set would pair. */
+const previewMockRules = (inventory: Inventory | null, rules: MappingRule[]): RulePreview => {
+  const names = (inventory?.schemas ?? []).flatMap((sc) =>
+    (sc.children ?? []).filter((t) => t.status !== 'added').map((t) => ({ schema: sc.name, table: t.name })),
+  );
+  const byRules = names.filter(({ schema, table }) =>
+    rules.some((r) =>
+      r.kind === 'prefix_replace'
+        ? table.startsWith(r.pattern)
+        : r.kind === 'suffix_replace'
+          ? table.endsWith(r.pattern)
+          : schema.toLowerCase() === r.pattern.toLowerCase(),
+    ),
+  ).length;
+  return { tablesTotal: names.length, tablesByRules: byRules, tablesMatched: Math.min(names.length, byRules + 2) };
 };
 
 const makeCheckPlan = (tableCount: number): CheckPlan => {
@@ -202,10 +346,11 @@ const makeCheckPlan = (tableCount: number): CheckPlan => {
     if (hasBalance) controls.push('balance');
     tables.push({
       tableId: deterministicId('tbl', i),
-      schemaName: 'demo_bank',
+      schemaName: i % 10 === 9 ? 'archive' : 'demo_bank',
       tableName: `table_${i.toString().padStart(4, '0')}`,
       level,
-      controlTotalColumns: controls.length ? controls : undefined,
+      controlTotalSuggestions: controls.length ? controls : undefined,
+      sizeBytes: (i + 1) * 3 * 1024 * 1024,
     });
   }
   return {
@@ -544,6 +689,7 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     warning: 'A custom check runs with your full permissions. Only run scripts you trust.',
   };
   let currentRunId = 0;
+  let lastInventory: Inventory | null = null;
   let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
   // the backend's "password lives in the keychain, not in the profile" shape so
@@ -648,7 +794,25 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     },
 
     async buildMapping(inventory: Inventory): Promise<Mapping> {
+      lastInventory = inventory;
       return makeMapping(inventory);
+    },
+
+    async editMapping(mapping: Mapping, edits: MappingEdit[]): Promise<Mapping> {
+      return editMockMapping(mapping, edits);
+    },
+
+    async previewRules(rules: MappingRule[]): Promise<RulePreview> {
+      return previewMockRules(lastInventory, rules);
+    },
+
+    async rebuildMapping(rules: MappingRule[]): Promise<Mapping> {
+      const base = makeMapping(lastInventory ?? baseInventory());
+      return {
+        ...base,
+        rules: rules.map((r) => `${r.kind}: ${r.pattern} -> ${r.target}`),
+        ruleSpecs: rules,
+      };
     },
 
     async saveMapping(mapping: Mapping): Promise<{ hash: string; json: string }> {

@@ -81,7 +81,13 @@ pub struct TableCheckDto {
     pub schema_name: String,
     pub table_name: String,
     pub level: CheckLevel,
+    /// Columns Dmux *suggests* as control totals.  Nothing is checked as a
+    /// control total until the user confirms it (the UI sends only confirmed
+    /// names to `start_run`).
     pub control_total_columns: Option<Vec<String>>,
+    /// The table's size on the old database, in bytes (0 when unknown), so the
+    /// UI can select tables by size.
+    pub size_bytes: i64,
 }
 
 /// The check plan, mirroring the contract's `CheckPlan`.
@@ -232,6 +238,26 @@ fn is_control_total_name(name: &str) -> bool {
         .any(|s| lower.contains(s))
 }
 
+/// Whether a column's type is a number (PLAN 4.4 suggests number columns only:
+/// summing text or dates means nothing).
+fn is_number_type(type_name: &str) -> bool {
+    let t = type_name.trim().to_ascii_lowercase();
+    [
+        "numeric",
+        "decimal",
+        "integer",
+        "int",
+        "bigint",
+        "smallint",
+        "real",
+        "double precision",
+        "float",
+        "money",
+    ]
+    .iter()
+    .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))
+}
+
 /// Build a check plan from two live databases (PLAN 4.4-4.5).  Every level and
 /// estimate comes from the engine's catalogue and estimate module; nothing is
 /// guessed.
@@ -276,7 +302,7 @@ pub async fn build_check_plan(
                 table
                     .columns
                     .iter()
-                    .filter(|c| is_control_total_name(&c.name))
+                    .filter(|c| is_control_total_name(&c.name) && is_number_type(&c.type_name))
                     .map(|c| c.name.clone())
                     .collect()
             } else {
@@ -294,6 +320,7 @@ pub async fn build_check_plan(
                 table_name: table.name.clone(),
                 level: CheckLevel::FullValues,
                 control_total_columns: (!controls.is_empty()).then_some(controls),
+                size_bytes: table.size_bytes.max(0),
             });
             estimate_inputs.push((schema.name.clone(), table.name.clone()));
         }
@@ -1036,6 +1063,31 @@ mod tests {
     }
 
     // --- Pure mapping tests (no server) ---
+
+    #[test]
+    fn only_number_types_are_suggested_as_control_totals() {
+        for t in [
+            "numeric(18,2)",
+            "numeric",
+            "bigint",
+            "integer",
+            "double precision",
+            "money",
+            "real",
+        ] {
+            assert!(is_number_type(t), "{t}");
+        }
+        for t in [
+            "text",
+            "character varying(20)",
+            "date",
+            "timestamp without time zone",
+            "interval",
+            "bytea",
+        ] {
+            assert!(!is_number_type(t), "{t}");
+        }
+    }
 
     #[test]
     fn control_total_names_are_recognised() {

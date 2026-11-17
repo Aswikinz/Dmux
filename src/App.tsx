@@ -268,6 +268,8 @@ function AppShell() {
               mapping={mapping}
               onMappingChange={(m) => {
                 setMapping(m);
+                // A different mapping means a different set of tables to check.
+                setPlan(null);
                 markCompleted('map');
               }}
               onNext={advance}

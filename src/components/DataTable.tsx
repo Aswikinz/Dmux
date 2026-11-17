@@ -6,7 +6,7 @@ import {
   type RowSelectionState,
 } from '@tanstack/react-table';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { cn } from '../design/cn';
 import { Search } from 'lucide-react';
 
@@ -37,13 +37,19 @@ export function DataTable<T extends object>({
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const parentRef = useRef<HTMLDivElement>(null);
 
-  const filteredData = filterFn
-    ? data.filter((row) => filterFn(row, filter.toLowerCase()))
-    : data.filter((row) =>
-        Object.values(row)
-          .filter((v): v is string => typeof v === 'string')
-          .some((v) => v.toLowerCase().includes(filter.toLowerCase())),
-      );
+  // Memoised: a new array on every render looks like new data to the table,
+  // which resets its state and renders again, and so on without end.
+  const filteredData = useMemo(
+    () =>
+      filterFn
+        ? data.filter((row) => filterFn(row, filter.toLowerCase()))
+        : data.filter((row) =>
+            Object.values(row)
+              .filter((v): v is string => typeof v === 'string')
+              .some((v) => v.toLowerCase().includes(filter.toLowerCase())),
+          ),
+    [data, filter, filterFn],
+  );
 
   const table = useReactTable({
     data: filteredData,
