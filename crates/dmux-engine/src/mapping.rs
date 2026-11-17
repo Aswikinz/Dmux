@@ -1,0 +1,665 @@
+//! Mapping between old and new database objects.
+//!
+//! Mappings are built deterministically:
+//!
+//! 1. Apply explicit rules first (schema rename, prefix/suffix rules).
+//! 2. Exact name matches are auto-accepted.
+//! 3. Case-insensitive matches are auto-accepted only when unambiguous; any
+//!    ambiguity lands in the "needs attention" queue.
+//! 4. Fuzzy matches are suggestions only and are **never** auto-accepted; they
+//!    always go to "needs attention" with a confidence score.
+//! 5. Tables or columns can be marked `ignore` with a required reason.
+//!
+//! The exported JSON is versioned and carries a SHA-256 hash of its canonical
+//! form.  Mapping files are treated as untrusted input: they are validated,
+//! size-limited and rejected if they contain unknown fields.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+
+/// Current mapping file format version.
+pub const MAPPING_VERSION: u32 = 1;
+/// Max size for an imported mapping file, in bytes.
+pub const MAX_MAPPING_BYTES: usize = 10 * 1024 * 1024;
+
+/// Errors thrown when loading or validating a mapping.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MappingError {
+    #[error("mapping file too large: {0} bytes")]
+    TooLarge(usize),
+    #[error("JSON parse error: {0}")]
+    Json(String),
+    #[error("unknown fields in mapping: {0:?}")]
+    UnknownFields(Vec<String>),
+    #[error("mapping version {0} is not supported")]
+    UnsupportedVersion(u32),
+    #[error("ignore reason cannot be empty")]
+    EmptyIgnoreReason,
+    #[error("mapping hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+}
+
+/// A saved mapping, serialisable to/from JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Mapping {
+    pub version: u32,
+    pub rules: Vec<Rule>,
+    pub schema_mappings: BTreeMap<String, SchemaMapping>,
+    pub ignored: Vec<IgnoredItem>,
+    pub mapping_hash: String,
+}
+
+impl Mapping {
+    /// Create a new empty mapping with the current version and a fresh hash.
+    pub fn new() -> Self {
+        Self {
+            version: MAPPING_VERSION,
+            rules: Vec::new(),
+            schema_mappings: BTreeMap::new(),
+            ignored: Vec::new(),
+            mapping_hash: String::new(),
+        }
+        .with_fresh_hash()
+    }
+
+    /// Recompute and store the canonical hash.
+    pub fn with_fresh_hash(mut self) -> Self {
+        self.mapping_hash = compute_hash(&self);
+        self
+    }
+
+    /// Serialise to a canonical JSON string (sorted keys, no whitespace).
+    pub fn to_canonical_json(&self) -> Result<String, MappingError> {
+        serde_json::to_string(self).map_err(|e| MappingError::Json(e.to_string()))
+    }
+}
+
+impl Default for Mapping {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A user-specified transformation rule, applied before automatic matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Rule {
+    pub kind: RuleKind,
+    pub pattern: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleKind {
+    SchemaRename,
+    PrefixReplace,
+    SuffixReplace,
+}
+
+/// Per-schema mapping: tables and their columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SchemaMapping {
+    pub target_schema: String,
+    pub table_mappings: BTreeMap<String, TableMapping>,
+}
+
+/// Per-table mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct TableMapping {
+    pub target_table: String,
+    pub status: MappingStatus,
+    pub column_mappings: BTreeMap<String, ColumnMapping>,
+    pub ignored_columns: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingStatus {
+    #[default]
+    Unmapped,
+    Exact,
+    CaseInsensitive,
+    Fuzzy,
+    Ignored,
+}
+
+/// Per-column mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct ColumnMapping {
+    pub target_column: String,
+    pub status: MappingStatus,
+}
+
+/// A deliberately ignored table or column with a required reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IgnoredItem {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Result of running the matching pipeline for one old-new schema pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchResult {
+    /// Items successfully mapped, by old name.
+    pub mapped: BTreeMap<String, TableMapping>,
+    /// Items that need a human decision.
+    pub needs_attention: Vec<AttentionItem>,
+    /// Suggestions only; never auto-accepted.
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// A table or column that could not be matched automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionItem {
+    pub path: String,
+    pub issue: AttentionIssue,
+}
+
+/// Why an item needs attention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttentionIssue {
+    MissingInNew { candidates: Vec<String> },
+    AmbiguousCaseInsensitive { candidates: Vec<String> },
+    AddBackReview,
+}
+
+/// A fuzzy-match suggestion with a confidence score.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub path: String,
+    pub candidate: String,
+    pub confidence: u8,
+}
+
+/// Pair the old table names in `old_names` with the new names in `new_names`.
+///
+/// `schema` is used only for building human-readable paths.
+pub fn match_tables(schema: &str, old_names: &[String], new_names: &[String]) -> MatchResult {
+    let mut mapped: BTreeMap<String, TableMapping> = BTreeMap::new();
+    let mut needs_attention: Vec<AttentionItem> = Vec::new();
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    let new_set: BTreeSet<String> = new_names.iter().cloned().collect();
+    let lower_new: BTreeMap<String, String> = new_names
+        .iter()
+        .map(|n| (n.to_lowercase(), n.clone()))
+        .collect();
+
+    for old in old_names {
+        if new_set.contains(old) {
+            mapped.insert(
+                old.clone(),
+                TableMapping {
+                    target_table: old.clone(),
+                    status: MappingStatus::Exact,
+                    ..TableMapping::default()
+                },
+            );
+            continue;
+        }
+
+        let lower = old.to_lowercase();
+        let mut case_matches: Vec<String> = new_names
+            .iter()
+            .filter(|n| n.to_lowercase() == lower)
+            .cloned()
+            .collect();
+        case_matches.sort();
+
+        if case_matches.len() == 1 {
+            mapped.insert(
+                old.clone(),
+                TableMapping {
+                    target_table: case_matches[0].clone(),
+                    status: MappingStatus::CaseInsensitive,
+                    ..TableMapping::default()
+                },
+            );
+        } else if case_matches.len() > 1 {
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{old}"),
+                issue: AttentionIssue::AmbiguousCaseInsensitive {
+                    candidates: case_matches,
+                },
+            });
+        } else {
+            // Try a fuzzy suggestion: longest common substring-ish via Levenshtein
+            // on lower-cased names.
+            let mut scored: Vec<(String, u8)> = new_names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        fuzzy_score(&old.to_lowercase(), &n.to_lowercase()),
+                    )
+                })
+                .filter(|(_, score)| *score > 0)
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+            if let Some((candidate, confidence)) = scored.into_iter().next() {
+                suggestions.push(Suggestion {
+                    path: format!("{schema}.{old}"),
+                    candidate,
+                    confidence,
+                });
+            }
+
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{old}"),
+                issue: AttentionIssue::MissingInNew {
+                    candidates: lower_new
+                        .keys()
+                        .filter(|k| k.starts_with(&lower[..1.min(lower.len())]))
+                        .map(|k| lower_new[k].clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                },
+            });
+        }
+    }
+
+    // Tables present only in new.
+    let old_set: BTreeSet<String> = old_names.iter().cloned().collect();
+    for new in new_names {
+        if !old_set.contains(new) && !mapped.values().any(|m| m.target_table == *new) {
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{new}"),
+                issue: AttentionIssue::AddBackReview,
+            });
+        }
+    }
+
+    MatchResult {
+        mapped,
+        needs_attention,
+        suggestions,
+    }
+}
+
+/// Match columns the same way as tables.
+pub fn match_columns(
+    schema: &str,
+    table: &str,
+    old_names: &[String],
+    new_names: &[String],
+) -> (
+    BTreeMap<String, ColumnMapping>,
+    Vec<AttentionItem>,
+    Vec<Suggestion>,
+) {
+    let mut mapped: BTreeMap<String, ColumnMapping> = BTreeMap::new();
+    let mut needs_attention: Vec<AttentionItem> = Vec::new();
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    let new_set: BTreeSet<String> = new_names.iter().cloned().collect();
+
+    for old in old_names {
+        if new_set.contains(old) {
+            mapped.insert(
+                old.clone(),
+                ColumnMapping {
+                    target_column: old.clone(),
+                    status: MappingStatus::Exact,
+                },
+            );
+            continue;
+        }
+
+        let lower = old.to_lowercase();
+        let mut case_matches: Vec<String> = new_names
+            .iter()
+            .filter(|n| n.to_lowercase() == lower)
+            .cloned()
+            .collect();
+        case_matches.sort();
+
+        if case_matches.len() == 1 {
+            mapped.insert(
+                old.clone(),
+                ColumnMapping {
+                    target_column: case_matches[0].clone(),
+                    status: MappingStatus::CaseInsensitive,
+                },
+            );
+        } else if case_matches.len() > 1 {
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{table}.{old}"),
+                issue: AttentionIssue::AmbiguousCaseInsensitive {
+                    candidates: case_matches,
+                },
+            });
+        } else {
+            let mut scored: Vec<(String, u8)> = new_names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        fuzzy_score(&old.to_lowercase(), &n.to_lowercase()),
+                    )
+                })
+                .filter(|(_, score)| *score > 0)
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+            if let Some((candidate, confidence)) = scored.into_iter().next() {
+                suggestions.push(Suggestion {
+                    path: format!("{schema}.{table}.{old}"),
+                    candidate,
+                    confidence,
+                });
+            }
+
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{table}.{old}"),
+                issue: AttentionIssue::MissingInNew {
+                    candidates: Vec::new(),
+                },
+            });
+        }
+    }
+
+    let old_set: BTreeSet<String> = old_names.iter().cloned().collect();
+    for new in new_names {
+        if !old_set.contains(new) && !mapped.values().any(|m| m.target_column == *new) {
+            needs_attention.push(AttentionItem {
+                path: format!("{schema}.{table}.{new}"),
+                issue: AttentionIssue::AddBackReview,
+            });
+        }
+    }
+
+    (mapped, needs_attention, suggestions)
+}
+
+/// Apply a rule to a table or column name.  Returns `Some(new_name)` if the
+/// rule matched and produced a rename.
+pub fn apply_rule(rule: &Rule, name: &str) -> Option<String> {
+    match rule.kind {
+        RuleKind::SchemaRename => {
+            // Used by the caller to translate schema names wholesale.
+            if rule.pattern.eq_ignore_ascii_case(name) {
+                Some(rule.target.clone())
+            } else {
+                None
+            }
+        }
+        RuleKind::PrefixReplace => name
+            .strip_prefix(&rule.pattern)
+            .map(|rest| format!("{}{}", rule.target, rest)),
+        RuleKind::SuffixReplace => name
+            .strip_suffix(&rule.pattern)
+            .map(|rest| format!("{}{}", rest, rule.target)),
+    }
+}
+
+/// Load a mapping from JSON bytes.
+///
+/// Validates size, version and rejects unknown fields.  Recomputes and
+/// checks the SHA-256 hash.
+pub fn from_json(bytes: &[u8]) -> Result<Mapping, MappingError> {
+    if bytes.len() > MAX_MAPPING_BYTES {
+        return Err(MappingError::TooLarge(bytes.len()));
+    }
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| MappingError::Json(e.to_string()))?;
+
+    // Reject unknown top-level fields.
+    if let Some(obj) = raw.as_object() {
+        let known: BTreeSet<&str> = [
+            "version",
+            "rules",
+            "schema_mappings",
+            "ignored",
+            "mapping_hash",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        let unknown: Vec<String> = obj
+            .keys()
+            .filter(|k| !known.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(MappingError::UnknownFields(unknown));
+        }
+    }
+
+    let mapping: Mapping =
+        serde_json::from_slice(bytes).map_err(|e| MappingError::Json(e.to_string()))?;
+
+    for item in &mapping.ignored {
+        if item.reason.trim().is_empty() {
+            return Err(MappingError::EmptyIgnoreReason);
+        }
+    }
+
+    if mapping.version != MAPPING_VERSION {
+        return Err(MappingError::UnsupportedVersion(mapping.version));
+    }
+
+    let stored_hash = mapping.mapping_hash.clone();
+    let computed = compute_hash(&mapping);
+    if stored_hash != computed {
+        return Err(MappingError::HashMismatch {
+            expected: stored_hash,
+            actual: computed,
+        });
+    }
+
+    Ok(mapping)
+}
+
+/// Serialise a mapping to canonical JSON bytes with a fresh hash.
+pub fn to_json(mapping: &Mapping) -> Result<Vec<u8>, MappingError> {
+    let mut canonical = mapping.clone();
+    canonical.mapping_hash = compute_hash(mapping);
+    serde_json::to_vec(&canonical).map_err(|e| MappingError::Json(e.to_string()))
+}
+
+/// Compute the SHA-256 hash of the mapping's canonical JSON form, excluding the
+/// stored `mapping_hash` field so the hash is self-verifying.
+fn compute_hash(mapping: &Mapping) -> String {
+    // Hash only the structural content, not the stored hash.
+    let canonical = CanonicalMapping::from(mapping);
+    let json = serde_json::to_string(&canonical).unwrap_or_default();
+    hex::encode(Sha256::digest(json.as_bytes()))
+}
+
+/// Stripped mapping used for canonical hashing.
+#[derive(Serialize)]
+struct CanonicalMapping<'a> {
+    version: u32,
+    rules: &'a [Rule],
+    schema_mappings: &'a BTreeMap<String, SchemaMapping>,
+    ignored: &'a [IgnoredItem],
+}
+
+impl<'a> From<&'a Mapping> for CanonicalMapping<'a> {
+    fn from(m: &'a Mapping) -> Self {
+        Self {
+            version: m.version,
+            rules: &m.rules,
+            schema_mappings: &m.schema_mappings,
+            ignored: &m.ignored,
+        }
+    }
+}
+
+/// Simple Levenshtein-based score scaled 0-100.
+fn fuzzy_score(a: &str, b: &str) -> u8 {
+    let dist = levenshtein(a, b);
+    let max_len = a.len().max(b.len()).max(1);
+    let similarity = max_len.saturating_sub(dist);
+    ((similarity * 100) / max_len) as u8
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let n = a.len();
+    let m = b.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr = vec![0; m + 1];
+
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[m]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_match_is_auto_accepted() {
+        let result = match_tables(
+            "public",
+            &["accounts".to_string()],
+            &["accounts".to_string()],
+        );
+        assert_eq!(result.mapped.len(), 1);
+        assert_eq!(result.mapped["accounts"].status, MappingStatus::Exact);
+        assert!(result.needs_attention.is_empty());
+        assert!(result.suggestions.is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_match_is_auto_accepted_when_unique() {
+        let result = match_tables(
+            "public",
+            &["ACCOUNTS".to_string()],
+            &["accounts".to_string()],
+        );
+        assert_eq!(result.mapped.len(), 1);
+        assert_eq!(
+            result.mapped["ACCOUNTS"].status,
+            MappingStatus::CaseInsensitive
+        );
+        assert!(result.needs_attention.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_case_insensitive_needs_attention() {
+        let result = match_tables(
+            "public",
+            &["ACCOUNTS".to_string()],
+            &["accounts".to_string(), "Accounts".to_string()],
+        );
+        assert!(result.mapped.is_empty());
+        // The ambiguous old table plus the two unmapped new tables all need attention.
+        assert_eq!(result.needs_attention.len(), 3);
+        assert!(result
+            .needs_attention
+            .iter()
+            .any(|a| matches!(a.issue, AttentionIssue::AmbiguousCaseInsensitive { .. })));
+    }
+
+    #[test]
+    fn fuzzy_match_is_suggestion_only() {
+        let result = match_tables(
+            "public",
+            &["acounts".to_string()],
+            &["accounts".to_string()],
+        );
+        assert!(result.mapped.is_empty());
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(result.suggestions[0].candidate, "accounts");
+    }
+
+    #[test]
+    fn mapping_hash_is_stable_and_self_verifying() {
+        let mut mapping = Mapping::new();
+        mapping.rules.push(Rule {
+            kind: RuleKind::PrefixReplace,
+            pattern: "old_".to_string(),
+            target: "new_".to_string(),
+        });
+        mapping = mapping.with_fresh_hash();
+        let json = to_json(&mapping).unwrap();
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(loaded, mapping);
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let json = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[],"mapping_hash":"","extra":"bad"}"#;
+        let err = from_json(json.as_bytes()).unwrap_err();
+        match err {
+            MappingError::UnknownFields(fields) => assert!(fields.contains(&"extra".to_string())),
+            _ => panic!("expected unknown fields error, got {err}"),
+        }
+    }
+
+    #[test]
+    fn ignore_reason_cannot_be_empty() {
+        let json = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[{"path":"x.y","reason":"   "}],"mapping_hash":""}"#;
+        let err = from_json(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, MappingError::EmptyIgnoreReason));
+    }
+
+    #[test]
+    fn apply_prefix_and_suffix_rules() {
+        let prefix = Rule {
+            kind: RuleKind::PrefixReplace,
+            pattern: "old_".to_string(),
+            target: "new_".to_string(),
+        };
+        assert_eq!(apply_rule(&prefix, "old_accounts").unwrap(), "new_accounts");
+
+        let suffix = Rule {
+            kind: RuleKind::SuffixReplace,
+            pattern: "_old".to_string(),
+            target: "_new".to_string(),
+        };
+        assert_eq!(apply_rule(&suffix, "accounts_old").unwrap(), "accounts_new");
+    }
+}
+
+#[cfg(test)]
+use proptest::prelude::*;
+
+#[cfg(test)]
+proptest! {
+    #[test]
+    fn fuzzy_score_is_at_most_100(a in "[a-z]{1,20}", b in "[a-z]{1,20}") {
+        let score = fuzzy_score(&a, &b);
+        assert!(score <= 100);
+    }
+
+    #[test]
+    fn mapping_never_auto_accepts_fuzzy(
+        old in "[a-z]{1,20}",
+        new in "[a-z]{1,20}"
+    ) {
+        let result = match_tables("public", &[old.clone()], &[new.clone()]);
+        if let Some(m) = result.mapped.get(&old) {
+            assert_ne!(m.status, MappingStatus::Fuzzy);
+        }
+    }
+}

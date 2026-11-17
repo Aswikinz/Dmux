@@ -1,9 +1,11 @@
 //! Dmux engine: the shared comparison logic behind the desktop app and the
 //! command-line runner.
 //!
-//! Phase 0 skeleton. The comparison core (`core/`: normalise, fingerprint,
-//! compare, drilldown) arrives in later phases; this crate deliberately
-//! contains no database code yet.
+//! Phase 1 structure work: inventory, schema diff and mapping.
+
+pub mod inventory;
+pub mod mapping;
+pub mod schema_diff;
 
 /// The engine version, taken from the crate manifest at compile time.
 pub fn version() -> &'static str {
