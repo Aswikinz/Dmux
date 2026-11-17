@@ -31,12 +31,13 @@ pub enum CoreError {
     /// Only the SQLSTATE is kept: server messages can quote row values.
     #[error("database error (SQLSTATE {0})")]
     Db(String),
-    /// A query hit row-level security.  With `row_security = off` PostgreSQL
-    /// raises this (SQLSTATE 42501) instead of silently filtering rows, so it
-    /// must never become a PASS.  The message is fixed: it never carries a
-    /// table name or a row value.
+    /// SQLSTATE 42501 (insufficient_privilege): either a plain missing SELECT
+    /// grant, or a query that hit row-level security (with `row_security =
+    /// off` PostgreSQL raises this instead of silently filtering rows).  Either
+    /// way it must never become a PASS.  The message is fixed: it never carries
+    /// a table name or a row value.
     #[error(
-        "row-level security would hide rows from the Dmux login; grant BYPASSRLS or exempt it"
+        "the Dmux login is not allowed to read this table: grant SELECT, and BYPASSRLS if the table uses row-level security"
     )]
     RowSecurity,
     #[error("not inside the Dmux read-only session: {0} is not set as required")]
@@ -194,7 +195,13 @@ mod tests {
             CoreError::RowSecurity
         );
         // The message is fixed and never carries a table name or row value.
+        // 42501 is also a plain missing SELECT, so it names both causes.
         let text = CoreError::RowSecurity.to_string();
+        assert_eq!(
+            text,
+            "the Dmux login is not allowed to read this table: grant SELECT, and BYPASSRLS if the table uses row-level security"
+        );
+        assert!(text.contains("grant SELECT"));
         assert!(text.contains("BYPASSRLS"));
         assert!(!text.contains("42"));
     }
