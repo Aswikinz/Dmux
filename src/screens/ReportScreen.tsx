@@ -39,6 +39,10 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
         setResultMessage(`${label} report saved to ${res.filePath}`);
       } else if (res.cancelled) {
         setResultMessage(`${label} export cancelled. Nothing was saved.`);
+      } else if (res.demoOnly) {
+        setResultMessage(
+          `This is the browser demo, so no ${label} file was saved. In the Dmux desktop app, you choose where to save it.`,
+        );
       } else {
         setError(res.error ?? 'The report could not be saved.');
       }

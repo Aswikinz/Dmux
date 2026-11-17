@@ -631,11 +631,11 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       return fixtures[fixture] ?? fixtures.pass;
     },
 
-    async exportReport(request: ReportRequest): Promise<ReportResult> {
-      // The mock never touches a real path: it reports a placeholder destination
-      // so the "saved to …" message stays meaningful.
-      const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
-      return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the demo saves nothing
+    async exportReport(_request: ReportRequest): Promise<ReportResult> {
+      // The browser demo has no file system and no save dialog. Say so plainly
+      // instead of pretending a file was saved somewhere.
+      return { ok: false, demoOnly: true };
     },
 
     async getVersion(): Promise<string> {
