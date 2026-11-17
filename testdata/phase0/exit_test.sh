@@ -6,7 +6,7 @@
 # the row hash made identical data hash differently on the two servers; the run
 # ended "Result: 80 passed, 3 failed" and exited 1). The real root cause of the
 # misreading was a missing EOF newline: line-based review saw the final echo as
-# the last line and never saw the `[ "$FAIL" -eq 0 ]` exit guard. This test makes
+# the last line and never saw the `[[ "$FAIL" -eq 0 ]]` exit guard. This test makes
 # the sabotage experiment permanent, so a harness that ever exits 0 with FAILs
 # fails loudly here.
 #
@@ -58,13 +58,13 @@ cp "$HERE"/*.sql "$WORK/"
 # only the "identical data stays quiet" checks can fail. If the template ever
 # changes shape, fail loudly instead of silently running an unsabotaged harness.
 hits=$(grep -c 'bank_code::text,' "$WORK/fingerprint.sql" || true)
-if [ "$hits" != 1 ]; then
+if [[ "$hits" != 1 ]]; then
   echo "exit_test: sabotage pattern found $hits times (wanted 1) in fingerprint.sql — template changed, update this test" >&2
   exit 1
 fi
 sed -i "s/bank_code::text,/bank_code::text || current_setting('server_version'),/" "$WORK/fingerprint.sql"
 hits=$(grep -c "current_setting('server_version')" "$WORK/fingerprint.sql" || true)
-if [ "$hits" != 1 ]; then
+if [[ "$hits" != 1 ]]; then
   echo "exit_test: sabotage injection failed (marker found $hits times, wanted 1)" >&2
   exit 1
 fi
@@ -76,17 +76,17 @@ bash "$WORK/prove.sh" "$@" > "$WORK/out" 2>&1 || rc=$?
 
 echo
 echo "Assertions on the sabotaged run:"
-if [ "$rc" -ne 0 ]; then
+if [[ "$rc" -ne 0 ]]; then
   ok "harness exited non-zero with FAILs (exit $rc)"
 else
   bad "harness exited 0 despite FAILs — exit guard broken (this is the regression)"
 fi
 
 result=$(grep -E '^Result: [0-9]+ passed, [0-9]+ failed$' "$WORK/out" || true)
-if [ -n "$result" ]; then
+if [[ -n "$result" ]]; then
   passed=$(printf '%s\n' "$result" | sed -E 's/^Result: ([0-9]+) passed, [0-9]+ failed$/\1/')
   failed=$(printf '%s\n' "$result" | sed -E 's/^Result: [0-9]+ passed, ([0-9]+) failed$/\1/')
-  if [ "$failed" -gt 0 ] && [ "$passed" -gt 0 ]; then
+  if [[ "$failed" -gt 0 ]] && [[ "$passed" -gt 0 ]]; then
     ok "summary line present with failures: $result"
   else
     bad "summary line has no failures (or no passes): $result"
@@ -97,12 +97,12 @@ else
 fi
 
 faillines=$(grep -c '^  FAIL  ' "$WORK/out" || true)
-if [ "$faillines" -ge 1 ]; then
+if [[ "$faillines" -ge 1 ]]; then
   ok "at least one '  FAIL  ' line ($faillines printed)"
 else
   bad "no '  FAIL  ' line in harness output"
 fi
-if [ "$faillines" = "$failed" ]; then
+if [[ "$faillines" = "$failed" ]]; then
   ok "FAIL line count matches the summary ($faillines = $failed)"
 else
   bad "FAIL line count ($faillines) does not match summary failed count ($failed)"
@@ -122,7 +122,7 @@ val() { psql -X -q -A -t -v ON_ERROR_STOP=1 "$1" -c "$2"; }
 for pair in "old|$OLD_URL" "new|$NEW_URL"; do
   side="${pair%%|*}"; u="${pair#*|}"
   left=$(val "$u" "SELECT count(*) FROM pg_namespace WHERE nspname = 'phase0'")
-  if [ "$left" = 0 ]; then
+  if [[ "$left" = 0 ]]; then
     ok "$side: phase0 schema dropped by the harness, verified gone"
   else
     echo "  warn  $side: phase0 schema left behind — dropping it now (harness cleanup regression?)"
@@ -130,7 +130,7 @@ for pair in "old|$OLD_URL" "new|$NEW_URL"; do
   fi
 done
 aux=$(val "$OLD_URL" "SELECT count(*) FROM pg_database WHERE datname IN ('bank_c', 'bank_ascii')")
-if [ "$aux" = 0 ]; then
+if [[ "$aux" = 0 ]]; then
   ok "old: bank_c/bank_ascii dropped by the harness, verified gone"
 else
   echo "  warn  old: auxiliary databases left behind — dropping them now (harness cleanup regression?)"
@@ -138,11 +138,11 @@ else
   q "$OLD_URL" "DROP DATABASE IF EXISTS bank_ascii"
 fi
 
-if [ "$FAIL" -ne 0 ]; then
+if [[ "$FAIL" -ne 0 ]]; then
   echo
   echo "Sabotaged harness output (check names only, no row data):"
   grep -E '^  FAIL  |^Result: ' "$WORK/out" || true
 fi
 echo
 echo "Result: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]

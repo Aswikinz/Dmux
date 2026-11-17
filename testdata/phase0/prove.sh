@@ -60,8 +60,8 @@ check() { # name, expectation (same|differ), file [, old url, new url]
   # buckets appearing on EITHER side of the diff, so an empty old side no longer
   # prints "0 bucket(s)" when the new side has rows (Opus T008 gate note 3).
   local buckets; buckets=$(diff "$TMP/old" "$TMP/new" | grep -E '^[<>]' | sed 's/^[<>] //' | cut -d'|' -f1 | sort -u | wc -l || true)
-  if [ "$got" = "$want" ]; then PASS=$((PASS+1)); printf '  ok    %-52s (%s' "$name" "$got"
-    [ "$got" = differ ] && printf ', %s bucket(s)' "$buckets"; printf ')\n'
+  if [[ "$got" = "$want" ]]; then PASS=$((PASS+1)); printf '  ok    %-52s (%s' "$name" "$got"
+    [[ "$got" = differ ]] && printf ', %s bucket(s)' "$buckets"; printf ')\n'
   else FAIL=$((FAIL+1)); printf '  FAIL  %-52s (wanted %s, got %s)\n' "$name" "$want" "$got"; fi
 }
 
@@ -74,7 +74,7 @@ assert_both() { # name, sql, expected value [, old url, new url] — one check, 
   local name="$1" sql="$2" want="$3" ou="${4:-$OLD_URL}" nu="${5:-$NEW_URL}" go gn
   go=$(psql -X -q -A -t -v ON_ERROR_STOP=1 "$ou" -c "$sql")
   gn=$(psql -X -q -A -t -v ON_ERROR_STOP=1 "$nu" -c "$sql")
-  if [ "$go" = "$want" ] && [ "$gn" = "$want" ]; then
+  if [[ "$go" = "$want" ]] && [[ "$gn" = "$want" ]]; then
     PASS=$((PASS+1)); printf '  ok    %-52s (both sides: %s)\n' "$name" "$want"
   else FAIL=$((FAIL+1)); printf '  FAIL  %-52s (wanted %s, got old=%s new=%s)\n' "$name" "$want" "$go" "$gn"; fi
 }
@@ -82,7 +82,7 @@ assert_both() { # name, sql, expected value [, old url, new url] — one check, 
 assert_one() { # name, url, sql, expected value
   local name="$1" u="$2" sql="$3" want="$4" got
   got=$(psql -X -q -A -t -v ON_ERROR_STOP=1 "$u" -c "$sql")
-  if [ "$got" = "$want" ]; then
+  if [[ "$got" = "$want" ]]; then
     PASS=$((PASS+1)); printf '  ok    %-52s (%s)\n' "$name" "$got"
   else FAIL=$((FAIL+1)); printf '  FAIL  %-52s (wanted %s, got %s)\n' "$name" "$want" "$got"; fi
 }
@@ -117,15 +117,15 @@ schema_check() { # name, table, marker, side (old|new) [, old url, new url]
   # is never the verdict.
   local name="$1" tbl="$2" marker="$3" side="$4" ou="${5:-$OLD_URL}" nu="${6:-$NEW_URL}" co cn ok=1
   co=$(cols "$ou" "$tbl"); cn=$(cols "$nu" "$tbl")
-  if [ "$co" = "$cn" ]; then ok=0; fi
-  if [ "$side" = new ]; then
+  if [[ "$co" = "$cn" ]]; then ok=0; fi
+  if [[ "$side" = new ]]; then
     if ! printf '%s\n' "$cn" | grep -qF "$marker"; then ok=0; fi
     if printf '%s\n' "$co" | grep -qF "$marker"; then ok=0; fi
   else
     if ! printf '%s\n' "$co" | grep -qF "$marker"; then ok=0; fi
     if printf '%s\n' "$cn" | grep -qF "$marker"; then ok=0; fi
   fi
-  if [ "$ok" = 1 ]; then
+  if [[ "$ok" = 1 ]]; then
     PASS=$((PASS+1)); printf '  ok    %-52s (schema diff reports it)\n' "$name"
   else FAIL=$((FAIL+1)); printf '  FAIL  %-52s (schema change not detected as expected)\n' "$name"; fi
 }
@@ -289,7 +289,7 @@ assert_both "money::numeric is locale-free (never ::text)" "SELECT '1234.56'::mo
 old_lc=$(psql -X -q -A -t "$OLD_URL" -c "SHOW lc_monetary")
 new_lc=$(psql -X -q -A -t "$NEW_URL" -c "SHOW lc_monetary")
 PASS=$((PASS+1)); printf '  ok    %-52s (old=%s, new=%s)\n' "lc_monetary recorded on both sides (P11)" "$old_lc" "$new_lc"
-if [ "$old_lc" != "$new_lc" ]; then
+if [[ "$old_lc" != "$new_lc" ]]; then
   echo "  warn  lc_monetary differs — the engine must record this warning (P11)"
 fi
 
@@ -472,4 +472,4 @@ q "$C_URL" "DROP SCHEMA phase0 CASCADE"; q "$A_URL" "DROP SCHEMA phase0 CASCADE"
 q "$OLD_URL" "DROP DATABASE bank_c"; q "$OLD_URL" "DROP DATABASE bank_ascii"
 q "$OLD_URL" "DROP SCHEMA phase0 CASCADE"; q "$NEW_URL" "DROP SCHEMA phase0 CASCADE"
 echo; echo "Result: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]

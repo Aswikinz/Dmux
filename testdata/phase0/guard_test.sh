@@ -25,7 +25,7 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 expect() { # want (accept|reject), url, label
   local want="$1" u="$2" label="$3" got
   if dmux_guard_url "$u"; then got=accept; else got=reject; fi
-  if [ "$got" = "$want" ]; then ok "$label ($got)"
+  if [[ "$got" = "$want" ]]; then ok "$label ($got)"
   else bad "$label (wanted $want, got $got)"; fi
 }
 
@@ -90,7 +90,7 @@ BYPASS='postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/bank?host=127.0.0.1&por
 wiring() { # script, label
   local script="$1" label="$2" rc=0
   PATH="$TMP:$PATH" OLD_URL="$BYPASS" bash "$HERE/$script" >"$TMP/out" 2>"$TMP/err" || rc=$?
-  if [ "$rc" -eq 1 ] && grep -q 'refusing:' "$TMP/err"; then
+  if [[ "$rc" -eq 1 ]] && grep -q 'refusing:' "$TMP/err"; then
     ok "$label refused before connecting (exit 1)"
   else
     bad "$label (exit $rc, wanted 1 + 'refusing:'); first stderr line: $(head -1 "$TMP/err")"
@@ -132,7 +132,7 @@ wiring_env_pass() { # script, label — valid URLs: guard passes, stub sees NO P
   local script="$1" label="$2" rc=0
   rm -f "$TMP/leak"
   run_hostile "$script" "$VALID_OLD" "$VALID_NEW" || rc=$?
-  if [ "$rc" -eq 97 ] && [ "$(cat "$TMP/leak" 2>/dev/null)" = none ]; then
+  if [[ "$rc" -eq 97 ]] && [[ "$(cat "$TMP/leak" 2>/dev/null)" = none ]]; then
     ok "$label hostile PG* env stripped, guard passed (stub reached, no leak)"
   else
     bad "$label (exit $rc, wanted 97 + marker 'none'); marker: $(cat "$TMP/leak" 2>/dev/null || echo missing); first stderr line: $(head -1 "$TMP/err")"
@@ -143,10 +143,10 @@ wiring_env_pass perf.sh  'perf.sh'
 
 wiring_env_refuse() { # script, bypass side (OLD|NEW), label — refusal must hold under hostile env
   local script="$1" side="$2" label="$3" rc=0 ou="$VALID_OLD" nu="$VALID_NEW"
-  if [ "$side" = OLD ]; then ou="$BYPASS"; else nu="$BYPASS"; fi
+  if [[ "$side" = OLD ]]; then ou="$BYPASS"; else nu="$BYPASS"; fi
   rm -f "$TMP/leak"
   run_hostile "$script" "$ou" "$nu" || rc=$?
-  if [ "$rc" -eq 1 ] && grep -q 'refusing:' "$TMP/err" && [ ! -e "$TMP/leak" ]; then
+  if [[ "$rc" -eq 1 ]] && grep -q 'refusing:' "$TMP/err" && [[ ! -e "$TMP/leak" ]]; then
     ok "$label refused with hostile env (exit 1, no psql)"
   else
     bad "$label (exit $rc, wanted 1 + 'refusing:' + no stub marker); first stderr line: $(head -1 "$TMP/err")"
@@ -159,4 +159,4 @@ wiring_env_refuse perf.sh  NEW 'perf.sh NEW_URL bypass'
 
 echo
 echo "Result: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]

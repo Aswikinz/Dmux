@@ -9,10 +9,10 @@ cd "$(dirname "$0")/.."
 . scripts/lib.sh
 
 ROOT="$(main_root)"
-[ "$ROOT" = "$(pwd -P)" ] || die "run this from the main checkout ($ROOT), not from a worktree"
+[[ "$ROOT" = "$(pwd -P)" ]] || die "run this from the main checkout ($ROOT), not from a worktree"
 
 NAME="$(git config user.name || true)"; EMAIL="$(git config user.email || true)"
-[ -n "$NAME" ] && [ -n "$EMAIL" ] || die "set your Git identity first:
+[[ -n "$NAME" ]] && [[ -n "$EMAIL" ]] || die "set your Git identity first:
   git config --global user.name  \"Your Name\"
   git config --global user.email \"you@example.com\"   # must be verified on GitHub"
 

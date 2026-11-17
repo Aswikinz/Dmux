@@ -8,18 +8,18 @@ set -euo pipefail
 BAD=0
 CHECKED=0
 while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  [ -s "$f" ] || continue          # empty file: nothing to check
+  [[ -f "$f" ]] || continue
+  [[ -s "$f" ]] || continue          # empty file: nothing to check
   grep -Iq '' "$f" || continue     # binary file: skip
   CHECKED=$((CHECKED + 1))
   last="$(tail -c 1 "$f" | od -An -tx1 | tr -d '[:space:]')"
-  if [ "$last" != "0a" ]; then
+  if [[ "$last" != "0a" ]]; then
     echo "eof: missing final newline: $f"
     BAD=1
   fi
 done < <(git -c core.quotepath=off ls-files)
 
-if [ "$BAD" -eq 0 ]; then
+if [[ "$BAD" -eq 0 ]]; then
   echo "eof: ok ($CHECKED text file(s) checked)"
 fi
 exit "$BAD"

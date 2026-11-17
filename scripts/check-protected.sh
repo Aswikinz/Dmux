@@ -8,14 +8,14 @@ CHANGED="$(git diff --name-only "$BASE"...HEAD)"
 
 KEY=0; CODE=0
 while IFS= read -r f; do
-  [ -n "$f" ] || continue
+  [[ -n "$f" ]] || continue
   case "$f" in
     testdata/expected_diffs.json|testdata/*/expected_diffs.json) KEY=1 ;;
     crates/*|src-tauri/*|src/*) CODE=1 ;;
   esac
 done <<< "$CHANGED"
 
-if [ "$KEY" -eq 1 ] && [ "$CODE" -eq 1 ]; then
+if [[ "$KEY" -eq 1 ]] && [[ "$CODE" -eq 1 ]]; then
   echo "protected files: this change edits both the answer key and product code."
   echo "Split it: the answer key changes alone, in its own pull request."
   exit 1

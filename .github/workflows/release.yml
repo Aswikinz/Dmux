@@ -119,17 +119,20 @@ jobs:
       # binary is "static-pie linked"). If a C dependency ever enters the
       # CLI, apt-get install musl-tools becomes necessary here.
       - name: Build static CLI (musl)
-        run: cargo build --release -p dmux-cli --target x86_64-unknown-linux-musl
+        run: cargo build --release -p dmux-cli --target x86_64-unknown-linux-musl --locked
 
       - name: Stage and verify the static CLI
         run: |
           # Flat staging dir: upload-artifact keeps directory structure, and
           # the release job checksums a flat artifacts/ directory. cp fails
           # if any bundle type is missing (fail closed).
-          mkdir -p dist
-          cp target/release/bundle/deb/*.deb target/release/bundle/rpm/*.rpm target/release/bundle/appimage/*.AppImage dist/
-          cp target/x86_64-unknown-linux-musl/release/dmux dist/dmux-x86_64-unknown-linux-musl
-          if ! file dist/dmux-x86_64-unknown-linux-musl | grep -q 'static'; then
+          # Named release-out, NOT dist: dist/ is where Vite writes the frontend
+          # build (tauri.conf.json frontendDist), so v0.0.1 leaked index.html +
+          # assets/ into the release by staging the installers there.
+          mkdir -p release-out
+          cp target/release/bundle/deb/*.deb target/release/bundle/rpm/*.rpm target/release/bundle/appimage/*.AppImage release-out/
+          cp target/x86_64-unknown-linux-musl/release/dmux release-out/dmux-x86_64-unknown-linux-musl
+          if ! file release-out/dmux-x86_64-unknown-linux-musl | grep -q 'static'; then
             echo "::error::CLI binary is not statically linked"
             exit 1
           fi
@@ -138,7 +141,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dmux-release-linux
-          path: dist/*
+          path: release-out/*
           if-no-files-found: error
 
   build-windows:
@@ -201,24 +204,24 @@ jobs:
           }
 
       - name: Build CLI (Windows)
-        run: cargo build --release -p dmux-cli
+        run: cargo build --release -p dmux-cli --locked
 
       - name: Stage the installers and CLI
         shell: pwsh
         run: |
           # Flat staging dir (see the Linux job). NSIS and the CLI are
           # required; Copy-Item fails without them. MSI is best effort.
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/bundle/nsis/*.exe dist/
+          New-Item -ItemType Directory -Force release-out | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe release-out/
           $msi = Get-ChildItem target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue
-          if ($msi) { Copy-Item $msi.FullName dist/ }
-          Copy-Item target/release/dmux.exe dist/dmux-x86_64-pc-windows-msvc.exe
+          if ($msi) { Copy-Item $msi.FullName release-out/ }
+          Copy-Item target/release/dmux.exe release-out/dmux-x86_64-pc-windows-msvc.exe
 
       - name: Upload Windows release artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dmux-release-windows
-          path: dist/*
+          path: release-out/*
           if-no-files-found: error
 
   release:
@@ -288,6 +291,12 @@ jobs:
           node-version: 26
 
       - name: Generate npm production SBOM (CycloneDX)
+        env:
+          # T030 (githubactions:S6505): npx installs cdxgen into its cache before
+          # running it, so suppress dependency lifecycle scripts — a transitive
+          # dependency's install hook must never run on the release runner.
+          # cdxgen's pnpm-lock parsing is pure JS and needs no install scripts.
+          npm_config_ignore_scripts: 'true'
         run: |
           # cdxgen writes supporting output BESIDE its -o path, and v0.0.1 left
           # a subdirectory in artifacts/ that way. Generate into scratch space

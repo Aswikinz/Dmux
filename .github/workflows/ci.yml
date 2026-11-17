@@ -266,7 +266,7 @@ jobs:
           GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
           set -euo pipefail
-          curl -fL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          curl -fL --proto '=https' --tlsv1.2 "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
           /tmp/gitleaks detect --no-banner --redact --exit-code 1 --source .
@@ -314,7 +314,7 @@ jobs:
         run: pnpm build
 
       - name: Build the workspace (includes the Tauri app)
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Cache tauri-driver
         id: cache-tauri-driver
@@ -415,7 +415,7 @@ jobs:
         run: pnpm build
 
       - name: Build the workspace (includes the Tauri app)
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Cache tauri-driver
         id: cache-tauri-driver
@@ -518,6 +518,14 @@ jobs:
   # narrowed only via exclusions: sonar.exclusions (generated/build/lock files,
   # the huge RESULTS.md, icons), sonar.coverage.exclusions (test code), and
   # sonar.cpd.exclusions (testdata, which is deliberately repetitive fixtures).
+  #
+  # T030: **/*.sql is added to sonar.exclusions because Sonar has no PostgreSQL
+  # analyzer — it applies ORACLE PL/SQL rules to our Postgres test fixtures
+  # (57 false-positive BUGs). Engine SQL lives in Rust string literals and is
+  # still analysed. The workflows' public throwaway mock password (dmux_dev_only)
+  # is a real false-positive for secrets:S6698 — these service containers are
+  # ephemeral and read-only, never loaded with real data (AGENTS.md) — so it is
+  # suppressed by the multicriteria block below, scoped to .github/workflows/**.
   sonar:
     name: SonarCloud scan
     needs: checks
@@ -554,9 +562,12 @@ jobs:
           args: >-
             -Dsonar.projectKey=Aswikinz_Dmux
             -Dsonar.organization=aswikinz
-            -Dsonar.exclusions=**/target/**,**/node_modules/**,**/dist/**,**/gen/**,testdata/phase0/RESULTS.md,**/coverage/**,src-tauri/icons/**,**/*.lock
+            -Dsonar.exclusions=**/target/**,**/node_modules/**,**/dist/**,**/gen/**,testdata/phase0/RESULTS.md,**/coverage/**,src-tauri/icons/**,**/*.lock,**/*.sql
             -Dsonar.coverage.exclusions=**/*.test.ts,**/*.test.tsx,e2e/**,**/db_tests.rs
             -Dsonar.cpd.exclusions=testdata/**
+            -Dsonar.issue.ignore.multicriteria=e1
+            -Dsonar.issue.ignore.multicriteria.e1.ruleKey=secrets:S6698
+            -Dsonar.issue.ignore.multicriteria.e1.resourceKey=.github/workflows/**
             -Dsonar.rust.lcov.reportPaths=rust-lcov.info
             -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
             -Dsonar.sourceEncoding=UTF-8

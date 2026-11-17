@@ -48,20 +48,20 @@ for u in "$OLD_URL" "$NEW_URL"; do
   fi
 done
 
-if [ "$#" -gt 2 ]; then SIZES="${*:3}"; else SIZES="${PERF_SIZES:-1000000 20000000}"; fi
+if [[ "$#" -gt 2 ]]; then SIZES="${*:3}"; else SIZES="${PERF_SIZES:-1000000 20000000}"; fi
 BATCH="${PERF_BATCH:-1000000}"
 read -r -a SIZE_LIST <<< "$SIZES"
-[ "${#SIZE_LIST[@]}" -gt 0 ] || { echo "no sizes given" >&2; exit 1; }
+[[ "${#SIZE_LIST[@]}" -gt 0 ]] || { echo "no sizes given" >&2; exit 1; }
 for n in "${SIZE_LIST[@]}" "$BATCH"; do
   case "$n" in ''|*[!0-9]*) echo "sizes and PERF_BATCH must be positive integers: $n" >&2; exit 1 ;; esac
-  if [ "$n" -eq 0 ]; then echo "sizes and PERF_BATCH must be positive integers" >&2; exit 1; fi
+  if [[ "$n" -eq 0 ]]; then echo "sizes and PERF_BATCH must be positive integers" >&2; exit 1; fi
 done
 
 TMP="$(mktemp -d)"
 STARTED=0
 cleanup() {
   # Best effort on any exit path; only once this harness has created schemas.
-  if [ "$STARTED" = 1 ]; then
+  if [[ "$STARTED" = 1 ]]; then
     for u in "$OLD_URL" "$NEW_URL"; do
       psql -X -q -v ON_ERROR_STOP=1 "$u" -c 'DROP SCHEMA IF EXISTS phase0 CASCADE' >/dev/null 2>&1 || true
     done
@@ -104,9 +104,9 @@ load_perf() { # url, rows — batched INSERT ... SELECT, one transaction per bat
   local u="$1" rows="$2" lo hi t0 t1
   t0="$(now_ns)"
   lo=1
-  while [ "$lo" -le "$rows" ]; do
+  while [[ "$lo" -le "$rows" ]]; do
     hi=$((lo + BATCH - 1))
-    if [ "$hi" -gt "$rows" ]; then hi="$rows"; fi
+    if [[ "$hi" -gt "$rows" ]]; then hi="$rows"; fi
     # Same value expressions as prove.sh's load_accounts (accents via chr(),
     # NULL/empty/remark mix), so the perf data matches the proven shape.
     q "$u" "INSERT INTO phase0.accounts_perf (acct_id, bank_code, holder_name, branch_code, balance, rate, opened_at, doc_blob, remarks)
@@ -136,7 +136,7 @@ check_fp() { # outfile, rows — sanity: non-empty, <=4096 buckets, counts sum t
   local out="$1" rows="$2" buckets sumn
   buckets="$(wc -l < "$out")"
   sumn="$(awk -F'|' '{ s += $2 } END { print s + 0 }' "$out")"
-  if [ "$buckets" -eq 0 ] || [ "$buckets" -gt 4096 ] || [ "$sumn" != "$rows" ]; then
+  if [[ "$buckets" -eq 0 ]] || [[ "$buckets" -gt 4096 ]] || [[ "$sumn" != "$rows" ]]; then
     echo "fingerprint sanity failed: $buckets buckets, sum(n)=$sumn, wanted $rows rows" >&2
     exit 1
   fi
@@ -149,13 +149,13 @@ active_info() { # url — classify other active backends; never print query text
 wait_quiet() { # url — let other active backends finish before a timed scan (max 30s)
   local u="$1" waited=0 info
   info="$(active_info "$u")"
-  while [ -n "$info" ] && [ "$waited" -lt 30 ]; do
+  while [[ -n "$info" ]] && [[ "$waited" -lt 30 ]]; do
     echo "  waiting for quiescence (active: $info, ${waited}s elapsed)"
     sleep 5
     waited=$((waited + 5))
     info="$(active_info "$u")"
   done
-  if [ -n "$info" ]; then
+  if [[ -n "$info" ]]; then
     echo "  warn: other active backend(s) during the timed scans: $info"
   fi
 }
@@ -174,7 +174,7 @@ for rows in "${SIZE_LIST[@]}"; do
       doc_blob bytea, remarks varchar(60)) WITH (autovacuum_enabled = off);"
     load_s="$(load_perf "$u" "$rows")"
     cnt="$(val "$u" "SELECT count(*) FROM phase0.accounts_perf")"
-    if [ "$cnt" != "$rows" ]; then echo "load produced $cnt rows, wanted $rows" >&2; exit 1; fi
+    if [[ "$cnt" != "$rows" ]]; then echo "load produced $cnt rows, wanted $rows" >&2; exit 1; fi
     bytes="$(val "$u" "SELECT pg_total_relation_size('phase0.accounts_perf')")"
     plan="$(psql -X -q -A -t -v ON_ERROR_STOP=1 "$u" -f "$TMP/explain.sql")"
     if grep -q 'Gather' <<< "$plan"; then plan_note='parallel (Gather)'; else plan_note='single process'; fi
@@ -211,7 +211,7 @@ for pair in "old|$OLD_URL" "new|$NEW_URL"; do
   u="${pair#*|}"
   q "$u" "DROP SCHEMA IF EXISTS phase0 CASCADE"
   left="$(val "$u" "SELECT count(*) FROM pg_namespace WHERE nspname = 'phase0'")"
-  if [ "$left" != 0 ]; then echo "cleanup failed on ${pair%%|*}: phase0 schema still present" >&2; exit 1; fi
+  if [[ "$left" != 0 ]]; then echo "cleanup failed on ${pair%%|*}: phase0 schema still present" >&2; exit 1; fi
   echo "  ${pair%%|*}: phase0 schema dropped, verified gone"
 done
 STARTED=0
