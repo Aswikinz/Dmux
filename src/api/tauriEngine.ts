@@ -868,15 +868,13 @@ export function createTauriEngine(): Engine {
       lastOldProfile = oldProfile;
       lastNewProfile = newProfile;
 
-      const oldInventory = await invoke<Record<string, unknown>>('run_inventory', {
-        input: toConnectInput(oldProfile),
-      });
-      const newInventory = await invoke<Record<string, unknown>>('run_inventory', {
-        input: toConnectInput(newProfile),
-      });
-      const diff = await invoke<RawSchemaDiff>('schema_diff', {
-        old: oldInventory,
-        new: newInventory,
+      // One call: the engine collects and compares both inventories itself.
+      // The raw inventories hold 64-bit values (sequence bounds up to
+      // i64::MAX) that a JS number cannot carry, so they must not round-trip
+      // through the webview.
+      const diff = await invoke<RawSchemaDiff>('compare_structure', {
+        old: toConnectInput(oldProfile),
+        new: toConnectInput(newProfile),
       });
 
       return {

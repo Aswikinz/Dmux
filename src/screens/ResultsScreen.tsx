@@ -53,10 +53,25 @@ function drillDownStatus(kind: DrillDownRow['kind']): 'missing-in-new' | 'extra-
   return 'changed-values';
 }
 
+/**
+ * How many drill-down rows render at first, and how many more each "Show more"
+ * adds.  The engine caps changed rows (CHANGED_DETAIL_LIMIT) but not missing or
+ * extra keys, so one table can carry tens of thousands; rendering them all at
+ * once froze the webview.
+ */
+export const DRILL_DOWN_PAGE = 50;
+
 function DrillDown({ rows }: { rows: DrillDownRow[] }) {
+  const [shown, setShown] = useState(DRILL_DOWN_PAGE);
+  const visible = rows.slice(0, shown);
+  const remaining = rows.length - visible.length;
   return (
     <div className="mt-2 space-y-2">
-      {rows.map((row, idx) => (
+      {/* Always say how many rows exist, so a partial list never reads as complete. */}
+      <p className="text-sm text-slate-600 dark:text-slate-300">
+        Showing {visible.length.toLocaleString()} of {rows.length.toLocaleString()} rows
+      </p>
+      {visible.map((row, idx) => (
         <div
           key={`${row.key}-${idx}`}
           className="rounded-lg border border-slate-200 p-2 text-sm dark:border-slate-700"
@@ -70,6 +85,16 @@ function DrillDown({ rows }: { rows: DrillDownRow[] }) {
           )}
         </div>
       ))}
+      {remaining > 0 && (
+        <Button
+          onClick={() => setShown((n) => n + DRILL_DOWN_PAGE)}
+          variant="secondary"
+          size="sm"
+        >
+          Show {Math.min(DRILL_DOWN_PAGE, remaining).toLocaleString()} more (
+          {remaining.toLocaleString()} not shown)
+        </Button>
+      )}
     </div>
   );
 }

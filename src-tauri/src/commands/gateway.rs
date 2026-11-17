@@ -257,34 +257,42 @@ pub(crate) async fn collect(
     .await
 }
 
-/// Collect one database's structural inventory.
+/// Collect both databases' structural inventories and compare them (PLAN 4.2).
+///
+/// The inventories never leave Rust.  They used to round-trip through the
+/// webview (`run_inventory` then `schema_diff`), which broke on any 64-bit
+/// value above 2^53: a sequence's default `max_value` (`i64::MAX`) became
+/// `9223372036854776000` in JavaScript and no longer fit an `i64` on the way
+/// back.  Only the [`SchemaDiff`] crosses IPC, and it carries no integers.
+///
+/// **Display-only** (audit L7): nothing a verdict, coverage line, result or
+/// report depends on may consume this output.  Verdicts and results come from
+/// the engine's live run (`crates::commands::data`), which collects its own
+/// inventories; this diff only renders the "structure compare" screen.
 #[tauri::command]
-pub async fn run_inventory(
-    input: ConnectInput,
+pub async fn compare_structure(
+    old: ConnectInput,
+    new: ConnectInput,
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
-) -> Result<DatabaseInventory, CommandError> {
+) -> Result<SchemaDiff, CommandError> {
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    collect(&input, allow, &state).await
+    structure_diff(&old, &new, allow, &state).await
 }
 
-/// Compare two already-collected inventories (PLAN 4.2).
-///
-/// **Display-only, and the inventories are webview-supplied** (audit L7): the
-/// UI collects them via [`run_inventory`], round-trips them through the webview
-/// and hands them back here.  Nothing a verdict, coverage line, result or
-/// report depends on may consume this output — a false PASS must never rest on
-/// data that crossed the IPC boundary.  Verdicts and results are produced by
-/// the engine's live run (`crates::commands::data`), which re-collects its own
-/// inventories; this diff only renders the "structure compare" screen.
-#[tauri::command]
-pub fn schema_diff(
-    old: DatabaseInventory,
-    new: DatabaseInventory,
+/// The body of [`compare_structure`], callable from tests without a Tauri
+/// `State`.
+pub(crate) async fn structure_diff(
+    old: &ConnectInput,
+    new: &ConnectInput,
+    allow: bool,
+    state: &AppState,
 ) -> Result<SchemaDiff, CommandError> {
-    Ok(compare_inventories(&old, &new))
+    let old_inv = collect(old, allow, state).await?;
+    let new_inv = collect(new, allow, state).await?;
+    Ok(compare_inventories(&old_inv, &new_inv))
 }
 
 /// The UI-facing result of building a mapping: the engine `Mapping` (for save /
@@ -616,6 +624,58 @@ mod tests {
         }
     }
 
+    fn sequence(name: &str, last_value: i64) -> dmux_engine::inventory::Sequence {
+        dmux_engine::inventory::Sequence {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(1),
+            min_value: Some(1),
+            max_value: Some(i64::MAX),
+            increment: Some(1),
+            last_value: Some(last_value),
+            cycle: Some(false),
+            is_called: true,
+            unreadable: false,
+        }
+    }
+
+    /// Every JSON number in `v` must be exactly representable as a JS number.
+    fn assert_js_safe(v: &serde_json::Value) {
+        const MAX_SAFE: u64 = (1 << 53) - 1;
+        match v {
+            serde_json::Value::Number(n) => {
+                let ok = n.as_u64().is_some_and(|u| u <= MAX_SAFE)
+                    || n.as_i64().is_some_and(|i| i.unsigned_abs() <= MAX_SAFE);
+                assert!(ok, "JSON number {n} would lose precision in JavaScript");
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(assert_js_safe),
+            serde_json::Value::Object(o) => o.values().for_each(assert_js_safe),
+            _ => {}
+        }
+    }
+
+    /// The structure diff is the only thing `compare_structure` sends to the
+    /// webview.  Sequences at `i64::MAX` (the Postgres default bound) must not
+    /// put any number into it that JavaScript would round, and two values that
+    /// round to the same f64 must still be told apart.
+    #[test]
+    fn structure_diff_of_i64_max_sequences_is_js_safe_and_exact() {
+        let mut old_schema = schema("public", Vec::new());
+        old_schema.sequences = vec![sequence("seq_note", i64::MAX)];
+        let mut new_schema = schema("public", Vec::new());
+        new_schema.sequences = vec![sequence("seq_note", i64::MAX - 1)];
+
+        let diff = compare_inventories(&inventory(vec![old_schema]), &inventory(vec![new_schema]));
+        let json = serde_json::to_value(&diff).expect("serialise diff");
+        assert_js_safe(&json);
+
+        let text = json.to_string();
+        assert!(
+            text.contains("9223372036854775807 -> 9223372036854775806"),
+            "regression between adjacent i64 values must be reported exactly: {text}"
+        );
+    }
+
     #[test]
     fn exact_names_map_without_attention() {
         let old = inventory(vec![schema(
@@ -885,6 +945,47 @@ mod tests {
             .await
             .expect("probe");
         assert!(info.version_num >= 100000);
+    }
+
+    /// Regression: on demo_bank every sequence has the default `max_value`
+    /// (`i64::MAX`).  The structure compare used to round-trip both
+    /// inventories through the webview and failed with "invalid value:
+    /// integer `9223372036854776000`, expected i64".  It now runs end to end
+    /// in Rust, and what it returns is safe to hand to JavaScript.
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_diff_runs_on_demo_bank_with_i64_max_sequences() {
+        let (Some(old_url), Some(new_url)) = (
+            env_url("DMUX_TEST_DEMO_OLD_URL"),
+            env_url("DMUX_TEST_DEMO_NEW_URL"),
+        ) else {
+            return;
+        };
+        let state = test_state();
+        let input = |url: &str| {
+            let (profile, password) = profile_input_from_url(url);
+            crate::types::ConnectInput {
+                profile,
+                password: Some(password),
+            }
+        };
+        let (old, new) = (input(&old_url), input(&new_url));
+
+        // The fixture really does carry the value that used to break.  It is the
+        // new (10+) side: on 9.x the inventory leaves sequence bounds empty.
+        let new_inv = collect(&new, true, &state).await.expect("new inventory");
+        assert!(
+            new_inv
+                .schemas
+                .iter()
+                .flat_map(|s| &s.sequences)
+                .any(|s| s.max_value == Some(i64::MAX)),
+            "demo_bank should have a sequence at i64::MAX"
+        );
+
+        let diff = structure_diff(&old, &new, true, &state)
+            .await
+            .expect("structure diff");
+        assert_js_safe(&serde_json::to_value(&diff).expect("serialise diff"));
     }
 
     // --- Anti-password-theft tests (PLAN 6.5) ---

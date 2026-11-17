@@ -37,8 +37,6 @@ const rawServerInfo = {
   tls: { state: 'encrypted', verified: true },
 };
 
-const emptyInventory: Record<string, unknown> = {};
-
 function rawDiff(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     status: 'equal',
@@ -240,10 +238,7 @@ describe('createTauriEngine', () => {
 
   it('compareStructure collects both inventories and translates the diff', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(
           rawDiff({
             entries: [
@@ -282,6 +277,27 @@ describe('createTauriEngine', () => {
     expect(missing?.status).toBe('missing');
   });
 
+  it('compareStructure sends only connection details, never an inventory', async () => {
+    // Inventories hold 64-bit sequence bounds (up to i64::MAX) that a JS
+    // number rounds to 9223372036854776000; they must stay in the engine.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+
+    const engine = createTauriEngine();
+    await engine.compareStructure(profile({ port: 5433 }), profile({ port: 5434 }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const [cmd, args] = invoke.mock.calls[0] as [string, Record<string, unknown>];
+    expect(cmd).toBe('compare_structure');
+    expect(Object.keys(args).sort()).toEqual(['new', 'old']);
+    const oldArg = args.old as { profile: { port: number } };
+    const newArg = args.new as { profile: { port: number } };
+    expect(oldArg.profile.port).toBe(5433);
+    expect(newArg.profile.port).toBe(5434);
+  });
+
   it('buildMapping requires compareStructure first', async () => {
     const engine = createTauriEngine();
     await expect(engine.buildMapping(inventory())).rejects.toThrow();
@@ -289,10 +305,7 @@ describe('createTauriEngine', () => {
 
   it('buildMapping only auto-approves exact and case_insensitive matches', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(rawDiff());
       }
       if (cmd === 'build_mapping') {
@@ -329,10 +342,7 @@ describe('createTauriEngine', () => {
 
   it('saveMapping exports the backend-built mapping', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(rawDiff());
       }
       if (cmd === 'build_mapping') {
@@ -510,8 +520,7 @@ describe('data half is wired to the backend', () => {
     const engine = createTauriEngine();
     // Satisfy the compare/buildMapping prerequisites.
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
-      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
       if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
       if (cmd === 'build_check_plan') {
         return Promise.resolve({
@@ -546,8 +555,7 @@ describe('data half is wired to the backend', () => {
   it('startRun sends the resolved levels and control totals', async () => {
     const engine = createTauriEngine();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
-      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
       if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
       if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-abc' });
       return Promise.reject(new Error(`unexpected command ${cmd}`));
