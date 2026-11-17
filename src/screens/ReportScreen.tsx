@@ -27,13 +27,17 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
     setResultMessage(null);
     try {
       const res = await engine.exportReport({
+        runId: results.runId,
         format,
         includeKeys,
       });
+      const label = format === 'pdf' ? 'PDF' : 'Excel';
       if (res.ok) {
-        setResultMessage(`${format.toUpperCase()} report saved to ${res.filePath}`);
+        setResultMessage(`${label} report saved to ${res.filePath}`);
+      } else if (res.cancelled) {
+        setResultMessage(`${label} export cancelled. Nothing was saved.`);
       } else {
-        setError(res.error ?? 'Export failed');
+        setError(res.error ?? 'The report could not be saved.');
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

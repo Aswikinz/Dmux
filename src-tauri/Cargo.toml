@@ -16,6 +16,9 @@ tauri = { version = "2", features = [] }
 # app wraps its public API in typed, async Tauri commands; it never touches
 # `core/` (the comparison core) or `ident` directly.
 dmux-engine = { path = "../crates/dmux-engine" }
+# Report rendering (PDF/XLSX) from engine-held results, with the same
+# verification `dmux report` uses (T059).
+dmux-report = { path = "../crates/dmux-report" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -25,6 +28,9 @@ rusqlite = { version = "0.43.0", features = ["bundled"] }
 # Passwords live in the OS keychain (decision: PLAN 4.1). `v1` (default) gives
 # Windows Credential Manager and the Secret Service on Linux.
 keyring = "4.2.0"
+# Native save dialog for report export (T059).  Opened from Rust only: the
+# webview gets no dialog or filesystem permission, and never names the path.
+tauri-plugin-dialog = "2.8.4"
 # Session-only password cache when no keychain exists (T055): the secret is
 # zeroed on drop, and entries are keyed by a SHA-256 of the connection fields.
 zeroize = "1.9.1"

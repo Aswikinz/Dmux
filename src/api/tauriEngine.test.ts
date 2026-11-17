@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createTauriEngine,
-  EngineError,
   mapDiffStatus,
   mapLevel,
   mapOverallState,
@@ -509,11 +508,35 @@ describe('a failed run', () => {
 });
 
 describe('data half is wired to the backend', () => {
-  it('exportReport is still NOT_AVAILABLE (T024)', async () => {
+  it('exportReport sends only the run id, format and key choice, and maps a saved path', async () => {
+    invoke.mockResolvedValueOnce({ status: 'saved', path: '/home/u/dmux-run-1.pdf' });
     const engine = createTauriEngine();
-    const call = engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
-    await expect(call).rejects.toBeInstanceOf(EngineError);
-    await expect(call).rejects.toMatchObject({ code: 'NOT_AVAILABLE' });
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'pdf', include_keys: false },
+    });
+    expect(res).toEqual({ ok: true, filePath: '/home/u/dmux-run-1.pdf' });
+  });
+
+  it('exportReport reports a dismissed dialog as cancelled', async () => {
+    invoke.mockResolvedValueOnce({ status: 'cancelled' });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'excel', include_keys: true },
+    });
+    expect(res).toEqual({ ok: false, cancelled: true });
+  });
+
+  it('exportReport turns a typed backend error into plain text', async () => {
+    invoke.mockRejectedValueOnce({
+      kind: 'results_not_available',
+      message: 'results are not available: the run has not finished',
+    });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('has not finished');
   });
 
   it('buildCheckPlan invokes build_check_plan and maps the plan', async () => {

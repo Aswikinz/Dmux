@@ -117,11 +117,11 @@ describe('mockEngine', () => {
 
   it('exports PDF and Excel reports', async () => {
     await expect(
-      mockEngine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' }),
-    ).resolves.toMatchObject({ ok: true, filePath: '/tmp/x/report.pdf' });
+      mockEngine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false }),
+    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.pdf' });
     await expect(
-      mockEngine.exportReport({ format: 'excel', includeKeys: true, filePath: '/tmp/x' }),
-    ).resolves.toMatchObject({ ok: true, filePath: '/tmp/x/report.xlsx' });
+      mockEngine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true }),
+    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.xlsx' });
   });
 
   it('returns its version string', async () => {

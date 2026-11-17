@@ -635,12 +635,9 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
 
     async exportReport(request: ReportRequest): Promise<ReportResult> {
       // The mock never touches a real path: it reports a placeholder destination
-      // so the "saved to …" message stays meaningful without a temp-path default.
-      const base = request.filePath ?? 'chosen-location';
-      if (request.format === 'pdf') {
-        return { ok: true, filePath: `${base}/report.pdf` };
-      }
-      return { ok: true, filePath: `${base}/report.xlsx` };
+      // so the "saved to …" message stays meaningful.
+      const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
+      return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
     },
 
     async getVersion(): Promise<string> {
