@@ -425,6 +425,33 @@ async fn resolver_reads_the_catalog() {
             .unwrap();
         assert_eq!(dom.base(), &PgType::Int4);
         assert!(matches!(dom, PgType::Domain { .. }));
+        // point has typelem float8 and box has typelem point: still not arrays.
+        for (n, g) in [
+            ("point", Geo::Point),
+            ("box", Geo::Box),
+            ("line", Geo::Line),
+        ] {
+            assert_eq!(r(oid(n).await, -1).await.unwrap(), PgType::Geometric(g));
+        }
+        let nr = r(oid("numrange").await, -1).await.unwrap();
+        assert!(matches!(nr, PgType::Range { ref sub, .. } if **sub == PgType::Numeric(None)));
+        // Arrays of domains (PG 11+) resolve element-wise to the domain's base.
+        let arr: u32 = t
+            .query_one(
+                "SELECT typarray FROM pg_type WHERE oid = 'information_schema.cardinal_number'::regtype",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if arr != 0 {
+            let a = r(arr, -1).await.unwrap();
+            let PgType::Array(ref e) = a else {
+                panic!("array expected");
+            };
+            assert_eq!(e.base(), &PgType::Int4);
+            assert!(matches!(**e, PgType::Domain { .. }));
+        }
         let rng = r(oid("int4range").await, -1).await.unwrap();
         assert!(matches!(rng, PgType::Range { ref sub, .. } if **sub == PgType::Int4));
         // pg_class's row type holds reltuples real: printed form is not exact.

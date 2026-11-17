@@ -289,6 +289,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_extra_buckets_alone_count_towards_the_stop_rule() {
+        let base = fp(many(100));
+        // 64 buckets only in old, 64 only in new, 64 differing: each alone trips it.
+        let mut missing = base.clone();
+        missing.buckets.drain(..64);
+        missing.rows -= 64;
+        let c = cmp(&base, &missing);
+        assert_eq!(c.verdict, Verdict::WidelyDifferent);
+        assert_eq!(c.missing.len(), 64);
+        let c = cmp(&missing, &base);
+        assert_eq!(c.verdict, Verdict::WidelyDifferent);
+        assert_eq!(c.extra.len(), 64);
+        let mut mixed = base.clone();
+        mixed.buckets.drain(..32);
+        mixed.buckets.extend((1000..1032).map(|i| b(i, 1, 0)));
+        let c = cmp(&base, &mixed);
+        assert_eq!((c.missing.len(), c.extra.len()), (32, 32));
+        assert_eq!(c.verdict, Verdict::WidelyDifferent);
+        assert!(c.reasons.contains(&NotPassReason::BucketsDiffer));
+    }
+
+    #[test]
     fn needs_review_is_never_a_pass() {
         let a = fp(many(5));
         let mut r = a.clone();

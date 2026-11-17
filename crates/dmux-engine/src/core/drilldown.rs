@@ -144,11 +144,8 @@ pub fn classify(old: Vec<RowRef>, new: Vec<RowRef>) -> Drilldown {
         }
         // Counted set: surplus copies on one side are missing or extra rows.
         let (lo, ln) = (o.len(), n.len());
-        if lo > ln {
-            d.missing.extend(o.into_iter().skip(ln));
-        } else {
-            d.extra.extend(n.into_iter().skip(lo));
-        }
+        d.missing.extend(o.into_iter().skip(ln));
+        d.extra.extend(n.into_iter().skip(lo));
     }
     d
 }
@@ -279,9 +276,24 @@ mod tests {
     }
 
     #[test]
+    fn each_kind_of_difference_explains_a_bucket() {
+        let one = |f: fn(&mut Drilldown)| {
+            let mut d = Drilldown::default();
+            f(&mut d);
+            d.explains_difference()
+        };
+        assert!(!one(|_| {}));
+        assert!(one(|d| d.missing.push(r("a", "1"))));
+        assert!(one(|d| d.extra.push(r("a", "1"))));
+        assert!(one(|d| d.changed.push((r("a", "1"), r("a", "2")))));
+        assert!(one(|d| d.duplicate_keys.push("a".into())));
+    }
+
+    #[test]
     fn debug_hides_row_data() {
         let s = format!("{:?}", r("a", "1"));
         assert!(!s.contains("secret"));
+        assert!(s.contains("RowRef") && s.contains("<hidden>") && s.contains("bucket: 1"));
         let c = ChangedRow {
             key_hash: "k".into(),
             key: vec![Some("secret".into())],
@@ -289,7 +301,9 @@ mod tests {
             old: vec![Some("secret".into())],
             new: vec![None],
         };
-        assert!(!format!("{c:?}").contains("secret"));
+        let s = format!("{c:?}");
+        assert!(!s.contains("secret"));
+        assert!(s.contains("ChangedRow") && s.contains("<hidden>") && s.contains("columns: [1]"));
     }
 
     #[test]
