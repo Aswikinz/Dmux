@@ -67,7 +67,7 @@ Status: todo, doing, review, done, blocked.
 | T051 | Audit M8: build provenance attestations + keyless cosign signature on SHA256SUMS + verify instructions. | kenji | done | T026 |
 | T052 | Fixtures: RLS database (rls_bank) and a TLS-only Postgres (profile tls, :5439). | nina | done | T026 |
 | T056 | Release v0.3.0 (desktop app wired + reports; first signed/attested release). | maya | done | T040, T024, T054 |
-| T057 | Real-app E2E (WebDriver on the release binary vs demo_bank: type profile + password → run → FAIL verdict → export), Playwright in CI, rls_bank in CI, non-SQL-user walkthrough with screenshots. Owner question. | sam + kenji | in progress | T054 |
+| T057 | Real-app E2E (WebDriver on the release binary vs demo_bank: type profile + password → run → FAIL verdict → export), Playwright in CI, rls_bank in CI, non-SQL-user walkthrough with screenshots. Owner question. | sam + kenji | done | T054 |
 | T063 | Release prep for v1.0.0: versions bumped together, CHANGELOG, release workflow stable/pre-release header. Tag only after the owner re-runs the external audit (decisions 20, 22, 23). | claude-code | done | T026 re-audit |
 | T062 | TLS follow-ups: CLI `--ca-file` (ConnArgs + run definitions) → ConnProfile::with_ca_file; ca_file in definition_hash (resume keying). | claude-code (owner handover) | done | T044, T047 |
 | T058 | Sequence bounds up to i64::MAX broke Compare structure (inventories round-tripped through the webview as JS numbers): compare_structure keeps inventories in Rust, only the diff crosses IPC; drill-down rows paged. Taken over and finished by claude-code. | claude-code | done | T057 |
