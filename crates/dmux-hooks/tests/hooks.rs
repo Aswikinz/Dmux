@@ -299,6 +299,46 @@ fn background_grandchild_does_not_block_normal_exit() {
 }
 
 #[test]
+fn setsid_grandchild_does_not_hang_reader_join() {
+    if !python_available() {
+        require_python();
+        return;
+    }
+    #[cfg(not(unix))]
+    {
+        // setsid is Unix-only; on Windows this fixture cannot escape the group.
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let script = fixtures().join("setsid_grandchild.py");
+        let mut spec = HookSpec::new(&script);
+        spec.timeout = Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        let result = run_hook(&spec, &sample_results()).expect("run_hook returns");
+        let elapsed = start.elapsed();
+
+        // The grandchild escapes the group kill via setsid and holds stdout
+        // open; the runner must NOT join a reader stuck on the pipe.  It must
+        // return promptly (well under the 5 s limit) with a warning.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "a setsid grandchild held the runner past the drain deadline"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be fully collected")),
+            "expected an uncollected-output warning, got {:?}",
+            result.warnings
+        );
+        assert!(result.findings.is_empty());
+    }
+}
+
+#[test]
 fn fail_finding_is_returned_with_fail_severity() {
     if !python_available() {
         require_python();

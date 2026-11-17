@@ -410,6 +410,19 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
                 truncate_for_log(&stderr)
             ));
         }
+        Collect::Uncollected(stderr) => {
+            warnings.push(format!(
+                "hook {} output could not be fully collected (a child process kept stdout open)",
+                spec.script.display()
+            ));
+            if !stderr.is_empty() {
+                warnings.push(format!(
+                    "hook {} stderr: {}",
+                    spec.script.display(),
+                    truncate_for_log(&stderr)
+                ));
+            }
+        }
     }
 
     Ok(HookResult {
@@ -548,9 +561,19 @@ pub fn sanitize_for_spreadsheet(value: &str) -> String {
 enum Collect {
     Findings(Vec<Finding>),
     BadOutput(String),
-    TimedOut { limit_ms: u64, stderr: String },
+    TimedOut {
+        limit_ms: u64,
+        stderr: String,
+    },
     Spawn(String),
-    ExitNoFindings { code: Option<i32>, stderr: String },
+    ExitNoFindings {
+        code: Option<i32>,
+        stderr: String,
+    },
+    /// The script finished (or was killed) but its stdout could not be fully
+    /// collected before the drain deadline — an escaped grandchild held the
+    /// pipe open.  Treated as a hook error, never as findings.
+    Uncollected(String),
 }
 
 /// Spawn the interpreter, feed it the payload, cap stdout/stderr, enforce the
@@ -605,8 +628,12 @@ fn spawn_and_collect(
     // us on a full pipe.
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let stdout_thread = spawn_reader(child.stdout.take(), MAX_OUTPUT_BYTES, stdout_tx);
-    let stderr_thread = spawn_reader(child.stderr.take(), MAX_OUTPUT_BYTES, stderr_tx);
+    // The reader threads are fully detached: we never join them (a grandchild
+    // that escaped the group kill via setsid would otherwise block a join
+    // forever holding the pipe open).  We only ever read what they deposit on
+    // the channels before the drain deadline.
+    spawn_reader(child.stdout.take(), MAX_OUTPUT_BYTES, stdout_tx);
+    spawn_reader(child.stderr.take(), MAX_OUTPUT_BYTES, stderr_tx);
 
     // Write stdin on a detached thread so a full pipe (a script that never reads
     // its input) can never stall the parent; the time limit below still holds
@@ -673,12 +700,15 @@ fn spawn_and_collect(
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
                 };
             }
-            let stdout_bytes = stdout_bytes.unwrap_or_default();
             let stderr_bytes = stderr_bytes.unwrap_or_default();
             let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-            // The group is dead; the reader threads end on their own (no join).
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            // If stdout never made it onto the channel in time (a grandchild
+            // escaped the group kill and kept stdout open), treat it as a hook
+            // error: we never run a script we could not observe to completion.
+            let stdout_bytes = match stdout_bytes {
+                Some(bytes) => bytes,
+                None => return Collect::Uncollected(stderr),
+            };
             return match parse_stdout(&stdout_bytes) {
                 Ok(findings) => Collect::Findings(findings),
                 Err(_) => {
@@ -700,7 +730,11 @@ fn spawn_reader<T: std::io::Read + Send + 'static>(
     from: Option<T>,
     cap: usize,
     tx: std::sync::mpsc::Sender<Vec<u8>>,
-) -> std::thread::JoinHandle<()> {
+) {
+    // Detached thread: the handle is dropped so a stuck reader (a grandchild
+    // that escaped the group kill and keeps a pipe open) can never be joined
+    // and block the parent.  The channel receiver is drained with a deadline
+    // instead.
     std::thread::spawn(move || {
         let mut out = Vec::new();
         if let Some(mut r) = from {
@@ -719,7 +753,7 @@ fn spawn_reader<T: std::io::Read + Send + 'static>(
             }
         }
         let _ = tx.send(out);
-    })
+    });
 }
 
 fn parse_stdout(bytes: &[u8]) -> Result<Vec<Finding>, ()> {

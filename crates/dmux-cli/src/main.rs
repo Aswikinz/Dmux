@@ -707,10 +707,10 @@ async fn run_run(args: RunArgs) -> ExitCode {
             }
         };
 
-        // A custom-check `fail` must change the *written* verdict, never only
-        // the exit code (false PASS).  A fail finding ⇒ FAIL (exit 1).  A hook
-        // timeout / crash / invalid output is a warning (exit 2), but only when
-        // there is no fail finding.
+        // The written verdict must match the exit code.  A fail finding ⇒
+        // verdict FAIL; a hook warning (timeout / crash / invalid / uncollected
+        // output) on an otherwise-PASS run ⇒ verdict WARNING with a recorded
+        // reason.  Neither may ever raise a non-PASS verdict back to PASS.
         let has_fail = hook_causes_non_pass(&hook_results);
         let has_warning = hook_results.iter().any(|r| !r.warnings.is_empty());
         exit_code = hook_exit_code(has_fail, has_warning, exit_code);
@@ -718,9 +718,7 @@ async fn run_run(args: RunArgs) -> ExitCode {
         // Mutate a typed copy of the results (so results_sha256 is recomputed
         // over exactly what is written) and re-serialise.
         let mut typed = outcome.results.clone();
-        if has_fail {
-            apply_custom_fail(&mut typed, &hook_results);
-        }
+        apply_hook_verdict(&mut typed, has_fail, has_warning, &hook_results);
 
         // Recompute the results-level self-hash over the mutated content, then
         // wrap everything in the envelope with its own SHA-256 so the hook
@@ -736,29 +734,40 @@ async fn run_run(args: RunArgs) -> ExitCode {
     ExitCode::from(exit_code)
 }
 
-/// Fold a custom-check `fail` finding into the typed results.  A `fail` finding
-/// turns a PASS verdict into FAIL with reason "custom check <id> failed" pushed
-/// into `warnings`.  It never lowers an already non-PASS verdict back to PASS,
-/// and never raises a FAILED run: any existing non-PASS verdict is left as-is
-/// (it is at least as grave as FAIL).
-fn apply_custom_fail(results: &mut RunResults, hook_results: &[dmux_hooks::HookResult]) {
-    let fail_ids: Vec<String> = hook_results
-        .iter()
-        .flat_map(|r| r.findings.iter())
-        .filter(|f| f.severity == Severity::Fail)
-        .map(|f| f.id.clone())
-        .collect();
-    if fail_ids.is_empty() {
-        return;
-    }
-
-    // Only a clean PASS is demoted; any non-PASS verdict already reflects a
-    // data or tool problem and must never be masked by a hook.
-    if results.verdict == Verdict::Pass {
-        results.verdict = Verdict::Fail;
-    }
-    for id in &fail_ids {
-        results.warnings.push(format!("custom check {id} failed"));
+/// Fold the hook outcome into the typed results so the written verdict matches
+/// the exit code.
+///
+/// - A `fail` finding turns a PASS into FAIL with reason "custom check <id>
+///   failed" recorded per finding.
+/// - A hook warning (timeout / crash / invalid / uncollected output) without a
+///   fail finding turns a PASS into WARNING with a recorded reason.
+/// - A fail finding never lowers an existing (already non-PASS) verdict back to
+///   PASS, and a warning never lowers a FAIL: the hook can only force the
+///   verdict off PASS, never mask a data or tool problem.
+fn apply_hook_verdict(
+    results: &mut RunResults,
+    has_fail: bool,
+    has_warning: bool,
+    hook_results: &[dmux_hooks::HookResult],
+) {
+    if has_fail {
+        if results.verdict == Verdict::Pass {
+            results.verdict = Verdict::Fail;
+        }
+        let fail_ids: Vec<String> = hook_results
+            .iter()
+            .flat_map(|r| r.findings.iter())
+            .filter(|f| f.severity == Severity::Fail)
+            .map(|f| f.id.clone())
+            .collect();
+        for id in fail_ids {
+            results.warnings.push(format!("custom check {id} failed"));
+        }
+    } else if has_warning && results.verdict == Verdict::Pass {
+        results.verdict = Verdict::Warning;
+        results
+            .warnings
+            .push("a custom check hook reported a problem; see hooks.warnings".to_string());
     }
 }
 
@@ -895,8 +904,8 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     })
 }
 
-/// Minimal `RunResults` for the `apply_custom_fail` tests (the engine type, but
-/// built by hand so no live run is needed).
+/// Minimal `RunResults` for the `apply_hook_verdict` tests (the engine type,
+/// but built by hand so no live run is needed).
 #[cfg(test)]
 fn minimal_run_results(verdict: Verdict) -> RunResults {
     RunResults {
@@ -922,7 +931,7 @@ fn minimal_run_results(verdict: Verdict) -> RunResults {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_superuser_requires_reason, apply_custom_fail, hook_causes_non_pass, hook_exit_code,
+        allow_superuser_requires_reason, apply_hook_verdict, hook_causes_non_pass, hook_exit_code,
         minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs, Severity,
         EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
@@ -1118,7 +1127,7 @@ mod tests {
 
         // A PASS verdict must flip to FAIL with the reason recorded.
         let mut pass_results = minimal_run_results(Verdict::Pass);
-        apply_custom_fail(&mut pass_results, std::slice::from_ref(&fail));
+        apply_hook_verdict(&mut pass_results, true, false, std::slice::from_ref(&fail));
         assert_eq!(pass_results.verdict, Verdict::Fail);
         assert!(
             pass_results
@@ -1131,13 +1140,66 @@ mod tests {
 
         // An already-FAIL verdict must never be raised back to PASS.
         let mut fail_results = minimal_run_results(Verdict::Fail);
-        apply_custom_fail(&mut fail_results, std::slice::from_ref(&fail));
+        apply_hook_verdict(&mut fail_results, true, false, std::slice::from_ref(&fail));
         assert_eq!(fail_results.verdict, Verdict::Fail);
 
         // A non-PASS, non-FAIL verdict stays as-is (never lowered to PASS).
         let mut tf = minimal_run_results(Verdict::ToolFault);
-        apply_custom_fail(&mut tf, std::slice::from_ref(&fail));
+        apply_hook_verdict(&mut tf, true, false, &[fail]);
         assert_eq!(tf.verdict, Verdict::ToolFault);
+    }
+
+    #[test]
+    fn warning_plus_fail_yields_verdict_fail() {
+        use dmux_hooks::Finding;
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec!["timed out".into()],
+        };
+
+        // WARNING + fail ⇒ file verdict FAIL (fail takes precedence); a warning
+        // must never lower a FAIL.
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut results, true, true, &[fail]);
+        assert_eq!(results.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn hook_warning_on_pass_yields_verdict_warning() {
+        // A hook that timed out / crashed / produced invalid or uncollected
+        // output on an otherwise-PASS run ⇒ file verdict WARNING with a reason.
+        let warn = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![],
+            warnings: vec!["hook timed out after 1000 ms".into()],
+        };
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut results, false, true, &[warn]);
+        assert_eq!(results.verdict, Verdict::Warning);
+        assert!(
+            results
+                .warnings
+                .iter()
+                .any(|w| w.contains("custom check hook reported a problem")),
+            "warning reason not recorded: {:?}",
+            results.warnings
+        );
+
+        // A hook warning never downgrades an existing non-PASS verdict.
+        let warn2 = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![],
+            warnings: vec!["timed out".into()],
+        };
+        let mut fail = minimal_run_results(Verdict::Fail);
+        apply_hook_verdict(&mut fail, false, true, &[warn2]);
+        assert_eq!(fail.verdict, Verdict::Fail);
     }
 
     #[test]
@@ -1153,7 +1215,7 @@ mod tests {
             }],
             warnings: vec![],
         };
-        apply_custom_fail(&mut results, &[info]);
+        apply_hook_verdict(&mut results, false, false, &[info]);
         assert_eq!(results.verdict, Verdict::Pass);
     }
 
@@ -1188,7 +1250,7 @@ mod tests {
             warnings: vec![],
         };
         let mut results = minimal_run_results(Verdict::Pass);
-        apply_custom_fail(&mut results, std::slice::from_ref(&fail));
+        apply_hook_verdict(&mut results, true, false, &[fail]);
         // Recompute exactly as run_run does before writing.
         results.results_sha256 = dmux_engine::results::sha256_of(&results);
 
