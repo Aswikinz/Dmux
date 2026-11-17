@@ -60,6 +60,12 @@ jobs:
       # merge after T015/T016, which add testdata/demo_bank/ to main.
       DMUX_TEST_DEMO_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/demo_bank
       DMUX_TEST_DEMO_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/demo_bank
+      # The RLS fail-closed fixture (built below) for the T043 engine test that
+      # proves a row-level-security table is a TOOL_FAULT, never a false PASS.
+      # Reader login dmux_rls_reader is a non-superuser (allow_superuser stays
+      # false); the password is the testdata/rls/build.sh default (throwaway).
+      DMUX_TEST_RLS_OLD_URL: postgres://dmux_rls_reader:dmux_rls_only@127.0.0.1:5433/rls_bank
+      DMUX_TEST_RLS_NEW_URL: postgres://dmux_rls_reader:dmux_rls_only@127.0.0.1:5434/rls_bank
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -124,6 +130,17 @@ jobs:
       - name: Build demo_bank fixture (old -> new)
         run: bash testdata/demo_bank/build.sh 5433 5434
 
+      # RLS fail-closed fixture (T052): one FORCE-ROW-LEVEL-SECURITY table whose
+      # hidden half differs between the two sides, so a silently-filtered scan
+      # would falsely PASS. Built here so the T043 engine test (crates/dmux-engine/
+      # tests/rls.rs, gated on DMUX_TEST_RLS_*_URL) runs on every push. The script
+      # self-checks the fixture and exits non-zero on any failure. The 9.6 + 17
+      # services both support RLS (9.5+).
+      - name: Build RLS fixture (rls_bank, old -> new)
+        env:
+          DMUX_RLS_PASSWORD: dmux_rls_only
+        run: bash testdata/rls/build.sh 5433 5434
+
       - name: Rust tests
         run: cargo test --workspace
 
@@ -164,6 +181,30 @@ jobs:
 
       - name: Frontend build
         run: pnpm build
+
+      # Playwright browser UI tests (decision 7: engine mocked). Chromium is
+      # installed with its system deps and cached; playwright.config.ts starts
+      # the Vite dev server itself. The HTML report is uploaded on failure so a
+      # red UI test is debuggable rather than just "some test failed".
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.65.1
+
+      - name: Install Playwright browser (Chromium)
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: UI tests (Playwright, Chromium)
+        run: pnpm test:ui
+
+      - name: Upload Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
 
       # Fail-closed on purpose: a silent coverage-upload failure would let
       # the badge and the Codecov/SonarCloud dashboards drift from reality,
@@ -275,6 +316,38 @@ jobs:
     name: Build + smoke (Ubuntu 22.04)
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    # The real-app E2E spec (e2e/specs/real-flow.spec.ts) drives the release
+    # binary against a real old/new Postgres pair, not the mock engine. These
+    # service containers stand in for the throwaway Podman mocks (same images,
+    # same public throwaway credentials, same LATIN1/C old and UTF-8 new split).
+    services:
+      old:
+        image: postgres:9.6
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+          POSTGRES_INITDB_ARGS: '--encoding=LATIN1 --locale=C'
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      new:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -383,10 +456,50 @@ jobs:
             target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
+      # The real-app E2E spec needs demo_bank and a non-superuser login: Dmux
+      # refuses the superuser `dmux_dev` by default (PLAN 6.2) and the UI has no
+      # override yet, so a least-privilege reader is created after the build.
+      - name: Install PostgreSQL client (psql, pg_dump, pg_restore)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      # GHA starts service containers alongside the job and does not reliably
+      # block on the health check (actions/runner#496), so wait here explicitly.
+      - name: Wait for Postgres service containers
+        run: |
+          for port in 5433 5434; do
+            for _ in $(seq 1 30); do
+              pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank && break
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
+          done
+
+      # The planted answer-key demo_bank (12 missing transactions, a changed
+      # balance, etc.), so the run must surface FAIL, never PASS.
+      - name: Build demo_bank fixture (old -> new)
+        run: bash testdata/demo_bank/build.sh 5433 5434
+
+      - name: Create read-only E2E login (dmux_reader)
+        env:
+          PGPASSWORD: dmux_dev_only
+        run: |
+          for port in 5433 5434; do
+            psql -h 127.0.0.1 -p "$port" -U dmux_dev -d demo_bank -v ON_ERROR_STOP=1 \
+              -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'dmux_reader') THEN CREATE ROLE dmux_reader LOGIN; END IF; END \$\$" \
+              -c "ALTER ROLE dmux_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'dmux_reader_only'" \
+              -c "GRANT CONNECT ON DATABASE demo_bank TO dmux_reader" \
+              -c "GRANT USAGE ON SCHEMA demo_bank TO dmux_reader" \
+              -c "GRANT SELECT ON ALL TABLES IN SCHEMA demo_bank TO dmux_reader" \
+              -c "GRANT SELECT, USAGE ON ALL SEQUENCES IN SCHEMA demo_bank TO dmux_reader"
+          done
+
       # Smoke runs AFTER bundling: `pnpm tauri build` produces the release
       # binary with the UI embedded. A plain `cargo build` binary is dev-mode
       # (loads http://localhost:5173, no embedded UI) and must not be smoked.
       # Last in the job so a smoke failure still keeps the uploaded installers.
+      # This run has no keychain and no E2E login, so only the shell smoke runs.
       - name: Smoke test (WebKitGTK under Xvfb)
         timeout-minutes: 15
         env:
@@ -395,6 +508,56 @@ jobs:
           # is the standard workaround for CI.
           WEBKIT_DISABLE_COMPOSITING_MODE: '1'
         run: xvfb-run -a pnpm test:e2e
+
+      # Real-app E2E (no-keychain variant, T055): no Secret Service is running,
+      # so the typed password is kept in memory for the session. Drives Connect
+      # (typed password + Test connection) through Compare structure.
+      - name: Real-app E2E (no keychain, demo_bank)
+        timeout-minutes: 15
+        env:
+          DMUX_APP_BINARY: target/release/dmux-app
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          DMUX_E2E_USER: dmux_reader
+          DMUX_E2E_PASSWORD: dmux_reader_only
+        run: xvfb-run -a pnpm test:e2e --spec e2e/specs/real-flow.spec.ts
+
+      # Real-app E2E (keychain variant): drive the release binary through the
+      # full flow against demo_bank with a working Secret Service. gnome-keyring
+      # is started and unlocked headless (the unlock password is arbitrary; the
+      # keyring just has to be unlocked for the keyring crate to store/read).
+      # dbus-run-session guarantees a session bus for Secret Service. The
+      # no-keychain variant runs in the step above.
+      - name: Real-app E2E (keychain, demo_bank)
+        timeout-minutes: 20
+        env:
+          DMUX_APP_BINARY: target/release/dmux-app
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          DMUX_E2E_KEYCHAIN: '1'
+          DMUX_E2E_USER: dmux_reader
+          DMUX_E2E_PASSWORD: dmux_reader_only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            # Unlock the login keyring (creating it with this throwaway password
+            # on first run) and then start the secrets component, all on the SAME
+            # session bus the app will use, so the keyring crate can store/read.
+            echo -n "dmux-e2e" | gnome-keyring-daemon --unlock
+            gnome-keyring-daemon --start --components=secrets
+            xvfb-run -a pnpm test:e2e --spec e2e/specs/real-flow.spec.ts
+          '
+
+      # On a failed real-app run the afterTest hook writes a screenshot + the
+      # rendered page text to e2e/artifacts/; upload them so a timeout is
+      # debuggable (which STEP, what the screen showed), never just "Timeout".
+      - name: Upload real-flow diagnostics (on failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: real-flow-diagnostics
+          path: e2e/artifacts/
+          if-no-files-found: ignore
 
   build-windows:
     name: Build + smoke (Windows)
