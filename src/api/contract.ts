@@ -21,6 +21,8 @@ export interface ConnectionProfile {
   tlsFingerprint?: string;
   /** Recorded reason for an unencrypted connection (encryption === 'allow-plaintext'). */
   plaintextReason?: string;
+  /** Path to a private-CA PEM bundle (a bank's internal CA), used with 'verify'. */
+  caFile?: string;
   /** Stored in the OS keychain, never in UI state. */
   passwordFromKeychain?: boolean;
 }

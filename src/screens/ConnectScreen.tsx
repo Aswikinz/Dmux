@@ -97,6 +97,20 @@ function ProfileEditor({
         }
         data-testid={`${title}-encryption`}
       />
+      {profile.encryption === 'verify' && (
+        <div className="space-y-1">
+          <Input
+            label="Your bank's certificate authority file (optional)"
+            value={profile.caFile ?? ''}
+            onChange={(e) => onChange({ ...profile, caFile: e.target.value })}
+            data-testid={`${title}-ca-file`}
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            A PEM bundle of your bank's private certificate authority, so an internal server can
+            be verified.
+          </p>
+        </div>
+      )}
       {profile.encryption === 'trust' && (
         <div className="space-y-1">
           <Input

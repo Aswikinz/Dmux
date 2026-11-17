@@ -52,6 +52,12 @@ describe('mockEngine', () => {
     expect(res.info?.tls).toHaveProperty('fingerprint');
   });
 
+  it('accepts a private-CA file on a verify profile', async () => {
+    const res = await mockEngine.testConnection(profile({ caFile: '/tmp/bank-ca.pem' }));
+    expect(res.ok).toBe(true);
+    expect(res.info?.tls).toEqual({ state: 'encrypted', verified: true });
+  });
+
   it('returns the base inventory by default', async () => {
     const inv = await mockEngine.compareStructure(defaultOldProfile(), defaultNewProfile());
     expect(inv.schemas[0].name).toBe('demo_bank');

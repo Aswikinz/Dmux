@@ -208,6 +208,7 @@ interface BackendProfile {
   encryption: EncryptionField;
   tls_fingerprint: string | null;
   plaintext_reason: string | null;
+  ca_file: string | null;
 }
 
 /** The engine's `CheckLevel` serialises as snake_case (`counts_and_totals`, ...). */
@@ -535,6 +536,7 @@ function toBackendProfile(profile: ConnectionProfile): BackendProfile {
     encryption,
     tls_fingerprint: profile.tlsFingerprint ?? null,
     plaintext_reason: profile.plaintextReason ?? null,
+    ca_file: profile.caFile ?? null,
   };
 }
 
