@@ -3,7 +3,9 @@
 # The license allow-list below is built from the ACTUAL dependency tree
 # (`cargo deny list`), not guessed. It is permissive-only: OSI-approved
 # permissive licences plus MPL-2.0 (weak, file-level copyleft) and the Unicode
-# data licence. No wildcards. A licence not listed in `allow` is denied by
+# data licence. No wildcard version requirements on registry dependencies
+# (unversioned workspace-internal path deps are the one allowed exception; see
+# [bans]). A licence not listed in `allow` is denied by
 # default, so a new dependency with an unapproved licence is surfaced loudly at
 # review time.
 #
@@ -39,8 +41,12 @@ ignore = [
 [bans]
 # Duplicate versions are common in a deep Tauri tree; warn, do not fail.
 multiple-versions = "warn"
-# No wildcard version requirements are allowed anywhere.
+# No wildcard version requirements are allowed for registry dependencies.
 wildcards = "deny"
+# Workspace-internal path dependencies (dmux-cli -> dmux-engine) carry no version;
+# they are never published, so a version requirement would be noise. Every
+# workspace member sets `publish = false`; registry deps are still checked.
+allow-wildcard-paths = true
 
 [sources]
 # Everything must come from the crates.io registry. No git or unknown sources.
@@ -57,6 +63,13 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CC0-1.0",
+    # ISC (permissive, OSI-approved): needed by the rustls stack — ring
+    # ("Apache-2.0 AND ISC"), rustls-webpki and untrusted. Compatible with this
+    # repo's Apache-2.0 licence.
+    "ISC",
+    # CDLA-Permissive-2.0 (permissive data licence): the webpki-roots CA bundle
+    # (v0.26.11 and its v1.0.12 successor), which is certificate data, not code.
+    "CDLA-Permissive-2.0",
     "MIT",
     "MIT-0",
     "MPL-2.0",

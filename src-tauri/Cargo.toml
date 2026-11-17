@@ -4,6 +4,8 @@ description = "Dmux desktop app (Phase 0 skeleton)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Never published: this is the desktop app binary.
+publish = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -16,6 +16,8 @@ describe('Dmux smoke test', () => {
     await expect(heading).toBeDisplayed();
 
     const body = await $('body');
-    await expect(body).toHaveText(expect.stringContaining('Old database'));
+    // The section label is uppercased by CSS, and WebDriver returns the
+    // rendered (uppercase) text, so match case-insensitively.
+    await expect(body).toHaveText(expect.stringMatching(/old database/i));
   });
 });
