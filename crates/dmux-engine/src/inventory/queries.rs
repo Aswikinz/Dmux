@@ -1,7 +1,8 @@
 //! Fixed catalog queries used by [`super::collect_inventory`].
 //!
-//! Every statement is a literal string with `$1` bound parameters only.
-//! No identifiers are interpolated.
+//! Every statement is a literal string with `$1` bound parameters only.  The
+//! one place an identifier is built at runtime is the per-sequence `last_value`
+//! read on PostgreSQL < 10, and that goes through `crate::ident::quote_qualified`.
 
 use super::{Extension, Function, Index, Sequence, Trigger, View};
 use crate::inventory::{
@@ -14,20 +15,22 @@ use tokio_postgres::GenericClient;
 pub const EXCLUDED_SCHEMAS_FILTER_SQL: &str =
     "!~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$'";
 
-pub(crate) async fn server_version(client: &impl GenericClient) -> Result<String, InventoryError> {
+pub(crate) async fn server_version<T: GenericClient>(client: &T) -> Result<String, InventoryError> {
     let row = client.query_one("SHOW server_version", &[]).await?;
     req_string(&row, 0)
 }
 
-pub(crate) async fn server_version_num(client: &impl GenericClient) -> Result<i32, InventoryError> {
+pub(crate) async fn server_version_num<T: GenericClient>(
+    client: &T,
+) -> Result<i32, InventoryError> {
     let row = client.query_one("SHOW server_version_num", &[]).await?;
     let text: String = req_string(&row, 0)?;
     text.parse::<i32>()
         .map_err(|_| InventoryError::VersionParse(text.clone()))
 }
 
-pub(crate) async fn database_properties(
-    client: &impl GenericClient,
+pub(crate) async fn database_properties<T: GenericClient>(
+    client: &T,
 ) -> Result<DatabaseProperties, InventoryError> {
     let row = client
         .query_one(
@@ -52,8 +55,8 @@ pub(crate) async fn database_properties(
     })
 }
 
-pub(crate) async fn list_schemas(
-    client: &impl GenericClient,
+pub(crate) async fn list_schemas<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<ListSchema>, InventoryError> {
     let rows = client
         .query(
@@ -75,10 +78,13 @@ pub(crate) async fn list_schemas(
         .collect()
 }
 
-pub(crate) async fn list_tables(
-    client: &impl GenericClient,
+pub(crate) async fn list_tables<T: GenericClient>(
+    client: &T,
     version_num: i32,
 ) -> Result<Vec<ListTable>, InventoryError> {
+    // Columns are identical across the two branches; only the has_oids source
+    // differs (relhasoids was removed in PostgreSQL 12).  relkind includes
+    // foreign tables ('f') so they are compared, not silently ignored.
     let sql = if version_num >= 120000 {
         "SELECT \
              n.nspname AS schema_name, \
@@ -92,7 +98,7 @@ pub(crate) async fn list_tables(
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_catalog.pg_stat_user_tables s ON s.relid = c.oid \
-         WHERE c.relkind IN ('r', 'p') \
+         WHERE c.relkind IN ('r', 'p', 'f') \
            AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
          ORDER BY n.nspname, c.relname"
     } else {
@@ -108,7 +114,7 @@ pub(crate) async fn list_tables(
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_catalog.pg_stat_user_tables s ON s.relid = c.oid \
-         WHERE c.relkind IN ('r', 'p') \
+         WHERE c.relkind IN ('r', 'p', 'f') \
            AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
          ORDER BY n.nspname, c.relname"
     };
@@ -117,7 +123,7 @@ pub(crate) async fn list_tables(
     rows.into_iter()
         .map(|row| {
             let last_analyze = opt_string(&row, 6)?;
-            let n_live_tup = req_i64(&row, 4)?;
+            let n_live_tup = req_i64(&row, 5)?;
             let stats_missing = last_analyze.is_none() && n_live_tup > 0;
             Ok(ListTable {
                 schema_name: req_string(&row, 0)?,
@@ -134,8 +140,8 @@ pub(crate) async fn list_tables(
         .collect()
 }
 
-pub(crate) async fn list_columns(
-    client: &impl GenericClient,
+pub(crate) async fn list_columns<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<ColumnInTable>, InventoryError> {
     let rows = client
         .query(
@@ -150,7 +156,7 @@ pub(crate) async fn list_columns(
              JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-             WHERE c.relkind IN ('r', 'p') \
+             WHERE c.relkind IN ('r', 'p', 'f') \
                AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
                AND a.attnum > 0 \
                AND NOT a.attisdropped \
@@ -178,8 +184,8 @@ pub(crate) async fn list_columns(
         .collect()
 }
 
-pub(crate) async fn list_constraints(
-    client: &impl GenericClient,
+pub(crate) async fn list_constraints<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<ConstraintInTable>, InventoryError> {
     let rows = client
         .query(
@@ -187,13 +193,14 @@ pub(crate) async fn list_constraints(
                  n.nspname AS schema_name, \
                  c.relname AS table_name, \
                  con.conname AS constraint_name, \
-                 con.contype AS type, \
+                 con.contype::text AS type, \
                  con.convalidated AS validated, \
                  pg_catalog.pg_get_constraintdef(con.oid, true) AS definition \
              FROM pg_catalog.pg_constraint con \
              JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
+             WHERE con.contype <> 'n' \
+               AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
              ORDER BY n.nspname, c.relname, con.conname",
             &[],
         )
@@ -223,8 +230,8 @@ pub(crate) async fn list_constraints(
         .collect()
 }
 
-pub(crate) async fn list_indexes(
-    client: &impl GenericClient,
+pub(crate) async fn list_indexes<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<IndexInTable>, InventoryError> {
     let rows = client
         .query(
@@ -259,15 +266,14 @@ pub(crate) async fn list_indexes(
         .collect()
 }
 
-pub(crate) async fn list_sequences(
-    client: &impl GenericClient,
+pub(crate) async fn list_sequences<T: GenericClient>(
+    client: &mut T,
     version_num: i32,
 ) -> Result<Vec<SequenceInSchema>, InventoryError> {
     if version_num < 100000 {
-        // PostgreSQL < 10: pg_sequences does not exist.  Reading per-sequence
-        // values needs identifier interpolation (the core quoting helper), so
-        // we list the names but mark values as skipped.  In 9.x sequences are
-        // always bigint.
+        // PostgreSQL < 10 has no pg_sequences view.  List the sequence names and
+        // read each last_value with a schema-qualified identifier (through the
+        // quoting helper).  Sequences are always bigint before the `AS` clause.
         let rows = client
             .query(
                 "SELECT n.nspname AS schema_name, c.relname AS sequence_name \
@@ -280,30 +286,33 @@ pub(crate) async fn list_sequences(
             )
             .await?;
 
-        return rows
-            .into_iter()
-            .map(|row| {
-                Ok(SequenceInSchema {
-                    schema_name: req_string(&row, 0)?,
-                    sequence: Sequence {
-                        name: req_string(&row, 1)?,
-                        data_type: "bigint".to_string(),
-                        start_value: None,
-                        min_value: None,
-                        max_value: None,
-                        increment: None,
-                        last_value: None,
-                        cycle: None,
-                        value_skipped: true,
-                    },
-                })
-            })
-            .collect();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let schema_name = req_string(&row, 0)?;
+            let name = req_string(&row, 1)?;
+            let qualified = crate::ident::quote_qualified(&schema_name, &name)?;
+            let (last_value, value_skipped) = read_sequence_last_value(client, &qualified).await?;
+            out.push(SequenceInSchema {
+                schema_name,
+                sequence: Sequence {
+                    name,
+                    data_type: "bigint".to_string(),
+                    start_value: None,
+                    min_value: None,
+                    max_value: None,
+                    increment: None,
+                    last_value,
+                    cycle: None,
+                    value_skipped,
+                },
+            });
+        }
+        return Ok(out);
     }
 
     let rows = client
         .query(
-            "SELECT schemaname, sequencename, data_type, start_value, min_value, \
+            "SELECT schemaname, sequencename, data_type::text, start_value, min_value, \
                  max_value, increment_by, cycle, last_value \
              FROM pg_catalog.pg_sequences \
              WHERE schemaname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
@@ -314,33 +323,56 @@ pub(crate) async fn list_sequences(
 
     rows.into_iter()
         .map(|row| {
+            let last_value = row.try_get::<_, Option<i64>>(8)?;
             Ok(SequenceInSchema {
                 schema_name: req_string(&row, 0)?,
                 sequence: Sequence {
                     name: req_string(&row, 1)?,
                     data_type: opt_string(&row, 2)?.unwrap_or_default(),
-                    start_value: opt_string(&row, 3)?,
-                    min_value: opt_string(&row, 4)?,
-                    max_value: opt_string(&row, 5)?,
-                    increment: opt_string(&row, 6)?,
+                    start_value: row.try_get::<_, Option<i64>>(3)?,
+                    min_value: row.try_get::<_, Option<i64>>(4)?,
+                    max_value: row.try_get::<_, Option<i64>>(5)?,
+                    increment: row.try_get::<_, Option<i64>>(6)?,
                     cycle: row.try_get::<_, Option<bool>>(7)?,
-                    last_value: opt_string(&row, 8)?,
-                    value_skipped: false,
+                    last_value,
+                    value_skipped: last_value.is_none(),
                 },
             })
         })
         .collect()
 }
 
-pub(crate) async fn list_views(
-    client: &impl GenericClient,
+/// Read one sequence's `last_value` inside a savepoint so an error on an
+/// uncalled sequence (`last_value is not yet defined`) never aborts the
+/// surrounding read-only transaction.
+async fn read_sequence_last_value<T: GenericClient>(
+    client: &mut T,
+    qualified: &str,
+) -> Result<(Option<i64>, bool), InventoryError> {
+    let sql = format!("SELECT last_value FROM {qualified}");
+    let sp = client.transaction().await?;
+    match sp.query_opt(&sql, &[]).await {
+        Ok(Some(row)) => {
+            let value = row.try_get::<_, Option<i64>>(0)?;
+            sp.commit().await?;
+            Ok((value, value.is_none()))
+        }
+        _ => {
+            let _ = sp.rollback().await;
+            Ok((None, true))
+        }
+    }
+}
+
+pub(crate) async fn list_views<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<ListView>, InventoryError> {
     let rows = client
         .query(
             "SELECT \
                  n.nspname AS schema_name, \
                  c.relname AS view_name, \
-                 c.relkind AS kind, \
+                 c.relkind::text AS kind, \
                  pg_catalog.pg_get_viewdef(c.oid, true) AS definition \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -365,38 +397,58 @@ pub(crate) async fn list_views(
         .collect()
 }
 
-pub(crate) async fn list_functions(
-    client: &impl GenericClient,
+pub(crate) async fn list_functions<T: GenericClient>(
+    client: &T,
+    version_num: i32,
 ) -> Result<Vec<ListFunction>, InventoryError> {
-    let rows = client
-        .query(
-            "SELECT \
-                 n.nspname AS schema_name, \
-                 p.proname AS function_name, \
-                 pg_catalog.pg_get_function_arguments(p.oid) AS arguments, \
-                 l.lanname AS language, \
-                 pg_catalog.pg_get_functiondef(p.oid) AS definition \
-                 FROM pg_catalog.pg_proc p \
-                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-                 JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
-                 WHERE n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
-                 ORDER BY n.nspname, p.proname, pg_catalog.pg_get_function_arguments(p.oid)",
-            &[],
-        )
-        .await?;
+    // Aggregate functions have no pg_get_functiondef representation and would
+    // error the query.  `proisagg` exists before PostgreSQL 11; `prokind` after.
+    let sql = if version_num >= 110000 {
+        "SELECT \
+             n.nspname AS schema_name, \
+             p.proname AS function_name, \
+             pg_catalog.pg_get_function_arguments(p.oid) AS arguments, \
+             pg_catalog.pg_get_function_identity_arguments(p.oid) AS identity_arguments, \
+             l.lanname AS language, \
+             pg_catalog.pg_get_functiondef(p.oid) AS definition \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+         WHERE n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
+           AND p.prokind <> 'a' \
+         ORDER BY n.nspname, p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)"
+    } else {
+        "SELECT \
+             n.nspname AS schema_name, \
+             p.proname AS function_name, \
+             pg_catalog.pg_get_function_arguments(p.oid) AS arguments, \
+             pg_catalog.pg_get_function_identity_arguments(p.oid) AS identity_arguments, \
+             l.lanname AS language, \
+             pg_catalog.pg_get_functiondef(p.oid) AS definition \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+         WHERE n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
+           AND NOT p.proisagg \
+         ORDER BY n.nspname, p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)"
+    };
+
+    let rows = client.query(sql, &[]).await?;
 
     rows.into_iter()
         .map(|row| {
             let name = req_string(&row, 1)?;
             let arguments = req_string(&row, 2)?;
-            let language = req_string(&row, 3)?;
-            let def = opt_string(&row, 4)?.unwrap_or_default();
+            let identity_arguments = req_string(&row, 3)?;
+            let language = req_string(&row, 4)?;
+            let def = opt_string(&row, 5)?.unwrap_or_default();
             let hash = hex::encode(Sha256::digest(def.as_bytes()));
             Ok(ListFunction {
                 schema_name: req_string(&row, 0)?,
                 function: Function {
                     name,
                     arguments,
+                    identity_arguments,
                     definition_hash: hash,
                     language,
                 },
@@ -405,8 +457,8 @@ pub(crate) async fn list_functions(
         .collect()
 }
 
-pub(crate) async fn list_triggers(
-    client: &impl GenericClient,
+pub(crate) async fn list_triggers<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<ListTrigger>, InventoryError> {
     let rows = client
         .query(
@@ -414,7 +466,7 @@ pub(crate) async fn list_triggers(
                  n.nspname AS schema_name, \
                  c.relname AS table_name, \
                  t.tgname AS trigger_name, \
-                 t.tgenabled AS enabled, \
+                 t.tgenabled::text AS enabled, \
                  pg_catalog.pg_get_triggerdef(t.oid, true) AS definition \
              FROM pg_catalog.pg_trigger t \
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
@@ -436,6 +488,7 @@ pub(crate) async fn list_triggers(
                 schema_name: req_string(&row, 0)?,
                 trigger: Trigger {
                     name: req_string(&row, 2)?,
+                    table_name: req_string(&row, 1)?,
                     enabled: req_string(&row, 3)?,
                     event_manipulation: parts.event_manipulation,
                     event_object: parts.event_object,
@@ -448,8 +501,8 @@ pub(crate) async fn list_triggers(
         .collect()
 }
 
-pub(crate) async fn list_inheritances(
-    client: &impl GenericClient,
+pub(crate) async fn list_inheritances<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<Inheritance>, InventoryError> {
     let rows = client
         .query(
@@ -481,8 +534,8 @@ pub(crate) async fn list_inheritances(
         .collect()
 }
 
-pub(crate) async fn list_extensions(
-    client: &impl GenericClient,
+pub(crate) async fn list_extensions<T: GenericClient>(
+    client: &T,
 ) -> Result<Vec<Extension>, InventoryError> {
     let rows = client
         .query(
@@ -505,7 +558,9 @@ pub(crate) async fn list_extensions(
         .collect()
 }
 
-pub(crate) async fn large_object_count(client: &impl GenericClient) -> Result<i64, InventoryError> {
+pub(crate) async fn large_object_count<T: GenericClient>(
+    client: &T,
+) -> Result<i64, InventoryError> {
     let row = client
         .query_one(
             "SELECT count(*) FROM pg_catalog.pg_largeobject_metadata",

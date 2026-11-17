@@ -4,15 +4,16 @@
 //!
 //! 1. Apply explicit rules first (schema rename, prefix/suffix rules).
 //! 2. Exact name matches are auto-accepted.
-//! 3. Case-insensitive matches are auto-accepted only when unambiguous; any
-//!    ambiguity lands in the "needs attention" queue.
+//! 3. Case-insensitive matches are auto-accepted only when unambiguous AND the
+//!    target has not already been claimed by another old name; any ambiguity
+//!    lands in the "needs attention" queue.
 //! 4. Fuzzy matches are suggestions only and are **never** auto-accepted; they
 //!    always go to "needs attention" with a confidence score.
 //! 5. Tables or columns can be marked `ignore` with a required reason.
 //!
 //! The exported JSON is versioned and carries a SHA-256 hash of its canonical
 //! form.  Mapping files are treated as untrusted input: they are validated,
-//! size-limited and rejected if they contain unknown fields.
+//! size-limited and rejected if they contain unknown fields (at any nesting).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -85,7 +86,7 @@ impl Default for Mapping {
 
 /// A user-specified transformation rule, applied before automatic matching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Rule {
     pub kind: RuleKind,
     pub pattern: String,
@@ -102,7 +103,7 @@ pub enum RuleKind {
 
 /// Per-schema mapping: tables and their columns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SchemaMapping {
     pub target_schema: String,
     pub table_mappings: BTreeMap<String, TableMapping>,
@@ -110,12 +111,11 @@ pub struct SchemaMapping {
 
 /// Per-table mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct TableMapping {
     pub target_table: String,
     pub status: MappingStatus,
     pub column_mappings: BTreeMap<String, ColumnMapping>,
-    pub ignored_columns: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
@@ -131,15 +131,18 @@ pub enum MappingStatus {
 
 /// Per-column mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ColumnMapping {
     pub target_column: String,
     pub status: MappingStatus,
 }
 
 /// A deliberately ignored table or column with a required reason.
+///
+/// This is the single ignore type: both table and column ignores are expressed
+/// as a path plus a non-empty reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct IgnoredItem {
     pub path: String,
     pub reason: String,
@@ -192,6 +195,9 @@ pub fn match_tables(schema: &str, old_names: &[String], new_names: &[String]) ->
         .iter()
         .map(|n| (n.to_lowercase(), n.clone()))
         .collect();
+    // New names already claimed by an auto-accept; a second old name that maps
+    // to the same target must be flagged, not silently double-mapped.
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
 
     for old in old_names {
         if new_set.contains(old) {
@@ -203,6 +209,7 @@ pub fn match_tables(schema: &str, old_names: &[String], new_names: &[String]) ->
                     ..TableMapping::default()
                 },
             );
+            claimed.insert(old.clone());
             continue;
         }
 
@@ -215,14 +222,25 @@ pub fn match_tables(schema: &str, old_names: &[String], new_names: &[String]) ->
         case_matches.sort();
 
         if case_matches.len() == 1 {
-            mapped.insert(
-                old.clone(),
-                TableMapping {
-                    target_table: case_matches[0].clone(),
-                    status: MappingStatus::CaseInsensitive,
-                    ..TableMapping::default()
-                },
-            );
+            let target = case_matches[0].clone();
+            if claimed.contains(&target) {
+                needs_attention.push(AttentionItem {
+                    path: format!("{schema}.{old}"),
+                    issue: AttentionIssue::AmbiguousCaseInsensitive {
+                        candidates: case_matches,
+                    },
+                });
+            } else {
+                mapped.insert(
+                    old.clone(),
+                    TableMapping {
+                        target_table: target.clone(),
+                        status: MappingStatus::CaseInsensitive,
+                        ..TableMapping::default()
+                    },
+                );
+                claimed.insert(target);
+            }
         } else if case_matches.len() > 1 {
             needs_attention.push(AttentionItem {
                 path: format!("{schema}.{old}"),
@@ -256,13 +274,7 @@ pub fn match_tables(schema: &str, old_names: &[String], new_names: &[String]) ->
             needs_attention.push(AttentionItem {
                 path: format!("{schema}.{old}"),
                 issue: AttentionIssue::MissingInNew {
-                    candidates: lower_new
-                        .keys()
-                        .filter(|k| k.starts_with(&lower[..1.min(lower.len())]))
-                        .map(|k| lower_new[k].clone())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
+                    candidates: first_letter_candidates(&lower_new, &lower),
                 },
             });
         }
@@ -302,6 +314,7 @@ pub fn match_columns(
     let mut suggestions: Vec<Suggestion> = Vec::new();
 
     let new_set: BTreeSet<String> = new_names.iter().cloned().collect();
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
 
     for old in old_names {
         if new_set.contains(old) {
@@ -312,6 +325,7 @@ pub fn match_columns(
                     status: MappingStatus::Exact,
                 },
             );
+            claimed.insert(old.clone());
             continue;
         }
 
@@ -324,13 +338,24 @@ pub fn match_columns(
         case_matches.sort();
 
         if case_matches.len() == 1 {
-            mapped.insert(
-                old.clone(),
-                ColumnMapping {
-                    target_column: case_matches[0].clone(),
-                    status: MappingStatus::CaseInsensitive,
-                },
-            );
+            let target = case_matches[0].clone();
+            if claimed.contains(&target) {
+                needs_attention.push(AttentionItem {
+                    path: format!("{schema}.{table}.{old}"),
+                    issue: AttentionIssue::AmbiguousCaseInsensitive {
+                        candidates: case_matches,
+                    },
+                });
+            } else {
+                mapped.insert(
+                    old.clone(),
+                    ColumnMapping {
+                        target_column: target.clone(),
+                        status: MappingStatus::CaseInsensitive,
+                    },
+                );
+                claimed.insert(target);
+            }
         } else if case_matches.len() > 1 {
             needs_attention.push(AttentionItem {
                 path: format!("{schema}.{table}.{old}"),
@@ -381,6 +406,21 @@ pub fn match_columns(
     (mapped, needs_attention, suggestions)
 }
 
+/// New names whose first character matches `lower`'s first character, without
+/// ever slicing at a non-char boundary (a non-ASCII first letter must not panic).
+fn first_letter_candidates(lower_new: &BTreeMap<String, String>, lower: &str) -> Vec<String> {
+    let Some(first) = lower.chars().next() else {
+        return Vec::new();
+    };
+    let mut out: BTreeSet<String> = lower_new
+        .iter()
+        .filter(|(k, _)| k.starts_with(first))
+        .map(|(_, v)| v.clone())
+        .collect();
+    out.remove(lower);
+    out.into_iter().collect()
+}
+
 /// Apply a rule to a table or column name.  Returns `Some(new_name)` if the
 /// rule matched and produced a rename.
 pub fn apply_rule(rule: &Rule, name: &str) -> Option<String> {
@@ -404,8 +444,8 @@ pub fn apply_rule(rule: &Rule, name: &str) -> Option<String> {
 
 /// Load a mapping from JSON bytes.
 ///
-/// Validates size, version and rejects unknown fields.  Recomputes and
-/// checks the SHA-256 hash.
+/// Validates size, version and rejects unknown fields at any nesting level.
+/// Recomputes and checks the SHA-256 hash.
 pub fn from_json(bytes: &[u8]) -> Result<Mapping, MappingError> {
     if bytes.len() > MAX_MAPPING_BYTES {
         return Err(MappingError::TooLarge(bytes.len()));
@@ -414,7 +454,8 @@ pub fn from_json(bytes: &[u8]) -> Result<Mapping, MappingError> {
     let raw: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| MappingError::Json(e.to_string()))?;
 
-    // Reject unknown top-level fields.
+    // Reject unknown top-level fields (nested fields are handled by
+    // `deny_unknown_fields`).
     if let Some(obj) = raw.as_object() {
         let known: BTreeSet<&str> = [
             "version",
@@ -581,6 +622,37 @@ mod tests {
     }
 
     #[test]
+    fn two_old_mapping_to_one_new_needs_attention() {
+        let result = match_tables(
+            "public",
+            &["Accounts".to_string(), "accounts".to_string()],
+            &["ACCOUNTS".to_string()],
+        );
+        // Exactly one old name may claim the single target; the other is flagged.
+        assert_eq!(result.mapped.len(), 1);
+        assert!(result
+            .needs_attention
+            .iter()
+            .any(|a| matches!(a.issue, AttentionIssue::AmbiguousCaseInsensitive { .. })));
+    }
+
+    #[test]
+    fn non_ascii_first_letter_does_not_panic() {
+        let result = match_tables(
+            "public",
+            &["échéance".to_string()],
+            &["échéance_2".to_string()],
+        );
+        // The non-ASCII name finds no exact/case match; it becomes a fuzzy
+        // suggestion + missing-in-new without panicking.
+        assert!(result.mapped.is_empty());
+        assert!(result
+            .needs_attention
+            .iter()
+            .any(|a| matches!(a.issue, AttentionIssue::MissingInNew { .. })));
+    }
+
+    #[test]
     fn fuzzy_match_is_suggestion_only() {
         let result = match_tables(
             "public",
@@ -614,6 +686,13 @@ mod tests {
             MappingError::UnknownFields(fields) => assert!(fields.contains(&"extra".to_string())),
             _ => panic!("expected unknown fields error, got {err}"),
         }
+    }
+
+    #[test]
+    fn nested_unknown_field_is_rejected() {
+        let json = r#"{"version":1,"rules":[{"kind":"prefix_replace","pattern":"a","target":"b","extra":"bad"}],"schema_mappings":{},"ignored":[],"mapping_hash":""}"#;
+        let err = from_json(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, MappingError::Json(_)));
     }
 
     #[test]
@@ -657,7 +736,7 @@ proptest! {
         old in "[a-z]{1,20}",
         new in "[a-z]{1,20}"
     ) {
-        let result = match_tables("public", &[old.clone()], &[new.clone()]);
+        let result = match_tables("public", std::slice::from_ref(&old), std::slice::from_ref(&new));
         if let Some(m) = result.mapped.get(&old) {
             assert_ne!(m.status, MappingStatus::Fuzzy);
         }

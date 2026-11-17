@@ -1,16 +1,16 @@
 //! Inventory collection: read-only catalog introspection for PostgreSQL 9.4+.
 //!
-//! Every query in this module is fixed SQL with bound parameters only.  No
-//! table or column identifiers are interpolated.  The module is designed so
-//! the parallel `db` module (T017) can pass any `GenericClient` or
-//! `Transaction` straight to [`collect_inventory`].
+//! Every query in this module is fixed SQL with bound parameters only.  Table
+//! and column names are never interpolated; the one exception is the per-sequence
+//! `last_value` read on PostgreSQL < 10, which goes through the core quoting
+//! helper (`crate::ident::quote_qualified`).
 
 pub mod queries;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
-use tokio_postgres::{Client, Error as PgError, GenericClient, Row};
+use tokio_postgres::{Error as PgError, GenericClient, Row};
 
 pub use queries::EXCLUDED_SCHEMAS_FILTER_SQL;
 
@@ -25,6 +25,8 @@ pub enum InventoryError {
     VersionMissing,
     #[error("could not parse server version number: {0}")]
     VersionParse(String),
+    #[error("invalid identifier: {0}")]
+    Ident(#[from] crate::ident::IdentError),
 }
 
 /// A complete structural inventory of one database.
@@ -123,11 +125,11 @@ pub struct Index {
 pub struct Sequence {
     pub name: String,
     pub data_type: String,
-    pub start_value: Option<String>,
-    pub min_value: Option<String>,
-    pub max_value: Option<String>,
-    pub increment: Option<String>,
-    pub last_value: Option<String>,
+    pub start_value: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub increment: Option<i64>,
+    pub last_value: Option<i64>,
     pub cycle: Option<bool>,
     pub value_skipped: bool,
 }
@@ -140,21 +142,23 @@ pub struct View {
     pub definition: String,
 }
 
-/// A function or procedure.
+/// A function or procedure, keyed by schema + name + identity arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Function {
     pub name: String,
     pub arguments: String,
+    pub identity_arguments: String,
     pub definition_hash: String,
     pub language: String,
 }
 
-/// A trigger.
+/// A trigger, keyed by table + name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Trigger {
     pub name: String,
+    pub table_name: String,
     pub event_manipulation: String,
     pub event_object: String,
     pub action_orientation: String,
@@ -176,8 +180,8 @@ pub struct Extension {
 ///
 /// The caller is responsible for opening a read-only transaction and applying
 /// the canonical settings block; this function only issues `SELECT` statements.
-pub async fn collect_inventory(
-    client: &impl GenericClient,
+pub async fn collect_inventory<T: GenericClient>(
+    client: &mut T,
 ) -> Result<DatabaseInventory, InventoryError> {
     let version_num = queries::server_version_num(client).await?;
     let server_version = queries::server_version(client).await?;
@@ -187,8 +191,8 @@ pub async fn collect_inventory(
 
     if version_num < 100000 {
         warnings.push(
-            "Sequence last_value cannot be read on PostgreSQL < 10 without identifier-based queries; \
-             skipped, sequences marked 'value_skipped'."
+            "Sequence last_value read per sequence (pg_sequences is PostgreSQL 10+); \
+             any value that cannot be read is reported, never skipped silently."
                 .to_string(),
         );
     }
@@ -219,7 +223,7 @@ pub async fn collect_inventory(
     let indexes = queries::list_indexes(client).await?;
     let sequences = queries::list_sequences(client, version_num).await?;
     let views = queries::list_views(client).await?;
-    let functions = queries::list_functions(client).await?;
+    let functions = queries::list_functions(client, version_num).await?;
     let triggers = queries::list_triggers(client).await?;
     let inheritances = queries::list_inheritances(client).await?;
     let extensions = queries::list_extensions(client).await?;
@@ -311,7 +315,7 @@ pub async fn collect_inventory(
             }
         } else {
             // Child partition tables are folded under the parent; nothing to
-            // attach at schema level, but log a debug-style note if needed.
+            // attach at schema level.
             let _ = (schema_name, table_name);
         }
     }
@@ -354,8 +358,14 @@ pub async fn collect_inventory(
         schema
             .materialized_views
             .sort_by(|a, b| a.name.cmp(&b.name));
-        schema.functions.sort_by(|a, b| a.name.cmp(&b.name));
-        schema.triggers.sort_by(|a, b| a.name.cmp(&b.name));
+        schema.functions.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then(a.identity_arguments.cmp(&b.identity_arguments))
+        });
+        schema
+            .triggers
+            .sort_by(|a, b| a.table_name.cmp(&b.table_name).then(a.name.cmp(&b.name)));
         schema.sequences.sort_by(|a, b| a.name.cmp(&b.name));
         for table in &mut schema.tables {
             table.columns.sort_by(|a, b| a.name.cmp(&b.name));
@@ -377,13 +387,6 @@ pub async fn collect_inventory(
         large_object_count,
         warnings,
     })
-}
-
-/// Convenience: collect an inventory from a connected [`Client`].
-pub async fn collect_inventory_from_client(
-    client: &Client,
-) -> Result<DatabaseInventory, InventoryError> {
-    collect_inventory(client).await
 }
 
 // --- internal helpers ---

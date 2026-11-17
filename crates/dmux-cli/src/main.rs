@@ -1,264 +1,322 @@
-//! `dmux` command-line runner — Phase 1 structure commands.
+//! `dmux` command-line runner.
 //!
-//! Exit codes follow PLAN.md 4.8: 0 pass, 1 fail, 2 warnings.  The `inventory`
-//! and `diff` commands are implemented here; other subcommands remain stubs.
+//! Exit codes follow PLAN.md 4.8: 0 pass, 1 fail, 2 warnings.  `probe`,
+//! `inventory` and `diff` are implemented; `capture`, `compare` and `run` are
+//! Phase 0 stubs that exit 2.
 
-use dmux_engine::inventory::collect_inventory;
-use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tokio_postgres::{Client, Config, NoTls};
+
+use clap::{Args, Parser, Subcommand};
+use dmux_engine::db::{probe_server, ConnProfile, DbError, ReadOnlySession, TlsMode};
+use dmux_engine::inventory::collect_inventory;
+use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
 
 /// PLAN.md 4.8 exit codes.
 const EXIT_PASS: u8 = 0;
 const EXIT_FAIL: u8 = 1;
-const EXIT_WARNING: u8 = 2;
+const EXIT_WARN: u8 = 2;
 
-const USAGE: &str = "\
-dmux — proves a PostgreSQL migration copied every row and value
+#[derive(Parser, Debug)]
+#[command(name = "dmux")]
+#[command(about = "Proves a PostgreSQL migration copied every row and value")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-Usage: dmux <command> [args]
-
-Commands:
-  inventory <conn args>     Collect a structural inventory and print it as JSON
-  diff --old <file> --new <file>
-                            Compare two inventory JSON files
-  capture                   Save one database's fingerprints to a file
-  compare                   Compare two fingerprint files, or a file and a live database
-  run <definition file>     Run a saved verification definition
-
-Exit codes: 0 pass, 1 fail, 2 warnings.";
-
-/// A parsed command line.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Subcommand, Debug)]
 enum Command {
+    /// Test a database connection and report server information.
+    Probe(ProbeArgs),
+    /// Collect a structural inventory and print it as JSON.
     Inventory(InventoryArgs),
+    /// Compare two inventory JSON files and print the differences as JSON.
     Diff(DiffArgs),
+    /// Save one database's fingerprints to a file (not implemented).
     Capture,
+    /// Compare two fingerprint files, or a file and a live database (not implemented).
     Compare,
-    Run { definition: String },
-    Help,
-    Version,
+    /// Run a saved verification definition (not implemented).
+    Run {
+        /// The verification definition file.
+        definition: String,
+    },
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
-struct InventoryArgs {
+/// Connection arguments shared by the commands that touch a database.
+#[derive(Args, Debug)]
+struct ProbeArgs {
+    #[arg(long)]
     host: String,
+    #[arg(long)]
     port: u16,
+    #[arg(long)]
     db: String,
+    #[arg(long)]
     user: String,
-    password_env: Option<String>,
+    #[arg(long, value_name = "VAR")]
+    password_env: String,
+    #[arg(long, value_name = "MODE")]
+    tls: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    #[arg(long)]
+    allow_superuser: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Args, Debug)]
+struct InventoryArgs {
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value = "5432")]
+    port: u16,
+    #[arg(long, default_value = "bank")]
+    db: String,
+    #[arg(long, default_value = "dmux_dev")]
+    user: String,
+    #[arg(long, value_name = "VAR")]
+    password_env: Option<String>,
+    #[arg(long, value_name = "MODE", default_value = "verify")]
+    tls: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    #[arg(long)]
+    allow_superuser: bool,
+}
+
+#[derive(Args, Debug)]
 struct DiffArgs {
+    #[arg(long)]
     old: PathBuf,
+    #[arg(long)]
     new: PathBuf,
 }
 
-impl Command {
-    /// The subcommand name, used in stub messages.
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Inventory(_) => "inventory",
-            Command::Diff(_) => "diff",
-            Command::Capture => "capture",
-            Command::Compare => "compare",
-            Command::Run { .. } => "run",
-            Command::Help => "help",
-            Command::Version => "version",
+/// Parse the `--tls` mode string into a [`TlsMode`].
+fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, String> {
+    match tls {
+        "verify" => Ok(TlsMode::VerifyFull),
+        "disable" => {
+            let reason = reason
+                .as_deref()
+                .ok_or("--reason <text> is required for --tls disable")?;
+            if reason.trim().is_empty() {
+                return Err("--reason <text> may not be empty".to_string());
+            }
+            Ok(TlsMode::Disable(reason.to_string()))
         }
-    }
-}
-
-/// Parse arguments (without the program name). Pure, so it is unit-testable.
-fn parse(args: &[String]) -> Result<Command, String> {
-    let Some(first) = args.first() else {
-        return Err("missing command".to_string());
-    };
-    let rest = &args[1..];
-    match first.as_str() {
-        "inventory" => Ok(Command::Inventory(parse_inventory_args(rest)?)),
-        "diff" => Ok(Command::Diff(parse_diff_args(rest)?)),
-        "capture" | "compare" => {
-            if rest.is_empty() {
-                Ok(if first == "capture" {
-                    Command::Capture
-                } else {
-                    Command::Compare
-                })
+        _ => {
+            if let Some(hex) = tls.strip_prefix("fingerprint:") {
+                if hex.is_empty() {
+                    return Err("--tls fingerprint:<hex> is missing the hex value".to_string());
+                }
+                Ok(TlsMode::TrustFingerprint(hex.to_string()))
             } else {
-                Err(format!("unexpected argument for {first}: {}", rest[0]))
+                Err(format!(
+                    "unknown --tls value: {tls} (expected verify, fingerprint:<hex>, or disable)"
+                ))
             }
         }
-        "run" => match rest {
-            [definition] => Ok(Command::Run {
-                definition: definition.clone(),
-            }),
-            [] => Err("run needs a definition file: dmux run <definition file>".to_string()),
-            _ => Err(format!("unexpected argument for run: {}", rest[1])),
-        },
-        "help" | "--help" | "-h" => Ok(Command::Help),
-        "version" | "--version" | "-V" => Ok(Command::Version),
-        other => Err(format!("unknown command: {other}")),
     }
 }
 
-fn parse_inventory_args(args: &[String]) -> Result<InventoryArgs, String> {
-    let mut parsed = InventoryArgs {
-        host: "127.0.0.1".to_string(),
-        port: 5432,
-        db: "bank".to_string(),
-        user: "dmux_dev".to_string(),
-        password_env: None,
+/// Validate that `--allow-superuser` carries a non-empty `--reason`.
+fn allow_superuser_requires_reason(reason: &Option<String>) -> bool {
+    reason.as_deref().is_some_and(|r| !r.trim().is_empty())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Probe(args) => run_probe(args).await,
+        Command::Inventory(args) => run_inventory(args).await,
+        Command::Diff(args) => run_diff(args),
+        Command::Capture | Command::Compare | Command::Run { .. } => {
+            eprintln!("dmux: this command is not implemented in Phase 0");
+            ExitCode::from(EXIT_WARN)
+        }
+    }
+}
+
+async fn run_probe(args: ProbeArgs) -> ExitCode {
+    let tls_mode = match parse_tls_mode(&args.tls, &args.reason) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
     };
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--host" => parsed.host = next_arg(&mut iter, "--host")?,
-            "--port" => {
-                parsed.port = next_arg(&mut iter, "--port")?
-                    .parse::<u16>()
-                    .map_err(|e| format!("--port: {e}"))?;
-            }
-            "--db" => parsed.db = next_arg(&mut iter, "--db")?,
-            "--user" => parsed.user = next_arg(&mut iter, "--user")?,
-            "--password-env" => parsed.password_env = Some(next_arg(&mut iter, "--password-env")?),
-            other => return Err(format!("unknown inventory argument: {other}")),
+    let password = match std::env::var(&args.password_env) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "configuration error: password environment variable {} is not set",
+                args.password_env
+            );
+            return ExitCode::from(EXIT_FAIL);
         }
-    }
-    Ok(parsed)
-}
-
-fn parse_diff_args(args: &[String]) -> Result<DiffArgs, String> {
-    let mut old: Option<PathBuf> = None;
-    let mut new: Option<PathBuf> = None;
-
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--old" => old = Some(PathBuf::from(next_arg(&mut iter, "--old")?)),
-            "--new" => new = Some(PathBuf::from(next_arg(&mut iter, "--new")?)),
-            other => return Err(format!("unknown diff argument: {other}")),
-        }
-    }
-
-    Ok(DiffArgs {
-        old: old.ok_or("--old <file> is required".to_string())?,
-        new: new.ok_or("--new <file> is required".to_string())?,
-    })
-}
-
-fn next_arg(iter: &mut std::slice::Iter<String>, flag: &str) -> Result<String, String> {
-    iter.next()
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires an argument"))
-}
-
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse(&args) {
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            ExitCode::from(EXIT_PASS)
-        }
-        Ok(Command::Version) => {
-            println!("dmux {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::from(EXIT_PASS)
-        }
-        Ok(Command::Inventory(inv_args)) => match run_inventory(inv_args) {
-            Ok(()) => ExitCode::from(EXIT_PASS),
-            Err(e) => {
-                eprintln!("dmux inventory failed: {e}");
-                ExitCode::from(EXIT_WARNING)
-            }
-        },
-        Ok(Command::Diff(diff_args)) => match run_diff(diff_args) {
-            Ok(status) => match status {
-                DiffStatus::Equal => ExitCode::from(EXIT_PASS),
-                DiffStatus::Warning => ExitCode::from(EXIT_WARNING),
-                DiffStatus::Different => ExitCode::from(EXIT_FAIL),
-            },
-            Err(e) => {
-                eprintln!("dmux diff failed: {e}");
-                ExitCode::from(EXIT_WARNING)
-            }
-        },
-        Ok(command) => {
-            eprintln!("dmux {}: not implemented in Phase 1", command.name());
-            ExitCode::from(EXIT_WARNING)
-        }
-        Err(message) => {
-            eprintln!("{message}");
-            eprintln!();
-            eprintln!("{USAGE}");
-            ExitCode::from(EXIT_WARNING)
-        }
-    }
-}
-
-fn run_inventory(args: InventoryArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let client = connect(&args).await?;
-        let inventory = collect_inventory(&client).await?;
-        let json = serde_json::to_string_pretty(&inventory)?;
-        println!("{json}");
-        Ok(())
-    })
-}
-
-async fn connect(args: &InventoryArgs) -> Result<Client, Box<dyn std::error::Error>> {
-    let password = match &args.password_env {
-        Some(var) => std::env::var(var).ok(),
-        None => None,
     };
 
-    let mut config = Config::new();
-    config
-        .host(&args.host)
-        .port(args.port)
-        .user(&args.user)
-        .dbname(&args.db)
-        .application_name("dmux");
-    if let Some(pass) = password {
-        config.password(pass);
+    if args.allow_superuser && !allow_superuser_requires_reason(&args.reason) {
+        eprintln!("configuration error: --allow-superuser requires --reason <text>");
+        return ExitCode::from(EXIT_FAIL);
     }
 
-    let (client, connection) = config.connect(NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    Ok(client)
-}
+    let profile = ConnProfile::new(args.host, args.port, args.db, args.user, password, tls_mode);
 
-fn run_diff(args: DiffArgs) -> Result<DiffStatus, Box<dyn std::error::Error>> {
-    let old_text = fs::read_to_string(&args.old)?;
-    let new_text = fs::read_to_string(&args.new)?;
-    let old = serde_json::from_str(&old_text)?;
-    let new = serde_json::from_str(&new_text)?;
-    let diff = compare_inventories(&old, &new);
-    let json = serde_json::to_string_pretty(&diff)?;
+    let info = match probe_server(&profile, args.allow_superuser).await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("probe failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let json = serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string());
     println!("{json}");
-    Ok(diff.status)
+
+    let mut warnings = Vec::new();
+    if info.is_superuser {
+        warnings.push("superuser login allowed with recorded reason");
+    }
+    if info.can_write {
+        warnings.push("login can write to user tables");
+    }
+    if info.pooler_suspected {
+        warnings.push("connection pooler suspected");
+    }
+    if info.sql_ascii {
+        warnings.push("SQL_ASCII encoding; review required");
+    }
+    if !info.md5_available {
+        warnings.push("md5 unavailable; fallback hashing will be used");
+    }
+
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+
+    if !warnings.is_empty() {
+        ExitCode::from(EXIT_WARN)
+    } else {
+        ExitCode::from(EXIT_PASS)
+    }
+}
+
+async fn run_inventory(args: InventoryArgs) -> ExitCode {
+    let tls_mode = match parse_tls_mode(&args.tls, &args.reason) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let password = match args.password_env.as_deref().map(std::env::var) {
+        Some(Ok(p)) => p,
+        Some(Err(_)) => {
+            eprintln!(
+                "configuration error: password environment variable {} is not set",
+                args.password_env.as_deref().unwrap_or_default()
+            );
+            return ExitCode::from(EXIT_FAIL);
+        }
+        None => String::new(),
+    };
+
+    if args.allow_superuser && !allow_superuser_requires_reason(&args.reason) {
+        eprintln!("configuration error: --allow-superuser requires --reason <text>");
+        return ExitCode::from(EXIT_FAIL);
+    }
+
+    let profile = ConnProfile::new(args.host, args.port, args.db, args.user, password, tls_mode);
+
+    let mut session = match ReadOnlySession::open(&profile, args.allow_superuser).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dmux inventory failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let inventory = session
+        .with_read_only("30s", |txn| {
+            Box::pin(async move {
+                collect_inventory(txn).await.map_err(|e| DbError::Postgres {
+                    message: e.to_string(),
+                })
+            })
+        })
+        .await;
+
+    match inventory {
+        Ok(inv) => {
+            match serde_json::to_string_pretty(&inv) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("dmux inventory failed: {e}");
+                    return ExitCode::from(EXIT_FAIL);
+                }
+            }
+            ExitCode::from(EXIT_PASS)
+        }
+        Err(e) => {
+            eprintln!("dmux inventory failed: {e}");
+            ExitCode::from(EXIT_FAIL)
+        }
+    }
+}
+
+fn run_diff(args: DiffArgs) -> ExitCode {
+    let result = (|| -> Result<DiffStatus, String> {
+        let old_text = fs::read_to_string(&args.old).map_err(|e| e.to_string())?;
+        let new_text = fs::read_to_string(&args.new).map_err(|e| e.to_string())?;
+        let old = serde_json::from_str(&old_text).map_err(|e| e.to_string())?;
+        let new = serde_json::from_str(&new_text).map_err(|e| e.to_string())?;
+        let diff = compare_inventories(&old, &new);
+        let json = serde_json::to_string_pretty(&diff).map_err(|e| e.to_string())?;
+        println!("{json}");
+        Ok(diff.status)
+    })();
+
+    match result {
+        Ok(DiffStatus::Equal) => ExitCode::from(EXIT_PASS),
+        Ok(DiffStatus::Warning) => ExitCode::from(EXIT_WARN),
+        Ok(DiffStatus::Different) => ExitCode::from(EXIT_FAIL),
+        Err(e) => {
+            eprintln!("dmux diff failed: {e}");
+            ExitCode::from(EXIT_FAIL)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{parse_tls_mode, Command, DiffArgs, EXIT_FAIL, EXIT_PASS, EXIT_WARN};
+    use clap::Parser;
+    use dmux_engine::db::TlsMode;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn exit_codes_match_the_plan() {
+        assert_eq!(EXIT_PASS, 0);
+        assert_eq!(EXIT_FAIL, 1);
+        assert_eq!(EXIT_WARN, 2);
+    }
+
+    fn parse(args: &[&str]) -> Command {
+        use super::Cli;
+        Cli::try_parse_from(std::iter::once("dmux").chain(args.iter().copied()))
+            .expect("args should parse")
+            .command
     }
 
     #[test]
     fn parses_inventory_defaults() {
-        let cmd = parse(&args(&["inventory"])).unwrap();
-        match cmd {
+        match parse(&["inventory"]) {
             Command::Inventory(a) => {
                 assert_eq!(a.host, "127.0.0.1");
                 assert_eq!(a.port, 5432);
@@ -266,13 +324,13 @@ mod tests {
                 assert_eq!(a.user, "dmux_dev");
                 assert!(a.password_env.is_none());
             }
-            _ => panic!("expected inventory"),
+            other => panic!("expected inventory, got {other:?}"),
         }
     }
 
     #[test]
     fn parses_inventory_overrides() {
-        let cmd = parse(&args(&[
+        match parse(&[
             "inventory",
             "--host",
             "db.example.com",
@@ -284,9 +342,7 @@ mod tests {
             "reader",
             "--password-env",
             "DMUX_PASSWORD",
-        ]))
-        .unwrap();
-        match cmd {
+        ]) {
             Command::Inventory(a) => {
                 assert_eq!(a.host, "db.example.com");
                 assert_eq!(a.port, 5433);
@@ -294,30 +350,90 @@ mod tests {
                 assert_eq!(a.user, "reader");
                 assert_eq!(a.password_env.as_deref(), Some("DMUX_PASSWORD"));
             }
-            _ => panic!("expected inventory"),
+            other => panic!("expected inventory, got {other:?}"),
         }
     }
 
     #[test]
     fn parses_diff_args() {
-        let cmd = parse(&args(&["diff", "--old", "a.json", "--new", "b.json"])).unwrap();
-        match cmd {
-            Command::Diff(a) => {
-                assert_eq!(a.old, PathBuf::from("a.json"));
-                assert_eq!(a.new, PathBuf::from("b.json"));
+        match parse(&["diff", "--old", "a.json", "--new", "b.json"]) {
+            Command::Diff(DiffArgs { old, new }) => {
+                assert_eq!(old, std::path::PathBuf::from("a.json"));
+                assert_eq!(new, std::path::PathBuf::from("b.json"));
             }
-            _ => panic!("expected diff"),
+            other => panic!("expected diff, got {other:?}"),
         }
     }
 
     #[test]
-    fn diff_requires_both_files() {
-        assert!(parse(&args(&["diff", "--old", "a.json"])).is_err());
-        assert!(parse(&args(&["diff", "--new", "b.json"])).is_err());
+    fn parses_probe_args() {
+        match parse(&[
+            "probe",
+            "--host",
+            "h",
+            "--port",
+            "5433",
+            "--db",
+            "bank",
+            "--user",
+            "u",
+            "--password-env",
+            "PW",
+            "--tls",
+            "verify",
+        ]) {
+            Command::Probe(a) => {
+                assert_eq!(a.host, "h");
+                assert_eq!(a.port, 5433);
+            }
+            other => panic!("expected probe, got {other:?}"),
+        }
     }
 
     #[test]
-    fn unknown_command_is_error() {
-        assert!(parse(&args(&["frobnicate"])).is_err());
+    fn parses_stub_commands() {
+        assert!(matches!(parse(&["capture"]), Command::Capture));
+        assert!(matches!(parse(&["compare"]), Command::Compare));
+        assert!(matches!(parse(&["run", "def.json"]), Command::Run { .. }));
+    }
+
+    #[test]
+    fn tls_mode_verify() {
+        assert_eq!(
+            parse_tls_mode("verify", &None).unwrap(),
+            TlsMode::VerifyFull
+        );
+    }
+
+    #[test]
+    fn tls_mode_fingerprint() {
+        match parse_tls_mode("fingerprint:abcd", &None).unwrap() {
+            TlsMode::TrustFingerprint(fp) => assert_eq!(fp, "abcd"),
+            other => panic!("expected fingerprint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tls_mode_fingerprint_requires_hex() {
+        assert!(parse_tls_mode("fingerprint:", &None).is_err());
+    }
+
+    #[test]
+    fn tls_mode_disable_requires_reason() {
+        assert!(parse_tls_mode("disable", &None).is_err());
+        assert_eq!(
+            parse_tls_mode("disable", &Some("test network".to_string())).unwrap(),
+            TlsMode::Disable("test network".to_string())
+        );
+    }
+
+    #[test]
+    fn tls_mode_disable_rejects_empty_reason() {
+        assert!(parse_tls_mode("disable", &Some("   ".to_string())).is_err());
+    }
+
+    #[test]
+    fn tls_mode_unknown_is_error() {
+        assert!(parse_tls_mode("bogus", &None).is_err());
     }
 }

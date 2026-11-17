@@ -4,9 +4,11 @@
 //! The result is a serialisable tree of red/green/amber entries.
 
 use crate::inventory::{
-    Column, Constraint, DatabaseInventory, Index, Sequence, Table, Trigger, View,
+    Column, Constraint, DatabaseInventory, Extension, Function, Index, Sequence, Table, Trigger,
+    View,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Overall status of a schema diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -88,11 +90,32 @@ pub fn compare_inventories(old: &DatabaseInventory, new: &DatabaseInventory) -> 
             format!("collation changed: {} -> {}", old.collation, new.collation),
         ));
     }
+    if old.lc_monetary != new.lc_monetary {
+        entries.push(SchemaDiffEntry::leaf(
+            vec!["database".to_string(), "lc_monetary".to_string()],
+            DiffStatus::Warning,
+            format!(
+                "lc_monetary changed: {} -> {}",
+                old.lc_monetary, new.lc_monetary
+            ),
+        ));
+    }
 
-    let old_schemas: std::collections::BTreeMap<_, _> =
-        old.schemas.iter().map(|s| (s.name.clone(), s)).collect();
-    let new_schemas: std::collections::BTreeMap<_, _> =
-        new.schemas.iter().map(|s| (s.name.clone(), s)).collect();
+    diff_extensions(&mut entries, &old.extensions, &new.extensions);
+
+    if old.large_object_count != new.large_object_count {
+        entries.push(SchemaDiffEntry::leaf(
+            vec!["database".to_string(), "large_objects".to_string()],
+            DiffStatus::Different,
+            format!(
+                "large object count changed: {} -> {}",
+                old.large_object_count, new.large_object_count
+            ),
+        ));
+    }
+
+    let old_schemas: BTreeMap<_, _> = old.schemas.iter().map(|s| (s.name.clone(), s)).collect();
+    let new_schemas: BTreeMap<_, _> = new.schemas.iter().map(|s| (s.name.clone(), s)).collect();
 
     for name in old_schemas.keys() {
         if !new_schemas.contains_key(name) {
@@ -136,6 +159,53 @@ pub fn compare_inventories(old: &DatabaseInventory, new: &DatabaseInventory) -> 
     }
 }
 
+fn diff_extensions(entries: &mut Vec<SchemaDiffEntry>, old: &[Extension], new: &[Extension]) {
+    let old_map: BTreeMap<_, _> = old.iter().map(|e| (e.name.clone(), e)).collect();
+    let new_map: BTreeMap<_, _> = new.iter().map(|e| (e.name.clone(), e)).collect();
+
+    for name in old_map.keys() {
+        if !new_map.contains_key(name) {
+            entries.push(SchemaDiffEntry::leaf(
+                vec![
+                    "database".to_string(),
+                    "extension".to_string(),
+                    name.clone(),
+                ],
+                DiffStatus::Warning,
+                format!("extension missing in new: {name}"),
+            ));
+        }
+    }
+    for (name, new_ext) in &new_map {
+        match old_map.get(name) {
+            None => {
+                entries.push(SchemaDiffEntry::leaf(
+                    vec![
+                        "database".to_string(),
+                        "extension".to_string(),
+                        name.clone(),
+                    ],
+                    DiffStatus::Warning,
+                    format!("extension added in new: {name}"),
+                ));
+            }
+            Some(old_ext) => {
+                if old_ext.version != new_ext.version || old_ext.schema != new_ext.schema {
+                    entries.push(SchemaDiffEntry::leaf(
+                        vec![
+                            "database".to_string(),
+                            "extension".to_string(),
+                            name.clone(),
+                        ],
+                        DiffStatus::Warning,
+                        format!("extension changed: {name}"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn diff_schema(
     name: &str,
     old: &crate::inventory::Schema,
@@ -168,20 +238,34 @@ fn diff_schema(
         &new.materialized_views,
         diff_view,
     );
-    diff_object_lists(
+    diff_keyed(
         &mut children,
         path.clone(),
         "function",
         &old.functions,
         &new.functions,
+        |f: &Function| {
+            let label = if f.identity_arguments.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{}({})", f.name, f.identity_arguments)
+            };
+            ((f.name.clone(), f.identity_arguments.clone()), label)
+        },
         diff_function,
     );
-    diff_object_lists(
+    diff_keyed(
         &mut children,
         path.clone(),
         "trigger",
         &old.triggers,
         &new.triggers,
+        |t: &Trigger| {
+            (
+                (t.table_name.clone(), t.name.clone()),
+                format!("{}.{}", t.table_name, t.name),
+            )
+        },
         diff_trigger,
     );
     diff_object_lists(
@@ -265,10 +349,8 @@ fn diff_column_list(
     old: &[Column],
     new: &[Column],
 ) {
-    let old_map: std::collections::BTreeMap<_, _> =
-        old.iter().map(|c| (c.name.clone(), c)).collect();
-    let new_map: std::collections::BTreeMap<_, _> =
-        new.iter().map(|c| (c.name.clone(), c)).collect();
+    let old_map: BTreeMap<_, _> = old.iter().map(|c| (c.name.clone(), c)).collect();
+    let new_map: BTreeMap<_, _> = new.iter().map(|c| (c.name.clone(), c)).collect();
 
     for name in old_map.keys() {
         if !new_map.contains_key(name) {
@@ -320,10 +402,6 @@ fn diff_column(path: Vec<String>, old: &Column, new: &Column) -> Option<SchemaDi
         status = merge_status(status, type_status);
         messages.push(format!("type: {} -> {}", old.type_name, new.type_name));
     }
-    if old.length != new.length {
-        status = merge_status(status, DiffStatus::Warning);
-        messages.push(format!("length: {:?} -> {:?}", old.length, new.length));
-    }
     if old.nullable != new.nullable {
         status = merge_status(status, DiffStatus::Warning);
         messages.push(format!("nullable: {} -> {}", old.nullable, new.nullable));
@@ -340,44 +418,64 @@ fn diff_column(path: Vec<String>, old: &Column, new: &Column) -> Option<SchemaDi
     }
 }
 
+/// Classify a column type change.  Any difference in `format_type` output is at
+/// least a warning (never silently equal): a `numeric(12,2)` -> `numeric(12,0)`
+/// scale change must not compare equal.
 fn type_change_status(old_type: &str, new_type: &str) -> DiffStatus {
-    let old_norm = normalise_type(old_type);
-    let new_norm = normalise_type(new_type);
-
-    if old_norm == new_norm {
+    if old_type == new_type {
         return DiffStatus::Equal;
     }
 
-    // char(n) -> varchar(n): allowed, amber.
-    if old_type.starts_with("char") && new_type.starts_with("varchar") {
+    let old_base = base_type(old_type);
+    let new_base = base_type(new_type);
+
+    // char(n) <-> varchar(n): amber (q06); a one-character char is not padded.
+    if (old_base == "character" && new_base == "character varying")
+        || (old_base == "character varying" && new_base == "character")
+    {
         return DiffStatus::Warning;
     }
 
-    // json -> jsonb: flagged because semantics change.
-    if old_type == "json" && new_type == "jsonb" {
+    // Same base type with only a typmod change (varchar(60)->varchar(120),
+    // numeric(12,2)->numeric(12,0), char(2)->char(3)): amber.
+    if old_base == new_base {
+        return DiffStatus::Warning;
+    }
+
+    // json <-> jsonb loses order and duplicate keys: red.
+    if (old_base == "json" && new_base == "jsonb") || (old_base == "jsonb" && new_base == "json") {
         return DiffStatus::Different;
     }
 
-    // varchar(50) -> varchar(100): amber warning (widening).
-    if old_type.starts_with("varchar") && new_type.starts_with("varchar") {
+    // timestamp <-> timestamptz changes interpretation under the session TZ.
+    if old_base.starts_with("timestamp") && new_base.starts_with("timestamp") {
         return DiffStatus::Warning;
     }
 
-    // numeric(p,s) -> numeric(p',s'): amber warning.
-    if old_type.starts_with("numeric") && new_type.starts_with("numeric") {
+    // float4 <-> float8 widening is exact; still a type change to flag amber.
+    if (old_base == "real" && new_base == "double precision")
+        || (old_base == "double precision" && new_base == "real")
+    {
         return DiffStatus::Warning;
     }
 
+    // Any other base-type change is a real change: red.
     DiffStatus::Different
 }
 
-fn normalise_type(t: &str) -> String {
-    // Drop length/precision for comparison when the base type matches.
-    if let Some(paren) = t.find('(') {
-        t[..paren].to_string()
-    } else {
-        t.to_string()
+/// Strip a parenthesised typmod from the base type name, keeping qualifiers
+/// such as "without time zone": `numeric(12,2)` -> `numeric`,
+/// `timestamp(0) without time zone` -> `timestamp without time zone`.
+fn base_type(t: &str) -> String {
+    if let Some(open) = t.find('(') {
+        if let Some(rel_close) = t[open..].find(')') {
+            let close = open + rel_close;
+            let base = &t[..open];
+            let rest = &t[close + 1..];
+            return format!("{base}{rest}");
+        }
     }
+    t.to_string()
 }
 
 fn diff_constraint(
@@ -429,24 +527,28 @@ fn diff_index(path: Vec<String>, old: &Index, new: &Index) -> Option<SchemaDiffE
 }
 
 fn diff_sequence(path: Vec<String>, old: &Sequence, new: &Sequence) -> Option<SchemaDiffEntry> {
+    // A value that could not be read is reported, never silently skipped.
     if old.value_skipped || new.value_skipped {
-        return None;
+        return Some(SchemaDiffEntry::leaf(
+            path,
+            DiffStatus::Warning,
+            format!(
+                "sequence {} last_value could not be read on one side; review required",
+                old.name
+            ),
+        ));
     }
-    if let (Some(o), Some(n)) = (&old.last_value, &new.last_value) {
-        let o_val: i64 = o.parse().ok()?;
-        let n_val: i64 = n.parse().ok()?;
-        if n_val < o_val {
-            return Some(SchemaDiffEntry::leaf(
-                path,
-                DiffStatus::Different,
-                format!(
-                    "sequence {} last_value regressed: {} -> {}",
-                    old.name, o_val, n_val
-                ),
-            ));
-        }
+    match (old.last_value, new.last_value) {
+        (Some(old_val), Some(new_val)) if new_val < old_val => Some(SchemaDiffEntry::leaf(
+            path,
+            DiffStatus::Different,
+            format!(
+                "sequence {} last_value regressed: {} -> {}",
+                old.name, old_val, new_val
+            ),
+        )),
+        _ => None,
     }
-    None
 }
 
 fn diff_view(_path: Vec<String>, old: &View, new: &View) -> Option<SchemaDiffEntry> {
@@ -460,11 +562,7 @@ fn diff_view(_path: Vec<String>, old: &View, new: &View) -> Option<SchemaDiffEnt
     None
 }
 
-fn diff_function(
-    path: Vec<String>,
-    old: &crate::inventory::Function,
-    new: &crate::inventory::Function,
-) -> Option<SchemaDiffEntry> {
+fn diff_function(path: Vec<String>, old: &Function, new: &Function) -> Option<SchemaDiffEntry> {
     if old.definition_hash != new.definition_hash {
         return Some(SchemaDiffEntry::leaf(
             path,
@@ -506,6 +604,73 @@ fn diff_object_lists<T, DiffFn>(
         |a, b| a.name() == b.name(),
         diff_fn,
     );
+}
+
+fn diff_keyed<T, K, DiffFn>(
+    children: &mut Vec<SchemaDiffEntry>,
+    path: Vec<String>,
+    kind: &str,
+    old: &[T],
+    new: &[T],
+    identity: impl Fn(&T) -> (K, String),
+    diff_fn: DiffFn,
+) where
+    K: Ord,
+    DiffFn: Fn(Vec<String>, &T, &T) -> Option<SchemaDiffEntry>,
+{
+    let old_map: BTreeMap<K, (&T, String)> = old
+        .iter()
+        .map(|o| {
+            let (k, label) = identity(o);
+            (k, (o, label))
+        })
+        .collect();
+    let new_map: BTreeMap<K, (&T, String)> = new
+        .iter()
+        .map(|n| {
+            let (k, label) = identity(n);
+            (k, (n, label))
+        })
+        .collect();
+
+    for (k, (_o, label)) in &old_map {
+        if !new_map.contains_key(k) {
+            children.push(SchemaDiffEntry::leaf(
+                push(&path, kind)
+                    .into_iter()
+                    .chain(Some(label.clone()))
+                    .collect(),
+                DiffStatus::Different,
+                format!("{kind} missing in new: {label}"),
+            ));
+        }
+    }
+    for (k, (n, label)) in &new_map {
+        match old_map.get(k) {
+            None => {
+                children.push(SchemaDiffEntry::leaf(
+                    push(&path, kind)
+                        .into_iter()
+                        .chain(Some(label.clone()))
+                        .collect(),
+                    DiffStatus::Warning,
+                    format!("{kind} added in new: {label}"),
+                ));
+            }
+            Some((o, _)) => {
+                if let Some(d) = diff_fn(
+                    push(&path, kind)
+                        .into_iter()
+                        .chain(Some(label.clone()))
+                        .collect(),
+                    o,
+                    n,
+                ) {
+                    children.push(d);
+                }
+            }
+        }
+    }
 }
 
 fn diff_named_list<T, EqFn, DiffFn>(
@@ -601,18 +766,6 @@ impl NamedObject for View {
     }
 }
 
-impl NamedObject for crate::inventory::Function {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl NamedObject for Trigger {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 impl NamedObject for Sequence {
     fn name(&self) -> &str {
         &self.name
@@ -672,6 +825,16 @@ mod tests {
         }
     }
 
+    fn column(name: &str, type_name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            length: None,
+            nullable: false,
+            default: None,
+        }
+    }
+
     #[test]
     fn equal_inventories_have_no_differences() {
         let inv = empty_inventory();
@@ -714,63 +877,60 @@ mod tests {
 
     #[test]
     fn column_type_change_char_to_varchar_is_warning() {
-        let old = table_with_columns(
-            "accounts",
-            vec![Column {
-                name: "status".to_string(),
-                type_name: "char(1)".to_string(),
-                length: Some(1),
-                nullable: false,
-                default: None,
-            }],
-        );
-        let new = table_with_columns(
-            "accounts",
-            vec![Column {
-                name: "status".to_string(),
-                type_name: "varchar(1)".to_string(),
-                length: Some(1),
-                nullable: false,
-                default: None,
-            }],
-        );
+        // Real format_type output: character(1) -> character varying(1).
+        let old = table_with_columns("kyc", vec![column("result", "character(1)")]);
+        let new = table_with_columns("kyc", vec![column("result", "character varying(1)")]);
+        let diff = diff_table(vec!["public".to_string(), "kyc".to_string()], &old, &new);
+        assert_eq!(diff.unwrap().status, DiffStatus::Warning);
+    }
+
+    #[test]
+    fn varchar_widening_is_warning() {
+        let old = table_with_columns("branches", vec![column("city", "character varying(60)")]);
+        let new = table_with_columns("branches", vec![column("city", "character varying(120)")]);
         let diff = diff_table(
-            vec!["public".to_string(), "accounts".to_string()],
+            vec!["public".to_string(), "branches".to_string()],
             &old,
             &new,
         );
-        assert!(diff.is_some());
+        assert_eq!(diff.unwrap().status, DiffStatus::Warning);
+    }
+
+    #[test]
+    fn numeric_scale_change_is_never_equal() {
+        // numeric(12,2) -> numeric(12,0) must not be Equal (and is a warning).
+        let old = table_with_columns("t", vec![column("amt", "numeric(12,2)")]);
+        let new = table_with_columns("t", vec![column("amt", "numeric(12,0)")]);
+        let diff = diff_table(vec!["public".to_string(), "t".to_string()], &old, &new);
         assert_eq!(diff.unwrap().status, DiffStatus::Warning);
     }
 
     #[test]
     fn json_to_jsonb_is_different() {
-        let old = table_with_columns(
-            "accounts",
-            vec![Column {
-                name: "meta".to_string(),
-                type_name: "json".to_string(),
-                length: None,
-                nullable: true,
-                default: None,
-            }],
-        );
-        let new = table_with_columns(
-            "accounts",
-            vec![Column {
-                name: "meta".to_string(),
-                type_name: "jsonb".to_string(),
-                length: None,
-                nullable: true,
-                default: None,
-            }],
-        );
+        let old = table_with_columns("accounts", vec![column("meta", "json")]);
+        let new = table_with_columns("accounts", vec![column("meta", "jsonb")]);
         let diff = diff_table(
             vec!["public".to_string(), "accounts".to_string()],
             &old,
             &new,
         );
         assert_eq!(diff.unwrap().status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn different_base_type_is_different() {
+        let old = table_with_columns("t", vec![column("v", "integer")]);
+        let new = table_with_columns("t", vec![column("v", "text")]);
+        let diff = diff_table(vec!["public".to_string(), "t".to_string()], &old, &new);
+        assert_eq!(diff.unwrap().status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn timestamp_to_timestamptz_is_warning() {
+        let old = table_with_columns("t", vec![column("ts", "timestamp without time zone")]);
+        let new = table_with_columns("t", vec![column("ts", "timestamp with time zone")]);
+        let diff = diff_table(vec!["public".to_string(), "t".to_string()], &old, &new);
+        assert_eq!(diff.unwrap().status, DiffStatus::Warning);
     }
 
     #[test]
@@ -832,20 +992,66 @@ mod tests {
         let old = Sequence {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
-            last_value: Some("100".to_string()),
+            last_value: Some(100),
             value_skipped: false,
             ..Sequence::default()
         };
         let new = Sequence {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
-            last_value: Some("50".to_string()),
+            last_value: Some(50),
             value_skipped: false,
             ..Sequence::default()
         };
         let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);
-        assert!(diff.is_some());
         assert_eq!(diff.unwrap().status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn skipped_sequence_value_is_warning_not_silent() {
+        let old = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            value_skipped: true,
+            ..Sequence::default()
+        };
+        let new = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            last_value: Some(10),
+            value_skipped: false,
+            ..Sequence::default()
+        };
+        let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);
+        assert_eq!(diff.unwrap().status, DiffStatus::Warning);
+    }
+
+    #[test]
+    fn large_object_count_change_is_different() {
+        let old = DatabaseInventory {
+            large_object_count: 1,
+            ..empty_inventory()
+        };
+        let new = DatabaseInventory {
+            large_object_count: 0,
+            ..empty_inventory()
+        };
+        let diff = compare_inventories(&old, &new);
+        assert_eq!(diff.status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn lc_monetary_change_is_warning() {
+        let old = DatabaseInventory {
+            lc_monetary: "C".to_string(),
+            ..empty_inventory()
+        };
+        let new = DatabaseInventory {
+            lc_monetary: "en_US.utf8".to_string(),
+            ..empty_inventory()
+        };
+        let diff = compare_inventories(&old, &new);
+        assert_eq!(diff.status, DiffStatus::Warning);
     }
 
     #[test]
