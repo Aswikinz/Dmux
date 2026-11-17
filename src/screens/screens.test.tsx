@@ -19,7 +19,7 @@ import { CompareStructureScreen } from './CompareStructureScreen';
 import { MapScreen } from './MapScreen';
 import { ChooseChecksScreen } from './ChooseChecksScreen';
 import { RunScreen } from './RunScreen';
-import { ResultsScreen } from './ResultsScreen';
+import { DRILL_DOWN_PAGE, ResultsScreen } from './ResultsScreen';
 import { ReportScreen } from './ReportScreen';
 
 function wrap(ui: ReactElement) {
@@ -854,6 +854,48 @@ describe('ResultsScreen', () => {
     fireEvent.click(showRows);
     // A changed row advertises its differing columns.
     expect(await screen.findByText('Changed columns: amount')).toBeDefined();
+  });
+
+  it('pages a very large drill-down instead of rendering every row', async () => {
+    // A partitioned-on-new table can report every old row as missing (15,000
+    // in demo_bank); rendering them all at once froze the webview.
+    const engine = createMockEngine({ forcedFixture: 'fail' });
+    const base = await engine.getResults('run-fail');
+    const card = base.failures[0];
+    const big: Results = {
+      ...base,
+      tableResults: base.tableResults.map((t) =>
+        t.tableId === card.tableId
+          ? {
+              ...t,
+              drillDown: Array.from({ length: 15000 }, (_, i) => ({
+                key: `row-${i}`,
+                kind: 'missing' as const,
+              })),
+            }
+          : t,
+      ),
+    };
+    wrap(
+      <ResultsScreen
+        engine={engine}
+        runId="run-fail"
+        results={big}
+        onResultsChange={() => {}}
+        onNext={() => {}}
+        onBack={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Show rows' })[0]);
+    expect(screen.getByText(`Showing ${DRILL_DOWN_PAGE} of 15,000 rows`)).toBeDefined();
+    expect(screen.getAllByText('Missing in new')).toHaveLength(DRILL_DOWN_PAGE);
+    expect(screen.queryByText(`row-${DRILL_DOWN_PAGE}`)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Show 50 more/ }));
+    expect(screen.getByText(`Showing ${DRILL_DOWN_PAGE * 2} of 15,000 rows`)).toBeDefined();
+    expect(screen.getByText(`row-${DRILL_DOWN_PAGE}`)).toBeDefined();
+    expect(screen.getByText(/14,900 not shown/)).toBeDefined();
   });
 
   it('labels changed-value rows "Changed values", never "Changed during check"', async () => {
