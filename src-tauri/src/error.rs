@@ -84,6 +84,14 @@ pub enum CommandError {
     #[error("could not remove the saved password; connection details were not changed")]
     PasswordRemoveFailed,
 
+    /// No run with the given id exists in this app session.
+    #[error("run not found: {run_id}")]
+    RunNotFound { run_id: String },
+
+    /// The run has not produced results yet (still running / paused / cancelled).
+    #[error("results are not available: {message}")]
+    ResultsNotAvailable { message: String },
+
     /// Something unexpected went wrong (no sensitive detail).
     #[error("{message}")]
     Internal { message: String },

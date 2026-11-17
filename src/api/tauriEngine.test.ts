@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createTauriEngine, EngineError, mapDiffStatus, mapVerdict } from './tauriEngine';
+import {
+  createTauriEngine,
+  EngineError,
+  mapDiffStatus,
+  mapLevel,
+  mapOverallState,
+  mapTableState,
+  mapVerdict,
+  toEngineLevel,
+} from './tauriEngine';
 import type { ConnectionProfile, Inventory, Mapping } from './contract';
 import { defaultOldProfile } from '../screens/ConnectScreen';
 
@@ -355,41 +364,268 @@ describe('createTauriEngine', () => {
   });
 });
 
-describe('data half is not available (never fabricates a verdict)', () => {
-  const dataMethods = [
-    'buildCheckPlan',
-    'startRun',
-    'pollRun',
-    'setRunPaused',
-    'cancelRun',
-    'getResults',
-    'exportReport',
-  ] as const;
+describe('level mapping (engine snake_case <-> contract)', () => {
+  it('mapLevel maps the engine levels 1:1', () => {
+    expect(mapLevel('structure')).toBe('structure');
+    expect(mapLevel('counts_and_totals')).toBe('counts');
+    expect(mapLevel('full_values')).toBe('full-values');
+  });
 
-  it.each(dataMethods)('%s throws a typed EngineError', async (method) => {
+  it('toEngineLevel reverses mapLevel', () => {
+    expect(toEngineLevel('structure')).toBe('structure');
+    expect(toEngineLevel('counts')).toBe('counts_and_totals');
+    expect(toEngineLevel('full-values')).toBe('full_values');
+  });
+});
+
+describe('progress-state mapping is strict', () => {
+  it('maps known per-table states', () => {
+    expect(mapTableState('done')).toBe('done');
+    expect(mapTableState('running')).toBe('running');
+    expect(mapTableState('paused')).toBe('paused');
+    expect(mapTableState('cancelled')).toBe('cancelled');
+    expect(mapTableState('failed')).toBe('failed');
+    expect(mapTableState('changed-during-check')).toBe('changed-during-check');
+  });
+
+  it('treats an unknown per-table state as queued (never done)', () => {
+    expect(mapTableState('bogus')).toBe('queued');
+    expect(mapTableState('')).toBe('queued');
+  });
+
+  it('treats an unknown overall state as running (never done)', () => {
+    expect(mapOverallState('bogus')).toBe('running');
+    expect(mapOverallState('done')).toBe('done');
+    expect(mapOverallState('cancelled')).toBe('cancelled');
+    expect(mapOverallState('paused')).toBe('paused');
+  });
+});
+
+describe('data half is wired to the backend', () => {
+  it('exportReport is still NOT_AVAILABLE (T024)', async () => {
     const engine = createTauriEngine();
-    // Every data method rejects with an EngineError(NOT_AVAILABLE), and never
-    // resolves with a fabricated result.
-    const call = (() => {
-      switch (method) {
-        case 'buildCheckPlan':
-          return engine.buildCheckPlan(mapping());
-        case 'startRun':
-          return engine.startRun(definition());
-        case 'pollRun':
-          return engine.pollRun('run-1');
-        case 'setRunPaused':
-          return engine.setRunPaused('run-1', true);
-        case 'cancelRun':
-          return engine.cancelRun('run-1');
-        case 'getResults':
-          return engine.getResults('run-1');
-        case 'exportReport':
-          return engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
-      }
-    });
+    const call = engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
     await expect(call).rejects.toBeInstanceOf(EngineError);
     await expect(call).rejects.toMatchObject({ code: 'NOT_AVAILABLE' });
+  });
+
+  it('buildCheckPlan invokes build_check_plan and maps the plan', async () => {
+    const engine = createTauriEngine();
+    // Satisfy the compare/buildMapping prerequisites.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
+      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      if (cmd === 'build_check_plan') {
+        return Promise.resolve({
+          tables: [
+            {
+              table_id: 'demo_bank.accounts',
+              schema_name: 'demo_bank',
+              table_name: 'accounts',
+              level: 'full_values',
+              control_total_columns: ['balance'],
+            },
+          ],
+          presets: ['full values everywhere'],
+          estimate_seconds_min: 2,
+          estimate_seconds_max: 8,
+        });
+      }
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+
+    const structure = await engine.compareStructure(profile(), profile());
+    await engine.buildMapping(structure);
+    const plan = await engine.buildCheckPlan(mapping());
+
+    expect(invoke).toHaveBeenCalledWith('build_check_plan', expect.objectContaining({}));
+    expect(plan.tables).toHaveLength(1);
+    expect(plan.tables[0].level).toBe('full-values');
+    expect(plan.tables[0].controlTotalColumns).toEqual(['balance']);
+    expect(plan.estimateSecondsMin).toBe(2);
+  });
+
+  it('startRun sends the resolved levels and control totals', async () => {
+    const engine = createTauriEngine();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
+      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-abc' });
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+
+    const structure = await engine.compareStructure(profile(), profile());
+    await engine.buildMapping(structure);
+
+    const started = await engine.startRun({
+      oldProfile: defaultOldProfile(),
+      newProfile: defaultOldProfile(),
+      mapping: mapping(),
+      plan: {
+        tables: [
+          {
+            tableId: 't0',
+            schemaName: 'demo_bank',
+            tableName: 'accounts',
+            level: 'counts',
+            controlTotalColumns: ['balance'],
+          },
+        ],
+        presets: [],
+        estimateSecondsMin: 1,
+        estimateSecondsMax: 2,
+      },
+    });
+
+    expect(invoke).toHaveBeenCalledWith(
+      'start_run',
+      expect.objectContaining({
+        input: expect.objectContaining({
+          levels: { 'demo_bank.accounts': 'counts_and_totals' },
+          control_total_columns: ['balance'],
+          default_level: 'full_values',
+        }),
+      }),
+    );
+    expect(started.runId).toBe('run-abc');
+    expect(started.overallState).toBe('running');
+  });
+
+  it('getResults maps the engine results and demotes an unknown verdict', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-1',
+      verdict: 'FAIL',
+      coverage: {
+        total_tables: 2,
+        full_values_tables: 1,
+        counts_tables: 1,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [{ id: 'demo_bank.legacy', name: 'demo_bank.legacy', reason: 'not migrated' }],
+      failures: [
+        {
+          id: 'fail-demo_bank.accounts',
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          level: 'full_values',
+          verdict: 'FAIL',
+          summary: '12 rows missing',
+          detail: 'new has fewer rows',
+        },
+      ],
+      table_results: [
+        {
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          verdict: 'FAIL',
+          level: 'full_values',
+          checked: true,
+          drill_down: [
+            { key: '12', kind: 'missing', differing_columns: null },
+          ],
+        },
+        {
+          table_id: 'demo_bank.other',
+          schema_name: 'demo_bank',
+          table_name: 'other',
+          verdict: 'BOGUS_VERDICT',
+          level: 'full_values',
+          checked: true,
+          drill_down: null,
+        },
+      ],
+    });
+
+    const results = await engine.getResults('run-1');
+
+    expect(invoke).toHaveBeenCalledWith('get_results', { runId: 'run-1' });
+    expect(results.verdict).toBe('FAIL');
+    expect(results.coverage.totalTables).toBe(2);
+    expect(results.failures).toHaveLength(1);
+    expect(results.tableResults).toHaveLength(2);
+    // Unknown verdict => TOOL_FAULT (non-PASS), never PASS.
+    expect(results.tableResults[1].verdict).toBe('TOOL_FAULT');
+    expect(results.tableResults[0].drillDown?.[0].kind).toBe('missing');
+  });
+
+  it('getResults maps every engine verdict 1:1 (never fabricates)', async () => {
+    const engine = createTauriEngine();
+    const rawResults = (verdict: string) => ({
+      run_id: 'run-1',
+      verdict,
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [
+        {
+          table_id: 'demo_bank.t',
+          schema_name: 'demo_bank',
+          table_name: 't',
+          verdict,
+          level: 'full_values',
+          checked: true,
+          drill_down: null,
+        },
+      ],
+    });
+
+    for (const v of [
+      'PASS',
+      'FAIL',
+      'WIDELY_DIFFERENT',
+      'NEEDS_REVIEW',
+      'CHANGED_DURING_CHECK',
+      'TOOL_FAULT',
+      'WARNING',
+    ]) {
+      invoke.mockReset();
+      invoke.mockResolvedValueOnce(rawResults(v));
+      const results = await engine.getResults('run-1');
+      expect(results.verdict).toBe(v);
+      expect(results.tableResults[0].verdict).toBe(v);
+    }
+  });
+
+  it('pollRun / setRunPaused / cancelRun invoke their commands', async () => {
+    const engine = createTauriEngine();
+    const progress = {
+      run_id: 'run-1',
+      overall_state: 'running',
+      tables: [
+        {
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          state: 'done',
+          progress_percent: 100,
+          eta_seconds: null,
+        },
+      ],
+      eta_seconds_min: null,
+      eta_seconds_max: null,
+    };
+    invoke.mockResolvedValue(progress);
+
+    await expect(engine.pollRun('run-1')).resolves.toMatchObject({ runId: 'run-1' });
+    expect(invoke).toHaveBeenCalledWith('poll_run', { runId: 'run-1' });
+
+    await engine.setRunPaused('run-1', true);
+    expect(invoke).toHaveBeenCalledWith('set_run_paused', { runId: 'run-1', paused: true });
+
+    await engine.cancelRun('run-1');
+    expect(invoke).toHaveBeenCalledWith('cancel_run', { runId: 'run-1' });
   });
 });
 
@@ -404,14 +640,5 @@ function inventory(): Inventory {
     newEncoding: 'UTF8',
     oldCollation: 'C',
     newCollation: 'C',
-  };
-}
-
-function definition(): import('./contract').RunDefinition {
-  return {
-    oldProfile: defaultOldProfile(),
-    newProfile: defaultOldProfile(),
-    mapping: mapping(),
-    plan: { tables: [], presets: [], estimateSecondsMin: 1, estimateSecondsMax: 2 },
   };
 }

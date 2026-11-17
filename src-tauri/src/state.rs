@@ -1,9 +1,10 @@
 //! Managed Tauri state shared by every command.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::CommandError;
+use crate::run_manager::RunManager;
 use crate::secrets::{Keychain, PasswordStore};
 use crate::store::Store;
 
@@ -13,6 +14,10 @@ pub struct AppState {
     pub keychain: Mutex<Box<dyn PasswordStore>>,
     /// The SQLite profile store, opened at startup.
     pub store: Mutex<Store>,
+    /// The registry of in-progress runs (the data half).
+    pub runs: Arc<RunManager>,
+    /// The app data directory (home of the profile and resume stores).
+    pub data_dir: PathBuf,
 }
 
 impl AppState {
@@ -36,6 +41,8 @@ impl AppState {
         Ok(Self {
             keychain: Mutex::new(keychain),
             store: Mutex::new(store),
+            runs: Arc::new(RunManager::default()),
+            data_dir,
         })
     }
 
@@ -62,4 +69,10 @@ pub fn app_data_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
     app.path()
         .app_data_dir()
         .expect("the OS must provide an app data dir")
+}
+
+/// The resume-store directory for the data half (the engine keeps its per-table
+/// results in a SQLite file here, keyed by run definition so resume is safe).
+pub fn resume_dir(state: &AppState) -> PathBuf {
+    state.data_dir.clone()
 }
