@@ -1623,6 +1623,7 @@ mod tests {
                 control_total_columns: vec![],
                 old_parallelism: None,
                 new_parallelism: None,
+                run_window: None,
                 export_keys: None,
                 allow_superuser: su(),
             },

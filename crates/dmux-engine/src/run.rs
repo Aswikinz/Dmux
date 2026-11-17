@@ -99,7 +99,15 @@ pub struct RunConfig {
     pub stats_settle: std::time::Duration,
     /// Pause/cancel switch (see [`RunControl`]); `None` runs to completion.
     pub control: Option<std::sync::Arc<RunControl>>,
+    /// An optional daily window (local time) outside which the run waits
+    /// between tables (PLAN 4.6).  Deliberately NOT part of
+    /// [`definition_hash`]: it only says when the run works, not what it
+    /// compares, so a resumed run may use a different window.
+    pub run_window: Option<crate::run_window::RunWindow>,
 }
+
+/// How often a run waiting for its window looks at the clock and the stop flag.
+const WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The default [`RunConfig::stats_settle`].
 pub const DEFAULT_STATS_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -129,6 +137,7 @@ impl RunConfig {
             resume_store: None,
             stats_settle: DEFAULT_STATS_SETTLE,
             control: None,
+            run_window: None,
         }
     }
 }
@@ -147,6 +156,7 @@ impl RunConfig {
 pub struct RunControl {
     stopped: std::sync::atomic::AtomicBool,
     tokens: std::sync::Mutex<Vec<crate::db::CancelToken>>,
+    live: std::sync::Mutex<crate::eta::LiveProgress>,
 }
 
 impl std::fmt::Debug for RunControl {
@@ -192,6 +202,15 @@ impl RunControl {
             .clone()
     }
 
+    /// Read or update the run's live numbers (estimates, measured tables,
+    /// window wait) under the lock.
+    pub fn with_live<T>(&self, f: impl FnOnce(&mut crate::eta::LiveProgress) -> T) -> T {
+        f(&mut self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
     /// How many sessions are registered.
     pub fn registered(&self) -> usize {
         self.tokens
@@ -213,6 +232,50 @@ pub(crate) fn checkpoint(config: &RunConfig) -> Result<(), RunError> {
     } else {
         Ok(())
     }
+}
+
+/// Between tables: wait while the run window is closed, then resume by itself.
+///
+/// Returns at once when no window is set or it is open.  Otherwise records one
+/// warning in `results`, shows the wait in the run's live state and polls the
+/// clock (`now`, minutes after local midnight) once a `step`, checking the stop
+/// flag each time so pause and cancel still work.  Never called mid-scan, so no
+/// half result exists.
+pub(crate) async fn wait_for_window(
+    config: &RunConfig,
+    results: &mut RunResults,
+    now: impl Fn() -> u32,
+    step: std::time::Duration,
+) -> Result<(), RunError> {
+    let Some(window) = config.run_window else {
+        return Ok(());
+    };
+    if window.contains(now()) {
+        return Ok(());
+    }
+    let note =
+        format!("the run paused outside its run window ({window}) and carried on when it opened");
+    if !results.warnings.contains(&note) {
+        results.warnings.push(note);
+    }
+    let opens = window.opens_at();
+    let set = |v: Option<String>| {
+        if let Some(c) = &config.control {
+            c.with_live(|l| l.set_window_wait(v));
+        }
+    };
+    set(Some(opens));
+    let outcome = loop {
+        if let Err(e) = checkpoint(config) {
+            break Err(e);
+        }
+        if window.contains(now()) {
+            break Ok(());
+        }
+        tokio::time::sleep(step).await;
+    };
+    set(None);
+    outcome
 }
 
 /// Register a freshly opened session with the run control, then check the
@@ -1247,13 +1310,34 @@ async fn run_live(
     let (total, per) = estimates(&mut old_s, &mut new_s, &pairs).await;
     checkpoint(config)?;
     b.results.estimate = total;
+    if let Some(c) = &config.control {
+        let plan = per.clone();
+        c.with_live(|l| l.set_plan(plan));
+    }
     b.results.table_estimates = per;
 
+    // The run window is honoured before the first snapshot as well, so the
+    // wait does not count against "changed during the check".
+    wait_for_window(
+        config,
+        &mut b.results,
+        crate::run_window::local_minute_of_day,
+        WINDOW_POLL,
+    )
+    .await?;
     let before = snapshot(config, &mut old_s, &mut new_s, &pairs).await?;
 
     for p in &pairs {
         // Stop before each table: finished tables are already in the store.
         checkpoint(config)?;
+        // Outside the run window: wait here, between tables, never mid-scan.
+        wait_for_window(
+            config,
+            &mut b.results,
+            crate::run_window::local_minute_of_day,
+            WINDOW_POLL,
+        )
+        .await?;
         let started = Instant::now();
         if p.level == CheckLevel::Structure {
             let mine: Vec<_> = findings
@@ -1311,6 +1395,10 @@ async fn run_live(
             }
         }
 
+        let scan_started = Instant::now();
+        if let Some(c) = &config.control {
+            c.with_live(|l| l.table_started(&p.path, scan_started));
+        }
         let mut e = scan_pair(
             config,
             &mut old_s,
@@ -1379,6 +1467,9 @@ async fn run_live(
         b.results
             .table_elapsed_ms
             .insert(p.path.clone(), started.elapsed().as_millis() as u64);
+        if let Some(c) = &config.control {
+            c.with_live(|l| l.table_finished(&p.path, scan_started.elapsed().as_secs_f64()));
+        }
     }
 
     // Run-level change sweep: any table that moved since the first snapshot is
@@ -2162,6 +2253,115 @@ mod tests {
         // Stopping twice is harmless.
         ctl.stop();
         assert!(matches!(checkpoint(&c), Err(RunError::Cancelled)));
+    }
+
+    fn windowed() -> (RunConfig, std::sync::Arc<RunControl>) {
+        let (mut c, ctl) = stopped_config();
+        c.run_window = crate::run_window::RunWindow::parse("22:00-05:00").ok();
+        (c, ctl)
+    }
+
+    const TICK: std::time::Duration = std::time::Duration::from_millis(1);
+
+    #[test]
+    fn the_run_window_is_not_part_of_the_definition_hash() {
+        let (c, _) = windowed();
+        assert_eq!(definition_hash(&c), definition_hash(&mock_config()));
+    }
+
+    #[tokio::test]
+    async fn no_window_or_an_open_window_never_waits_or_warns() {
+        let mut r = RunResults::default();
+        let c = mock_config();
+        wait_for_window(&c, &mut r, || 12 * 60, TICK).await.unwrap();
+        let (c, ctl) = windowed();
+        wait_for_window(&c, &mut r, || 23 * 60, TICK).await.unwrap();
+        wait_for_window(&c, &mut r, || 22 * 60, TICK).await.unwrap();
+        wait_for_window(&c, &mut r, || 4 * 60 + 59, TICK)
+            .await
+            .unwrap();
+        assert!(r.warnings.is_empty());
+        assert_eq!(
+            ctl.with_live(|l| l.window_opens_at().map(str::to_string)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_the_window_the_run_waits_then_carries_on_when_it_opens() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (c, ctl) = windowed();
+        let mut r = RunResults::default();
+        let calls = AtomicU32::new(0);
+        // Closed (12:00) for the first reads, then 22:00 (open).
+        let clock = || {
+            if calls.fetch_add(1, Ordering::SeqCst) < 4 {
+                12 * 60
+            } else {
+                22 * 60
+            }
+        };
+        // Observe the wait state from another task while waiting.
+        let watcher = {
+            let ctl = ctl.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    if let Some(t) = ctl.with_live(|l| l.window_opens_at().map(str::to_string)) {
+                        return Some(t);
+                    }
+                    tokio::time::sleep(TICK).await;
+                }
+                None
+            })
+        };
+        wait_for_window(&c, &mut r, clock, std::time::Duration::from_millis(20))
+            .await
+            .unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 5);
+        assert_eq!(watcher.await.unwrap().as_deref(), Some("22:00"));
+        assert_eq!(
+            ctl.with_live(|l| l.window_opens_at().map(str::to_string)),
+            None
+        );
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("22:00-05:00"));
+        // A second wait in the same run does not repeat the warning.
+        let calls2 = AtomicU32::new(0);
+        wait_for_window(
+            &c,
+            &mut r,
+            || {
+                if calls2.fetch_add(1, Ordering::SeqCst) < 2 {
+                    600
+                } else {
+                    1380
+                }
+            },
+            TICK,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_the_window() {
+        let (c, ctl) = windowed();
+        let mut r = RunResults::default();
+        let stopper = {
+            let ctl = ctl.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                ctl.stop();
+            })
+        };
+        let out = wait_for_window(&c, &mut r, || 12 * 60, TICK).await;
+        stopper.await.unwrap();
+        assert!(matches!(out, Err(RunError::Cancelled)));
+        assert_eq!(
+            ctl.with_live(|l| l.window_opens_at().map(str::to_string)),
+            None
+        );
     }
 
     #[tokio::test]

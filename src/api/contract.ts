@@ -201,6 +201,9 @@ export interface CheckPlan {
   /** Total estimated seconds, shown as a range. */
   estimateSecondsMin: number;
   estimateSecondsMax: number;
+  /** Optional daily run window "HH:MM-HH:MM" (local time); the run waits
+   *  between tables outside it. Absent when off. */
+  runWindow?: string;
 }
 
 export type TableRunState =
@@ -229,6 +232,10 @@ export interface RunProgress {
   /** Overall seconds remaining, shown as a range. */
   etaSecondsMin?: number;
   etaSecondsMax?: number;
+  /** Set while the run waits for its run window: the time it opens ("22:00"). */
+  waitingForWindow?: string;
+  /** Plain notices for the person watching the run. */
+  notices?: string[];
 }
 
 /**

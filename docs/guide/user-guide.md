@@ -90,6 +90,12 @@ bank signs its server certificates with its own certificate authority, add `ca_f
 path to the CA's PEM file) to the `old` and `new` connection tables, or pass
 `--ca-file <PATH>` to `dmux probe`, `dmux inventory` and `dmux capture`.
 
+To run only at night, add `run_window = "22:00-05:00"` to the definition file (start and
+end on a 24-hour clock, this computer's local time; a window across midnight is fine).
+Outside it `dmux run` waits between tables and carries on when the window opens. A badly
+written window is refused with a message before anything runs. The window is not part of
+what the run compares, so a resumed run may use a different one.
+
 A saved capture can be compared again later, but only by a version of Dmux that uses the
 same comparison rules as the one that made it. Dmux refuses any other capture and asks for
 it to be captured again; see [How Dmux decides](../how-dmux-decides.md).
@@ -288,6 +294,11 @@ take before you start.
    amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
    column is added up in every table that has a column with that name.
 5. Read the estimate: a range per table and in total.
+6. If the databases are only quiet at certain hours, switch on **Only run during certain
+   hours** and set the times, for example 22:00 until 05:00. It is off unless you turn it on.
+   Outside those hours Dmux waits between tables, and carries on by itself when the hours
+   start again. A window that crosses midnight works. The times are the clock of the
+   computer running Dmux.
 6. Press **Run**.
 
 **What you see.** A list of tables with their level, their size on disk and an estimated
@@ -302,7 +313,12 @@ pass, because Dmux then goes back for the rows.
   tables got which level, so nothing is hidden.
 - *A table has no suggested totals*: its columns may not be numeric, or the names are
   unfamiliar. Counts alone are still checked.
-- *The run window is set outside your quiet hours*: change it in settings before starting.
+- *The run window is set outside your quiet hours*: change the times on this screen before
+  you press **Run**.
+- *Tables changed while the check was waiting*: Dmux only waits between tables, but if
+  someone changes a table during the wait, that table is marked "changed during check",
+  never a tick. Use a window only when the databases are quiet outside it, or accept that
+  tables read after a long wait may need a second check.
 
 > **TODO (wiring):** screenshot of the selection tools and the estimate panel.
 
@@ -314,14 +330,23 @@ pass, because Dmux then goes back for the rows.
 
 1. Watch the progress list. Each table shows its level, its state and, once it is done,
    its verdict.
-2. Leave the machine awake. Dmux blocks sleep during a run; closing the window asks first.
+2. Leave the machine switched on. While a run is working, Dmux asks the computer not to go
+   to sleep (the screen may still turn off). The block is lifted when you pause, cancel, or
+   the run ends. If the computer does not allow it, the run carries on and a note on the
+   screen and in the results says so; in that case keep the computer awake yourself.
 3. Use **Pause** if you need the databases for something else, and resume when ready.
 4. Use **Cancel** if the run must stop. It stops the queries on the server, not only the
    display.
 5. When every table is done, continue to **Results**.
 
-**What you see.** A row per table with a progress bar, the time left, and words as well as
-colours for every state. Tables already finished keep their results, so a dropped VPN, a
+**What you see.** A row per table with a progress bar, and words as well as colours for every
+state. **Time remaining** is a range for the whole run, for example "about 12-40 minutes".
+It starts from the estimate on the previous screen and is corrected as each table finishes,
+using how fast the finished tables really ran, so the range narrows and the numbers move
+towards the truth. The table being read shows its own time left. When Dmux cannot say, it
+shows nothing rather than a guess. If you set a run window and it is closed, the screen says
+"Waiting for the run window (opens at 22:00)"; nothing is wrong, and the run restarts by
+itself. Pause and Cancel still work while it waits. Tables already finished keep their results, so a dropped VPN, a
 closed laptop or a restart does not throw the run away: Dmux resumes where it stopped. A
 table being written to by someone else shows "changed during check", never a tick.
 

@@ -1018,6 +1018,10 @@ struct RunDefinition {
     /// and minimum 2000: the statistics flush lag; see dmux_engine::consistency).
     #[serde(default)]
     stats_settle_ms: Option<u64>,
+    /// A daily window such as "22:00-05:00" (local time, may cross midnight).
+    /// Outside it the run waits between tables and carries on when it opens.
+    #[serde(default)]
+    run_window: Option<String>,
 }
 
 /// The smallest accepted `stats_settle_ms`.
@@ -1169,6 +1173,13 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
             ))
         }
     };
+    let run_window = match def.run_window.as_deref() {
+        None => None,
+        Some(text) => Some(
+            dmux_engine::run_window::RunWindow::parse(text)
+                .map_err(|e| format!("run_window: {e}"))?,
+        ),
+    };
     let old_parallelism = def.old_parallelism.unwrap_or(2);
     let new_parallelism = def.new_parallelism.unwrap_or(4);
     if old_parallelism == 0 || new_parallelism == 0 {
@@ -1195,6 +1206,7 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         resume_store: None,
         stats_settle,
         control: None,
+        run_window,
     })
 }
 
@@ -1681,6 +1693,34 @@ new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", 
             &CONNS.replace("tls = \"disable\", reason = \"lab\"", "tls = \"bogus\"")
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_run_window_parses_and_a_bad_one_is_refused() {
+        let c = definition("window-none", CONNS).unwrap();
+        assert!(c.run_window.is_none());
+        let c = definition(
+            "window-ok",
+            &format!("run_window = \"22:00-05:00\"\n{CONNS}"),
+        )
+        .unwrap();
+        assert_eq!(c.run_window.unwrap().to_string(), "22:00-05:00");
+        for bad in ["25:00-05:00", "22:00", "08:00-08:00", ""] {
+            let e =
+                definition("window-bad", &format!("run_window = \"{bad}\"\n{CONNS}")).unwrap_err();
+            assert!(e.contains("run_window"), "{e}");
+        }
+        // A window is not part of what the run is: same definition hash.
+        let a = definition("window-h1", CONNS).unwrap();
+        let b = definition(
+            "window-h2",
+            &format!("run_window = \"22:00-05:00\"\n{CONNS}"),
+        )
+        .unwrap();
+        assert_eq!(
+            dmux_engine::run::definition_hash(&a),
+            dmux_engine::run::definition_hash(&b)
+        );
     }
 
     #[test]

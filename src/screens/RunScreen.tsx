@@ -182,6 +182,16 @@ export function RunScreen({
                         ? 'Cancelled: this run has no verdict.'
                         : 'The run has finished.'}
                 </div>
+                {progress.overallState === 'running' && progress.waitingForWindow && (
+                  <div role="status" className="text-sm font-medium text-slate-800 dark:text-slate-100">
+                    Waiting for the run window (opens at {progress.waitingForWindow})
+                  </div>
+                )}
+                {progress.notices?.map((n) => (
+                  <div key={n} role="status" className="text-sm text-amber-800 dark:text-amber-300">
+                    {n}
+                  </div>
+                ))}
                 {!finished &&
                   progress.etaSecondsMin !== undefined &&
                   progress.etaSecondsMax !== undefined && (

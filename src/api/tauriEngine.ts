@@ -332,6 +332,8 @@ interface RawRunProgress {
   tables: RawTableProgress[];
   eta_seconds_min: number | null;
   eta_seconds_max: number | null;
+  waiting_for_window?: string | null;
+  notices?: string[];
 }
 
 /** `get_results` -> `ResultsDto`. */
@@ -1018,6 +1020,8 @@ function translateProgress(raw: RawRunProgress): RunProgress {
     tables,
     etaSecondsMin: raw.eta_seconds_min ?? undefined,
     etaSecondsMax: raw.eta_seconds_max ?? undefined,
+    waitingForWindow: raw.waiting_for_window ?? undefined,
+    notices: raw.notices && raw.notices.length > 0 ? raw.notices : undefined,
   };
 }
 
@@ -1335,6 +1339,7 @@ export function createTauriEngine(): Engine {
           default_level: 'full_values',
           control_total_columns: controlTotalColumns,
           allow_superuser: allowSuperuser(),
+          run_window: definition.plan.runWindow ?? null,
         },
       });
       return { runId: started.run_id, overallState: 'running', tables: [] };

@@ -689,6 +689,62 @@ describe('data half is wired to the backend', () => {
     expect(started.overallState).toBe('running');
   });
 
+  it('startRun passes the run window, and none when it is off', async () => {
+    const engine = createTauriEngine();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-w' });
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const structure = await engine.compareStructure(profile(), profile());
+    await engine.buildMapping(structure);
+    const plan = { tables: [], presets: [], estimateSecondsMin: 1, estimateSecondsMax: 2 };
+    const def = { oldProfile: defaultOldProfile(), newProfile: defaultOldProfile(), mapping: mapping() };
+    await engine.startRun({ ...def, plan: { ...plan, runWindow: '22:00-05:00' } });
+    expect(invoke).toHaveBeenCalledWith(
+      'start_run',
+      expect.objectContaining({ input: expect.objectContaining({ run_window: '22:00-05:00' }) }),
+    );
+    await engine.startRun({ ...def, plan });
+    expect(invoke).toHaveBeenLastCalledWith(
+      'start_run',
+      expect.objectContaining({ input: expect.objectContaining({ run_window: null }) }),
+    );
+  });
+
+  it('pollRun maps the window wait, the notices and the time remaining', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'r',
+      overall_state: 'running',
+      tables: [
+        { table_id: 'a.b', schema_name: 'a', table_name: 'b', state: 'running', progress_percent: 0, eta_seconds: 30 },
+      ],
+      eta_seconds_min: 10,
+      eta_seconds_max: 90,
+      waiting_for_window: '22:00',
+      notices: ['note'],
+    });
+    const p = await engine.pollRun('r');
+    expect(p.waitingForWindow).toBe('22:00');
+    expect(p.notices).toEqual(['note']);
+    expect([p.etaSecondsMin, p.etaSecondsMax, p.tables[0].etaSeconds]).toEqual([10, 90, 30]);
+    invoke.mockResolvedValueOnce({
+      run_id: 'r',
+      overall_state: 'running',
+      tables: [],
+      eta_seconds_min: null,
+      eta_seconds_max: null,
+      waiting_for_window: null,
+      notices: [],
+    });
+    const q = await engine.pollRun('r');
+    expect(q.waitingForWindow).toBeUndefined();
+    expect(q.notices).toBeUndefined();
+    expect(q.etaSecondsMin).toBeUndefined();
+  });
+
   it('getResults maps the engine results and demotes an unknown verdict', async () => {
     const engine = createTauriEngine();
     invoke.mockResolvedValueOnce({

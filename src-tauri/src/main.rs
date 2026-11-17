@@ -8,6 +8,7 @@ mod hooks;
 mod prefs;
 mod run_manager;
 mod secrets;
+mod sleep;
 mod state;
 mod store;
 mod types;

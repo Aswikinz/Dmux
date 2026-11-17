@@ -545,6 +545,31 @@ describe('ChooseChecksScreen', () => {
     expect(await screen.findByText('Estimated time:')).toBeDefined();
   });
 
+  it('offers an optional run window, off by default, and stores it on the plan', async () => {
+    let latest: CheckPlan | null = null;
+    function Spy({ engine }: { engine: Engine }) {
+      const [plan, setPlan] = useState<CheckPlan | null>(null);
+      latest = plan;
+      return (
+        <ChooseChecksScreen
+          engine={engine}
+          mapping={{ rules: [], matches: [], needsAttention: [], ignored: [] }}
+          plan={plan}
+          onPlanChange={setPlan}
+          onNext={() => {}}
+          onBack={() => {}}
+        />
+      );
+    }
+    wrap(<Spy engine={createMockEngine()} />);
+    await screen.findByText('Estimated time:');
+    expect((latest as CheckPlan | null)?.runWindow).toBeUndefined();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Only run during certain hours' }));
+    expect((latest as CheckPlan | null)?.runWindow).toBe('22:00-05:00');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Only run during certain hours' }));
+    expect((latest as CheckPlan | null)?.runWindow).toBeUndefined();
+  });
+
   it('changes a table check level through the select', async () => {
     function ChecksWithState({ engine }: { engine: Engine }) {
       const [plan, setPlan] = useState<CheckPlan | null>(null);
@@ -670,6 +695,49 @@ describe('RunScreen', () => {
     expect(screen.getByText(/do not match/)).toBeDefined();
     expect(screen.queryByText('Done')).toBeNull();
     expect(screen.queryByText('PASS')).toBeNull();
+  });
+
+  it('says the run waits for its window, and shows notices', async () => {
+    const waiting: RunProgress = {
+      runId: 'run-wait',
+      overallState: 'running',
+      tables: [],
+      waitingForWindow: '22:00',
+      notices: ['Dmux could not stop this computer from going to sleep during the check.'],
+    };
+    const engine: Engine = {
+      ...createMockEngine(),
+      startRun: async () => waiting,
+      pollRun: async () => waiting,
+    };
+    wrap(<RunHarness engine={engine} />);
+    expect(
+      await screen.findByText('Waiting for the run window (opens at 22:00)'),
+    ).toBeDefined();
+    expect(screen.getByText(/could not stop this computer from going to sleep/)).toBeDefined();
+  });
+
+  it('shows the live time remaining as a plain range', async () => {
+    const live: RunProgress = {
+      runId: 'run-eta',
+      overallState: 'running',
+      tables: [
+        {
+          tableId: 't1',
+          schemaName: 'demo_bank',
+          tableName: 'ledger',
+          state: 'running',
+          progressPercent: 0,
+          etaSeconds: 90,
+        },
+      ],
+      etaSecondsMin: 60,
+      etaSecondsMax: 600,
+    };
+    const engine: Engine = { ...createMockEngine(), startRun: async () => live, pollRun: async () => live };
+    wrap(<RunHarness engine={engine} />);
+    expect(await screen.findByText(/Time remaining:/)).toBeDefined();
+    expect(screen.getByText(/about 2 minutes left/)).toBeDefined();
   });
 
   it('can pause, resume and cancel a running run', async () => {
