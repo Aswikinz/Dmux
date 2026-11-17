@@ -19,15 +19,15 @@ done
 
 # Every non-merge commit must carry the owner's author email. Merge commits are
 # skipped: GitHub's own PR merges are authored by "GitHub", not the owner.
-if [ -n "$OWNER_EMAIL" ]; then
+if [[ -n "$OWNER_EMAIL" ]]; then
   while IFS= read -r sha; do
-    [ -n "$sha" ] || continue
+    [[ -n "$sha" ]] || continue
     email="$(git log -1 --format=%ae "$sha")"
-    if [ "$email" != "$OWNER_EMAIL" ]; then
+    if [[ "$email" != "$OWNER_EMAIL" ]]; then
       echo "commit $(git log -1 --format='%h %s' "$sha") has author email '$email', not the owner's '$OWNER_EMAIL'"; BAD=1
     fi
   done < <(git rev-list --no-merges "$RANGE")
 fi
 
-[ "$BAD" -eq 0 ] && echo "commit rules: ok ($(git rev-list --count "$RANGE") commit(s) checked)"
+[[ "$BAD" -eq 0 ]] && echo "commit rules: ok ($(git rev-list --count "$RANGE") commit(s) checked)"
 exit "$BAD"

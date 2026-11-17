@@ -39,10 +39,10 @@ for arg in "$@"; do
     --baseline)
       # The value follows in the next argument; handled below.
       BASELINE="__next__" ;;
-    *) if [ "$BASELINE" = "__next__" ]; then BASELINE="$arg"; else ARGS+=("$arg"); fi ;;
+    *) if [[ "$BASELINE" = "__next__" ]]; then BASELINE="$arg"; else ARGS+=("$arg"); fi ;;
   esac
 done
-if [ "$BASELINE" = "__next__" ]; then
+if [[ "$BASELINE" = "__next__" ]]; then
   echo "usage: verify.sh [old port] [new port] [--baseline FILE]" >&2
   exit 2
 fi
@@ -147,10 +147,10 @@ fi
 : > "$TMP/new.digest"
 echo "Per-table digests:"
 while IFS= read -r tbl; do
-  [ -n "$tbl" ] || continue
+  [[ -n "$tbl" ]] || continue
   exprs_old="$(col_exprs "$OLD_URL" "$tbl")"
   exprs_new="$(col_exprs "$NEW_URL" "$tbl")"
-  if [ -z "$exprs_old" ] || [ -z "$exprs_new" ]; then
+  if [[ -z "$exprs_old" ]] || [[ -z "$exprs_new" ]]; then
     bad "$tbl: no columns found (table missing on one side?)"
     continue
   fi
@@ -158,7 +158,7 @@ while IFS= read -r tbl; do
   d_new="$(digest "$NEW_URL" "$tbl" "$exprs_new")"
   printf '%s|%s\n' "$tbl" "$d_old" >> "$TMP/old.digest"
   printf '%s|%s\n' "$tbl" "$d_new" >> "$TMP/new.digest"
-  if [ "$d_old" = "$d_new" ]; then
+  if [[ "$d_old" = "$d_new" ]]; then
     ok "$(printf '%-22s %s rows' "$tbl" "${d_old%%|*}")"
   else
     bad "$(printf '%-22s old=%s new=%s' "$tbl" "$d_old" "$d_new")"
@@ -173,9 +173,9 @@ else
   sed 's/^/        /' "$TMP/copy.diff"
 fi
 
-if [ -n "$BASELINE" ]; then
+if [[ -n "$BASELINE" ]]; then
   echo "Reproducibility check (baseline: $BASELINE):"
-  if [ -f "$BASELINE" ]; then
+  if [[ -f "$BASELINE" ]]; then
     if diff -u "$BASELINE" "$TMP/old.digest" > "$TMP/base.diff"; then
       ok "identical to the baseline: two builds produced the same data"
     else
@@ -189,4 +189,4 @@ if [ -n "$BASELINE" ]; then
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]

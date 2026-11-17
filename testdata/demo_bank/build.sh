@@ -59,7 +59,7 @@ for arg in "$@"; do
     *) PORTS+=("$arg") ;;
   esac
 done
-if [ "${#PORTS[@]}" -gt 2 ]; then
+if [[ "${#PORTS[@]}" -gt 2 ]]; then
   echo "build.sh: at most two ports (old, new)" >&2
   exit 2
 fi
@@ -87,7 +87,7 @@ done
 # only run DROP/CREATE DATABASE for the fixed literal $DB.
 for u in "$OLD_URL" "$NEW_URL"; do
   db="${u##*/}"
-  if [ "$db" != "$DB" ]; then
+  if [[ "$db" != "$DB" ]]; then
     echo "refusing: build.sh only writes to database $DB, not '$db'" >&2
     exit 1
   fi
@@ -153,9 +153,9 @@ echo "Summary (before planting):"
 printf '  old  %s\n' "$(table_counts "$OLD_URL")"
 printf '  new  %s\n' "$(table_counts "$NEW_URL")"
 
-if [ "$PLANT" -eq 1 ]; then
+if [[ "$PLANT" -eq 1 ]]; then
   echo "Planting the PLAN.md 8.2 differences in the new database only:"
-  if [ ! -f "$HERE/plant.sql" ]; then
+  if [[ ! -f "$HERE/plant.sql" ]]; then
     echo "  plant.sql is missing" >&2
     exit 1
   fi

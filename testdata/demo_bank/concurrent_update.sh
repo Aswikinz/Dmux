@@ -31,7 +31,7 @@ PORT="${2:-5434}"
 case "$DURATION" in
   ''|*[!0-9]*) echo "usage: concurrent_update.sh [seconds] [new port]" >&2; exit 2 ;;
 esac
-[ "$DURATION" -gt 0 ] || { echo "seconds must be positive" >&2; exit 2; }
+[[ "$DURATION" -gt 0 ]] || { echo "seconds must be positive" >&2; exit 2; }
 case "$PORT" in
   *[!0-9]*) echo "usage: concurrent_update.sh [seconds] [new port]" >&2; exit 2 ;;
 esac
@@ -46,7 +46,7 @@ if ! dmux_guard_url "$NEW_URL"; then
 fi
 # URL guard is not enough: this script writes, so the database name is fixed too.
 # Any other local database (bank, postgres, a copy) is refused before connecting.
-if [ "${NEW_URL##*/}" != "demo_bank" ]; then
+if [[ "${NEW_URL##*/}" != "demo_bank" ]]; then
   echo "refusing: concurrent_update.sh only writes to database demo_bank, not '${NEW_URL##*/}'" >&2
   exit 1
 fi
@@ -55,7 +55,7 @@ NOTE_ID=1500
 
 rows="$(psql -X -q -A -t -v ON_ERROR_STOP=1 "$NEW_URL" \
   -c "SELECT count(*) FROM demo_bank.notes WHERE note_id = $NOTE_ID")"
-if [ "$rows" != "1" ]; then
+if [[ "$rows" != "1" ]]; then
   echo "refusing: demo_bank.notes note_id $NOTE_ID not found (build the answer key first)" >&2
   exit 1
 fi
@@ -63,8 +63,8 @@ fi
 echo "Updating demo_bank.notes note_id $NOTE_ID in the new database for ${DURATION}s..."
 count=0
 end=$((SECONDS + DURATION))
-while [ "$SECONDS" -lt "$end" ]; do
-  if [ $((count % 2)) -eq 0 ]; then token='runtime probe A'; else token='runtime probe B'; fi
+while [[ "$SECONDS" -lt "$end" ]]; do
+  if [[ $((count % 2)) -eq 0 ]]; then token='runtime probe A'; else token='runtime probe B'; fi
   psql -X -q -v ON_ERROR_STOP=1 "$NEW_URL" \
     -c "UPDATE demo_bank.notes SET note_text = '$token' WHERE note_id = $NOTE_ID" >/dev/null
   count=$((count + 1))

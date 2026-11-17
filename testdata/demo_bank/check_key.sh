@@ -48,7 +48,7 @@ for u in "$OLD_URL" "$NEW_URL"; do
   fi
 done
 
-[ -f "$KEY" ] || { echo "missing answer key: $KEY" >&2; exit 1; }
+[[ -f "$KEY" ]] || { echo "missing answer key: $KEY" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required to read the key" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
@@ -66,9 +66,9 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
 # returned no row; an empty expected means the key (or python) failed. Both are
 # failures, never a silent "" = "".
 assert_eq() { # label, actual, expected
-  if [ -z "$2" ] || [ -z "$3" ]; then
+  if [[ -z "$2" ]] || [[ -z "$3" ]]; then
     bad "$1 (empty value: actual=[$2] expected=[$3]; a query or the key failed)"
-  elif [ "$2" = "$3" ]; then
+  elif [[ "$2" = "$3" ]]; then
     ok "$1"
   else
     bad "$1 (expected [$3], got [$2])"
@@ -253,7 +253,7 @@ without_column() { # column list, name to drop
   local out="" c
   local IFS=','
   for c in $1; do
-    [ "$c" = "$2" ] || out="${out:+$out,}$c"
+    [[ "$c" = "$2" ]] || out="${out:+$out,}$c"
   done
   printf '%s' "$out"
 }
@@ -301,12 +301,12 @@ get_raw "old server" "$OLD_URL" "SELECT current_setting('server_version')
     || ', ' || pg_encoding_to_char(encoding) || ', collate ' || datcollate
   FROM pg_database WHERE datname = current_database()"
 printf '  old %s\n' "$GOT"
-[ -n "$GOT" ] || bad "old server did not answer"
+[[ -n "$GOT" ]] || bad "old server did not answer"
 get_raw "new server" "$NEW_URL" "SELECT current_setting('server_version')
     || ', ' || pg_encoding_to_char(encoding) || ', collate ' || datcollate
   FROM pg_database WHERE datname = current_database()"
 printf '  new %s\n' "$GOT"
-[ -n "$GOT" ] || bad "new server did not answer"
+[[ -n "$GOT" ]] || bad "new server did not answer"
 
 # ---------------------------------------------------------------------------
 # Must-report entries. Every expected value comes from the key, so a key edit
@@ -347,7 +347,7 @@ assert_eq "m02 count difference" "$((new_count - old_count))" "$(keyval m02 'v["
 keyval m02 '"\n".join("\t".join([r["event_at"], r["actor"], r["action"], r["object_name"], r["detail"]]) for r in v["extra_rows"])' > "$TMP/m02.tsv"
 m02_rows=0
 while IFS=$'\t' read -r ts actor action object_name detail; do
-  [ -n "${ts:-}" ] || continue
+  [[ -n "${ts:-}" ]] || continue
   m02_rows=$((m02_rows + 1))
   pred="event_at = timestamptz '$ts' AND actor = '$actor' AND action = '$action'
         AND object_name = '$object_name' AND detail = '$detail'"
@@ -370,7 +370,7 @@ new_val="$GOT"
 assert_eq "m03 account $m03_key old balance" "$old_val" "$(keyval m03 'v["old"]')"
 assert_eq "m03 account $m03_key new balance" "$new_val" "$(keyval m03 'v["new"]')"
 m03_difference=""
-if [ -n "$old_val" ] && [ -n "$new_val" ]; then
+if [[ -n "$old_val" ]] && [[ -n "$new_val" ]]; then
   m03_difference="$(python3 -c 'import sys; print("%.4f" % (float(sys.argv[1]) - float(sys.argv[2])))' "$new_val" "$old_val")"
 fi
 assert_eq "m03 balance difference" "$m03_difference" "$(keyval m03 'v["difference"]')"
@@ -452,7 +452,7 @@ if ! m09_cols="$(columns_of "$OLD_URL" "$m09_old")"; then
   bad "m09 columns query failed for $m09_old"
   m09_cols=""
 fi
-if [ -z "$m09_cols" ]; then
+if [[ -z "$m09_cols" ]]; then
   bad "m09 cannot compare $m09_old with $m09_new (no columns)"
 else
   get_digest "m09 new data digest" "$NEW_URL" "$m09_new" "$(col_exprs "$NEW_URL" "$m09_new" "$m09_cols")"
@@ -498,7 +498,7 @@ assert_eq "m12 seq_gl_entry old last_value" "$m12_old" "$(keyval m12 'v["old_las
 assert_eq "m12 seq_gl_entry new last_value" "$m12_new" "$(keyval m12 'v["new_last_value"]')"
 assert_eq "m12 old next value" "$((m12_old + 1))" "$(keyval m12 'v["old_next_value"]')"
 assert_eq "m12 new next value" "$((m12_new + 1))" "$(keyval m12 'v["new_next_value"]')"
-if [ "$m12_new" -lt "$m12_old" ]; then
+if [[ "$m12_new" -lt "$m12_old" ]]; then
   ok "m12 the new sequence is behind the old one"
 else
   bad "m12 the new sequence is not behind the old one"
@@ -642,8 +642,8 @@ echo "Per-table data identity:"
 tables_of() { # url
   local extra=""
   # relispartition is Postgres 10+; the 9.4/9.6 old side has no partitions.
-  if [ "$(scalar "$1" "SELECT count(*) FROM pg_attribute
-      WHERE attrelid = 'pg_class'::regclass AND attname = 'relispartition'")" = "1" ]; then
+  if [[ "$(scalar "$1" "SELECT count(*) FROM pg_attribute
+      WHERE attrelid = 'pg_class'::regclass AND attname = 'relispartition'")" = "1" ]]; then
     extra="AND NOT c.relispartition"
   fi
   psql -X -q -A -t -v ON_ERROR_STOP=1 "$1" -c "
@@ -673,12 +673,12 @@ fi
 
 IDENTICAL_SKIP=" transactions audit_log accounts "
 while IFS= read -r tbl; do
-  [ -n "$tbl" ] || continue
+  [[ -n "$tbl" ]] || continue
   new_tbl="$(new_table_for "$tbl")"
   get_scalar "$tbl: counterpart exists" "$NEW_URL" "SELECT count(*) FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'demo_bank' AND c.relname = '$new_tbl' AND c.relkind IN ('r', 'p')"
-  if [ "$GOT" != "1" ]; then
+  if [[ "$GOT" != "1" ]]; then
     bad "$tbl: no counterpart $new_tbl on new"
     continue
   fi
@@ -691,7 +691,7 @@ while IFS= read -r tbl; do
     continue
   fi
   common="$(common_columns "$old_cols" "$new_cols")"
-  if [ -z "$common" ]; then
+  if [[ -z "$common" ]]; then
     bad "$tbl: no common columns with $new_tbl"
     continue
   fi
@@ -744,7 +744,7 @@ done < "$TMP/old.tables"
 # be there). The behaviour itself is exercised by the engine harness.
 # ---------------------------------------------------------------------------
 mark_handled r01
-if [ -x "$HERE/concurrent_update.sh" ]; then
+if [[ -x "$HERE/concurrent_update.sh" ]]; then
   ok "r01 concurrent_update.sh is present and executable"
 else
   bad "r01 concurrent_update.sh is missing or not executable"
@@ -765,9 +765,9 @@ for id in $(key_ids must_report) $(key_ids must_stay_quiet) $(key_ids runtime); 
     *) uncovered=$((uncovered + 1)); bad "entry $id is in the key but check_key.sh does not check it" ;;
   esac
 done
-if [ "$uncovered" -eq 0 ]; then
+if [[ "$uncovered" -eq 0 ]]; then
   ok "every entry in the key is covered by a check"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]
