@@ -74,26 +74,35 @@ pub fn do_save_profile(
     validate_profile(&profile)?;
     let incoming = as_stored(&profile);
 
-    // Detect the credential-mixing hazard: overwriting an existing profile's
-    // connection fields without a new password would keep the old keychain
-    // entry, so a later keychain-based connection would send the real password
-    // to a changed host / weaker encryption / attacker-pinned cert.  Drop the
-    // saved password unless a new one is supplied in this same call.
-    let fields_changed = match state.store()?.get(&incoming.id)? {
-        Some(existing) => connection_fields_differ(&existing, &incoming),
-        None => false, // new profile; there is no stale password to leak
-    };
+    let existing = state.store()?.get(&incoming.id)?;
+    let is_update = existing.is_some();
+    let fields_changed = existing
+        .as_ref()
+        .is_some_and(|ex| connection_fields_differ(ex, &incoming));
 
     let mut warning = None;
-    if fields_changed && password.is_none() {
-        // Fail closed: if the saved password cannot be removed, the old secret
-        // may still exist and must never be reused against the new details.
-        // Abort BEFORE `store.save` so the on-disk profile is left unchanged.
-        state
-            .keychain()?
-            .delete(&incoming.id)
-            .map_err(|_| CommandError::PasswordRemoveFailed)?;
-        warning = Some(PASSWORD_REMOVED_MESSAGE.to_string());
+
+    // Fail-closed password hygiene: whenever this call will leave the id
+    // WITHOUT a freshly-supplied password, any password that may still exist
+    // for it must be removed BEFORE the profile changes on disk, so a stale
+    // secret can never be reused against new connection details.
+    if password.is_none() {
+        //   - an update that changed connection fields, or
+        //   - a brand-new profile (whose id may still hold a leftover entry
+        //     orphaned by an earlier deletion),
+        // both require clearing any existing entry.
+        let must_clear = !is_update || fields_changed;
+        if must_clear {
+            state
+                .keychain()?
+                .delete(&incoming.id)
+                .map_err(|_| CommandError::PasswordRemoveFailed)?;
+            // Only warn when we dropped a password the user knew about (an
+            // update), not when clearing an unreachable orphan on a new profile.
+            if is_update {
+                warning = Some(PASSWORD_REMOVED_MESSAGE.to_string());
+            }
+        }
     }
 
     let stored = state.store()?.save(&incoming)?;
@@ -127,14 +136,28 @@ pub fn save_profile(
     do_save_profile(profile, password, &state)
 }
 
+/// Delete a profile and its keychain password, keychain-first and fail-closed.
+///
+/// The keychain entry is removed BEFORE the SQLite row so a failed delete can
+/// abort (row untouched) and never leave an orphaned password that a later
+/// save of the same id could reuse.
+pub fn do_delete_profile(id: &str, state: &AppState) -> Result<bool, CommandError> {
+    match state.store()?.get(id)? {
+        Some(_) => {}
+        None => return Ok(false),
+    }
+    state
+        .keychain()?
+        .delete(id)
+        .map_err(|_| CommandError::PasswordRemoveFailed)?;
+    state.store()?.delete(id)?;
+    Ok(true)
+}
+
 /// Delete a profile and its keychain password.
 #[tauri::command]
 pub fn delete_profile(id: String, state: State<'_, AppState>) -> Result<bool, CommandError> {
-    let removed = state.store()?.delete(&id)?;
-    if removed {
-        state.keychain()?.delete(&id)?;
-    }
-    Ok(removed)
+    do_delete_profile(&id, &state)
 }
 
 /// Return whether a password is stored for a profile, without returning it.
@@ -404,5 +427,84 @@ mod tests {
         // "No such entry" is success, matching the OS keychain's NoEntry -> Ok.
         store.delete("never-saved").unwrap();
         assert!(!store.contains("never-saved"));
+    }
+
+    // --- delete_profile: keychain-first, fail-closed ---
+
+    #[test]
+    fn delete_profile_with_failing_keychain_delete_aborts_and_keeps_the_row_and_password() {
+        let s = failing_delete_state();
+        do_save_profile(profile(|_| {}), Some("s3cr3t".to_string()), &s).unwrap();
+
+        let err = do_delete_profile("prod", &s).unwrap_err();
+        assert!(
+            matches!(err, CommandError::PasswordRemoveFailed),
+            "got {err:?}"
+        );
+
+        // The SQLite row is untouched.
+        assert!(s.store().unwrap().get("prod").unwrap().is_some());
+        // The password is still present (not orphaned against a deleted row).
+        assert_eq!(saved_password(&s, "prod").unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn delete_profile_removes_the_row_and_password_when_delete_succeeds() {
+        let s = test_state();
+        do_save_profile(profile(|_| {}), Some("s3cr3t".to_string()), &s).unwrap();
+
+        assert!(do_delete_profile("prod", &s).unwrap());
+        assert!(s.store().unwrap().get("prod").unwrap().is_none());
+        assert!(matches!(
+            saved_password(&s, "prod"),
+            Err(CommandError::PasswordMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_profile_of_a_missing_profile_returns_false() {
+        let s = test_state();
+        assert!(!do_delete_profile("nope", &s).unwrap());
+    }
+
+    // --- New profile must clear a leftover keychain entry ---
+
+    #[test]
+    fn new_profile_without_a_password_clears_a_leftover_keychain_entry() {
+        let s = test_state();
+        // Simulate an orphaned password left behind for this id (e.g. from a
+        // previously-deleted profile) — no store row exists yet.
+        s.keychain().unwrap().set("prod", "orphan-pw").unwrap();
+
+        // Saving a NEW profile with no password must clear the leftover entry
+        // so it can never be reused against the new profile.
+        let res = do_save_profile(profile(|_| {}), None, &s).unwrap();
+        assert!(
+            res.warning.is_none(),
+            "no user-facing warning for an orphan"
+        );
+        assert!(matches!(
+            saved_password(&s, "prod"),
+            Err(CommandError::PasswordMissing { .. })
+        ));
+        assert!(s.store().unwrap().get("prod").unwrap().is_some());
+    }
+
+    #[test]
+    fn new_profile_without_a_password_aborts_if_the_leftover_delete_fails() {
+        let s = failing_delete_state();
+        // Leftover entry, and a keychain whose delete always fails.
+        s.keychain().unwrap().set("prod", "orphan-pw").unwrap();
+
+        let err = do_save_profile(profile(|_| {}), None, &s).unwrap_err();
+        assert!(
+            matches!(err, CommandError::PasswordRemoveFailed),
+            "got {err:?}"
+        );
+
+        // The save was aborted: no store row was created.
+        assert!(s.store().unwrap().get("prod").unwrap().is_none());
+        // The leftover password was not silently left paired with a new profile.
+        assert_eq!(saved_password(&s, "prod").unwrap(), "orphan-pw");
     }
 }
