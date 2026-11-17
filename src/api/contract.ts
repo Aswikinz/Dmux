@@ -264,6 +264,9 @@ export interface ReportResult {
   filePath?: string;
   /** The user dismissed the save dialog; nothing was written. */
   cancelled?: boolean;
+  /** The browser demo cannot save files: nothing was written. The desktop app
+   *  opens the system's save dialog instead. */
+  demoOnly?: boolean;
   error?: string;
 }
 

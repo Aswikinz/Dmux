@@ -31,5 +31,6 @@ test('completes the full 7-step flow and exports a report', async ({ page }) => 
   await page.getByRole('main').getByRole('button', { name: 'Report' }).click();
   await expect(page.getByRole('button', { name: /Export PDF/ })).toBeVisible();
   await page.getByRole('button', { name: /Export PDF/ }).click();
-  await expect(page.getByText(/report saved/)).toBeVisible();
+  // The browser demo saves nothing, and says so (the desktop app asks where).
+  await expect(page.getByText(/browser demo, so no PDF file was saved/)).toBeVisible();
 });

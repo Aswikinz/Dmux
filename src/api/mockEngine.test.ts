@@ -123,10 +123,10 @@ describe('mockEngine', () => {
   it('exports PDF and Excel reports', async () => {
     await expect(
       mockEngine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false }),
-    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.pdf' });
+    ).resolves.toEqual({ ok: false, demoOnly: true });
     await expect(
       mockEngine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true }),
-    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.xlsx' });
+    ).resolves.toEqual({ ok: false, demoOnly: true });
   });
 
   it('returns its version string', async () => {
