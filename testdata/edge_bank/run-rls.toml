@@ -1,0 +1,27 @@
+# Dmux run definition for the edge_bank playground.
+#   export EDGE_READER_PASSWORD=edge_reader_only
+#   dmux run testdata/edge_bank/run-rls.toml --out /tmp/edge-results.json
+# The password is never written here; password_env names the variable that holds it.
+level = "full-values"
+# The 3 million row table is only counted, so this run takes seconds, not minutes.
+levels = { "big.ledger_entries" = "counts" }
+# Control totals are named by column name: every column called "balance" gets one.
+control_total = ["balance"]
+
+[old]
+host = "127.0.0.1"
+port = 5433
+db = "edge_bank"
+user = "edge_reader_rls"
+password_env = "EDGE_READER_PASSWORD"
+tls = "disable"
+reason = "local throwaway test server on this machine"
+
+[new]
+host = "127.0.0.1"
+port = 5434
+db = "edge_bank"
+user = "edge_reader_rls"
+password_env = "EDGE_READER_PASSWORD"
+tls = "disable"
+reason = "local throwaway test server on this machine"
