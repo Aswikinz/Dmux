@@ -68,6 +68,7 @@ fn build_profile_from_stored(
         encryption: stored.encryption.clone(),
         tls_fingerprint: stored.tls_fingerprint.clone(),
         plaintext_reason: stored.plaintext_reason.clone(),
+        ca_file: stored.ca_file.clone(),
     };
     let tls = parse_tls_mode(&input)?;
     Ok(build_profile(&input, password, tls))
@@ -825,6 +826,7 @@ mod tests {
                 encryption: "allow-plaintext".to_string(),
                 tls_fingerprint: None,
                 plaintext_reason: Some("mock database has no TLS".to_string()),
+                ca_file: None,
             },
             password.to_string(),
         )
@@ -900,6 +902,7 @@ mod tests {
             encryption: encryption.to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         }
     }
 
@@ -926,6 +929,7 @@ mod tests {
                 encryption: "allow-plaintext".to_string(),
                 tls_fingerprint: None,
                 plaintext_reason: Some("downgrade".to_string()),
+                ca_file: None,
             },
             password: None,
         };
@@ -957,6 +961,7 @@ mod tests {
                 encryption: "verify".to_string(),
                 tls_fingerprint: None,
                 plaintext_reason: None,
+                ca_file: None,
             },
             password: Some(test_secret()),
         };
@@ -990,6 +995,7 @@ mod tests {
                 encryption: "verify".to_string(),
                 tls_fingerprint: None,
                 plaintext_reason: None,
+                ca_file: None,
             },
             password: None,
         };
@@ -1038,6 +1044,7 @@ mod tests {
             encryption: "verify".to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         };
         crate::commands::profiles::do_save_profile(seed.clone(), Some(test_secret()), &state)
             .expect("seed");

@@ -1100,6 +1100,7 @@ mod tests {
                 encryption: "allow-plaintext".into(),
                 tls_fingerprint: None,
                 plaintext_reason: Some("mock database has no TLS".into()),
+                ca_file: None,
             },
             password: Some(p.password.clone()),
         }

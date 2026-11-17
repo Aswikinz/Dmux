@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::consistency::{change_detection_floor, SideChangeDetection};
 use crate::core::compare::{compare, SideOutcome};
 use crate::core::fingerprint::{Fingerprint, Side, Source, TablePlan};
 use crate::core::normalise::{plan_column, ColumnMapping};
@@ -28,15 +29,15 @@ use crate::db::{probe_server, ConnProfile, ReadOnlySession};
 use crate::fingerprint_file::{CapturedTable, FingerprintFile};
 use crate::inventory::DatabaseInventory;
 use crate::mapping::Mapping;
-use crate::plan::{build_table_spec, LiveColumn, LiveTable, SpecInputs};
+use crate::plan::{build_table_spec, unknown_keys, LiveColumn, LiveTable, SpecInputs};
 use crate::results::{fresh_run_id, CheckLevel, Verdict};
 
 use super::structure;
 use super::verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 use super::{
-    apply_replica, checkpoint, counters, definition_hash, epoch, epoch_changed, inventory,
-    live_table, map_table, note_paused, register, replica, replica_outcome, scan_counts,
-    scan_fingerprint, settle, wal, Input, RunConfig, RunError, RunOutcome,
+    apply_replica, checkpoint, counters, definition_hash, epoch, epoch_changed, foreign_tables_set,
+    inventory, live_table, map_table, note_paused, register, replica, replica_outcome, scan_counts,
+    scan_fingerprint, settle, track_counts_on, wal, Input, RunConfig, RunError, RunOutcome,
 };
 
 /// The run warning when a side has no inventory to compare.
@@ -266,6 +267,10 @@ pub async fn compare_file_to_live(
     let live_inv = inventory(&mut s).await;
     checkpoint(config)?;
     let live_inv = live_inv?;
+    // Change-detection availability on the live side (M3): when `track_counts`
+    // is off the counters never move, and foreign tables have no counters.
+    let live_track_counts = track_counts_on(&mut s).await;
+    let live_foreign = foreign_tables_set(&mut s).await?;
     // Structure: the captured inventory against the live one, oriented.
     match file_side {
         Side::Old => file_structure(&mut b, file.inventory.as_deref(), Some(&live_inv), mapping),
@@ -285,6 +290,38 @@ pub async fn compare_file_to_live(
         .iter()
         .map(|t| (t.old_qualified.as_str(), t))
         .collect();
+    // L4: a level, column-option or ignore key that names no table or column on
+    // either side is a configuration error, never a silent no-op.
+    let mut known_tables: BTreeSet<String> = live.clone();
+    let mut known_columns: BTreeSet<String> = BTreeSet::new();
+    for sc in &live_inv.schemas {
+        for t in &sc.tables {
+            for c in &t.columns {
+                known_columns.insert(format!("{}.{}.{}", sc.name, t.name, c.name));
+            }
+        }
+    }
+    for t in &file.tables {
+        known_tables.insert(t.old_qualified.clone());
+        for c in &t.columns {
+            known_columns.insert(format!("{}.{}", t.old_qualified, c));
+        }
+    }
+    let unknown = unknown_keys(
+        &config.levels,
+        &config.column_options,
+        &mapping.ignored,
+        &known_tables,
+        &known_columns,
+        &known_tables,
+        &known_columns,
+    );
+    if !unknown.is_empty() {
+        return Err(RunError::Config(format!(
+            "unknown paths in the run definition or mapping: {}",
+            unknown.join(", ")
+        )));
+    }
     let table_ignores: BTreeMap<&str, &str> = mapping
         .ignored
         .iter()
@@ -299,6 +336,7 @@ pub async fn compare_file_to_live(
     // (old path, captured table, live (schema, table)).
     let mut pairs: Vec<(String, &CapturedTable, (String, String))> = Vec::new();
     let mut targets = BTreeSet::new();
+    let mut mapped: Vec<(String, String)> = Vec::new();
     let old_names: Vec<String> = match file_side {
         Side::Old => captured.keys().map(|k| k.to_string()).collect(),
         Side::New => live.iter().cloned().collect(),
@@ -312,6 +350,7 @@ pub async fn compare_file_to_live(
             b.ignore_table(old_path, reason);
             continue;
         }
+        mapped.push((old_path.clone(), new_path.clone()));
         let (cap, live_name) = match file_side {
             Side::Old => (
                 captured.get(old_path.as_str()).copied(),
@@ -331,6 +370,36 @@ pub async fn compare_file_to_live(
                 Outcome::MissingOnNew,
             )),
         }
+    }
+    // M2: refuse two old tables mapping to one new table (the mapping does not
+    // say which old table the new one is, so neither may PASS against it).
+    let duplicates = crate::mapping::duplicate_table_targets(&mapped);
+    if !duplicates.is_empty() {
+        let mapped_by_old: BTreeMap<&str, &str> = mapped
+            .iter()
+            .map(|(o, n)| (o.as_str(), n.as_str()))
+            .collect();
+        let mut kept = Vec::with_capacity(pairs.len());
+        for (old_path, c, l) in pairs {
+            let dup = mapped_by_old
+                .get(old_path.as_str())
+                .and_then(|np| duplicates.get(*np));
+            if let Some(olds) = dup {
+                b.record(Evidence::new(
+                    &old_path,
+                    c.level,
+                    Outcome::Fault(format!(
+                        "{} old tables ({}) map to new table {}",
+                        if olds.len() == 2 { "two" } else { "multiple" },
+                        olds.join(", "),
+                        mapped_by_old[old_path.as_str()]
+                    )),
+                ));
+            } else {
+                kept.push((old_path, c, l));
+            }
+        }
+        pairs = kept;
     }
     let new_only: Vec<String> = match file_side {
         Side::Old => live
@@ -378,6 +447,20 @@ pub async fn compare_file_to_live(
         .await;
         // A stop during the scans is never recorded as the table's result.
         checkpoint(config)?;
+        // Change detection unavailable on the live side (track_counts off or a
+        // foreign table): floor the table at NEEDS_REVIEW (M3).  The file side
+        // is a frozen capture, so only the live side's counters are in question.
+        let live_cd = SideChangeDetection::of(
+            live_track_counts,
+            live_foreign.contains(&format!("{ls}.{lt}")),
+        );
+        let cd_floor = match file_side {
+            Side::Old => change_detection_floor(SideChangeDetection::Ok, live_cd),
+            Side::New => change_detection_floor(live_cd, SideChangeDetection::Ok),
+        };
+        if let Some((floor, reason)) = cd_floor {
+            e.floors.push((floor, reason));
+        }
         let d = replica_outcome(&r_before, &replica(&mut s, info.version_num).await);
         note_paused(&mut b.results, live_side, &d);
         apply_replica(&mut e, live_side, &d);
@@ -477,6 +560,10 @@ async fn file_live_pair(
             estimated_rows: 0,
         },
     );
+    // M2: two old columns pairing with the same new column is refused.
+    if let Some(dup) = crate::plan::duplicate_column_target(&spec) {
+        return fault(dup.to_string());
+    }
     let mut e = Evidence::new(path, level, Outcome::Fault(String::new()));
     e.dropped = spec.dropped.clone();
     e.added = spec.added.clone();

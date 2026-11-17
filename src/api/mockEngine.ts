@@ -538,6 +538,17 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
           }),
         };
       }
+      // A private-CA bundle only applies to 'verify'; the mock can't read a real
+      // file, so it reports the connection as verified (the field still flows
+      // through the ConnectionProfile shape unchanged).
+      if (profile.caFile) {
+        return {
+          ok: true,
+          info: makeServerInfo({
+            tls: { state: 'encrypted', verified: true },
+          }),
+        };
+      }
       return { ok: true, info: makeServerInfo() };
     },
 

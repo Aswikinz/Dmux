@@ -28,6 +28,8 @@ pub struct StoredProfile {
     pub tls_fingerprint: Option<String>,
     /// Reason recorded when `encryption == "allow-plaintext"`.
     pub plaintext_reason: Option<String>,
+    /// Optional private-CA PEM bundle path used when `encryption == "verify"`.
+    pub ca_file: Option<String>,
 }
 
 /// The profile store: a single SQLite database file.
@@ -50,9 +52,23 @@ impl Store {
                  user              TEXT NOT NULL,
                  encryption        TEXT NOT NULL,
                  tls_fingerprint   TEXT,
-                 plaintext_reason  TEXT
+                 plaintext_reason  TEXT,
+                 ca_file           TEXT
              );",
         )?;
+        // Migration: a profiles table created before `ca_file` existed lacks the
+        // column, and `CREATE TABLE IF NOT EXISTS` does not add it.  Add it in
+        // place so an upgraded install keeps working.
+        let has_ca_file = {
+            let mut stmt = conn.prepare("PRAGMA table_info(profiles)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|name| name == "ca_file")
+        };
+        if !has_ca_file {
+            conn.execute("ALTER TABLE profiles ADD COLUMN ca_file TEXT", [])?;
+        }
         Ok(Self { conn })
     }
 
@@ -60,7 +76,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<StoredProfile>, CommandError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, host, port, database, user, encryption, \
-                        tls_fingerprint, plaintext_reason \
+                        tls_fingerprint, plaintext_reason, ca_file \
                  FROM profiles ORDER BY label, id",
         )?;
         let rows = stmt.query_map([], row_to_profile)?;
@@ -75,7 +91,7 @@ impl Store {
     pub fn get(&self, id: &str) -> Result<Option<StoredProfile>, CommandError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, host, port, database, user, encryption, \
-                    tls_fingerprint, plaintext_reason \
+                    tls_fingerprint, plaintext_reason, ca_file \
              FROM profiles WHERE id = ?1",
         )?;
         let found = stmt.query_row(params![id], row_to_profile).optional()?;
@@ -96,8 +112,8 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO profiles \
-                 (id, label, host, port, database, user, encryption, tls_fingerprint, plaintext_reason) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 (id, label, host, port, database, user, encryption, tls_fingerprint, plaintext_reason, ca_file) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(id) DO UPDATE SET \
                  label = excluded.label, \
                  host = excluded.host, \
@@ -106,7 +122,8 @@ impl Store {
                  user = excluded.user, \
                  encryption = excluded.encryption, \
                  tls_fingerprint = excluded.tls_fingerprint, \
-                 plaintext_reason = excluded.plaintext_reason",
+                 plaintext_reason = excluded.plaintext_reason, \
+                 ca_file = excluded.ca_file",
             params![
                 stored.id,
                 stored.label,
@@ -117,6 +134,7 @@ impl Store {
                 stored.encryption,
                 stored.tls_fingerprint,
                 stored.plaintext_reason,
+                stored.ca_file,
             ],
         )?;
         Ok(stored)
@@ -142,6 +160,7 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredProfile> {
         encryption: row.get(6)?,
         tls_fingerprint: row.get(7)?,
         plaintext_reason: row.get(8)?,
+        ca_file: row.get(9)?,
     })
 }
 
@@ -170,6 +189,7 @@ mod tests {
             encryption: "verify".to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         }
     }
 
@@ -204,6 +224,25 @@ mod tests {
         let got = store.get("fixed").unwrap().unwrap();
         assert_eq!(got.host, "db.example.com");
         assert_eq!(store.list().unwrap().len(), 1, "no duplicate row");
+    }
+
+    #[test]
+    fn round_trips_the_ca_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("profiles.db")).unwrap();
+
+        let mut with_ca = sample("ca");
+        with_ca.ca_file = Some("/etc/bank/ca-bundle.pem".to_string());
+        store.save(&with_ca).unwrap();
+
+        let got = store.get("ca").unwrap().unwrap();
+        assert_eq!(got.ca_file.as_deref(), Some("/etc/bank/ca-bundle.pem"));
+
+        // Clearing it sticks too.
+        let mut cleared = with_ca;
+        cleared.ca_file = None;
+        store.save(&cleared).unwrap();
+        assert_eq!(store.get("ca").unwrap().unwrap().ca_file, None);
     }
 
     #[test]
