@@ -28,7 +28,7 @@
 set -euo pipefail
 # Same hardening as build.sh / prove.sh: no PG* environment may override the URLs.
 unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGHOST PGPORT PGDATABASE PGUSER PGPASSWORD
-export PGOPTIONS="${PGOPTIONS:-} -c client_min_messages=warning"
+export PGOPTIONS="${PGOPTIONS:-} -c client_min_messages=warning -c default_transaction_read_only=on"
 export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 
 BASELINE=""

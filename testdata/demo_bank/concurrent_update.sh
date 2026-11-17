@@ -44,6 +44,12 @@ if ! dmux_guard_url "$NEW_URL"; then
   echo "refusing: concurrent_update.sh only runs against local mock databases" >&2
   exit 1
 fi
+# URL guard is not enough: this script writes, so the database name is fixed too.
+# Any other local database (bank, postgres, a copy) is refused before connecting.
+if [ "${NEW_URL##*/}" != "demo_bank" ]; then
+  echo "refusing: concurrent_update.sh only writes to database demo_bank, not '${NEW_URL##*/}'" >&2
+  exit 1
+fi
 
 NOTE_ID=1500
 

@@ -80,6 +80,18 @@ for u in "$OLD_URL" "$NEW_URL" "$OLD_ADMIN" "$NEW_ADMIN"; do
     exit 1
   fi
 done
+# The URL guard allows any local database, but this script writes: it loads
+# schema.sql + data.sql into OLD_URL, restores and plants into NEW_URL. The
+# database name is fixed, so a URL ending in /bank (or anything else) is refused
+# before the first connection. The admin URLs end in /postgres on purpose: they
+# only run DROP/CREATE DATABASE for the fixed literal $DB.
+for u in "$OLD_URL" "$NEW_URL"; do
+  db="${u##*/}"
+  if [ "$db" != "$DB" ]; then
+    echo "refusing: build.sh only writes to database $DB, not '$db'" >&2
+    exit 1
+  fi
+done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
