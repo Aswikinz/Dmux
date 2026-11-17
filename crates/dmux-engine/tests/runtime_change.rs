@@ -43,9 +43,13 @@ fn mock_password() -> String {
             }
         }
     }
-    // No env URL (e.g. a local manual run): build a "user, password" pair the
-    // same way the mock is provisioned, but as a runtime value, never a literal.
-    format!("t-{}-only", std::process::id())
+    // No env URL (e.g. a local manual run): a runtime-only value with no
+    // compile-time-constant content, so no credential literal exists at all.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:032x}", (std::process::id() as u128) << 96 ^ nanos)
 }
 
 fn profile(port: u16) -> ConnProfile {

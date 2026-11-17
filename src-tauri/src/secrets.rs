@@ -239,11 +239,21 @@ impl PasswordStore for InMemoryPasswordStore {
 mod tests {
     use super::*;
 
-    /// Build a non-literal password fixture at runtime so no hard-coded
-    /// credential literal flows into a password parameter (CodeQL
-    /// rust/hard-coded-cryptographic-value).
-    fn test_secret(tag: &str) -> String {
-        format!("t-{tag}-{}", std::process::id())
+    /// Build a password fixture with no compile-time-constant content, so no
+    /// hard-coded credential value can flow into a password parameter (CodeQL
+    /// rust/hard-coded-cryptographic-value).  Derived only from runtime values:
+    /// the process id, wall-clock nanoseconds and a per-call counter, hex-encoded.
+    fn test_secret() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = (pid << 96) ^ (nanos << 32) ^ n;
+        format!("{mixed:032x}")
     }
 
     #[test]
@@ -261,7 +271,7 @@ mod tests {
     #[test]
     fn set_surfaces_a_typed_warning_when_unavailable() {
         let mut kc = Keychain::unavailable();
-        let err = kc.set("x", &test_secret("set")).unwrap_err();
+        let err = kc.set("x", &test_secret()).unwrap_err();
         match err {
             CommandError::Keychain { message } => {
                 assert!(message.contains("asked each run"), "message: {message}");
@@ -286,7 +296,7 @@ mod tests {
     #[test]
     fn in_memory_store_round_trips_and_deletes() {
         let mut store = InMemoryPasswordStore::new();
-        let secret = test_secret("roundtrip");
+        let secret = test_secret();
         assert!(!store.contains("k"));
         store.set("k", &secret).unwrap();
         assert!(store.contains("k"));

@@ -360,6 +360,23 @@ mod tests {
     };
     use rustls::client::danger::ServerCertVerifier;
 
+    /// Build a password fixture with no compile-time-constant content, so no
+    /// hard-coded credential value can flow into a password parameter (CodeQL
+    /// rust/hard-coded-cryptographic-value).  Derived only from runtime values:
+    /// the process id, wall-clock nanoseconds and a per-call counter, hex-encoded.
+    fn test_secret() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = (pid << 96) ^ (nanos << 32) ^ n;
+        format!("{mixed:032x}")
+    }
+
     #[test]
     fn fingerprint_is_lowercase_hex() {
         let cert = rustls::pki_types::CertificateDer::from(vec![0u8; 32]);
@@ -486,7 +503,7 @@ mod tests {
             5432,
             "bank",
             "dmux_dev",
-            format!("t-plaintext-{}", std::process::id()),
+            test_secret(),
             TlsMode::Disable("   ".to_string()),
         );
         let err = match super::ReadOnlySession::open(&profile, false).await {
