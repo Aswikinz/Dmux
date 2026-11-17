@@ -2,8 +2,8 @@ name: Release
 
 # Decision 14: pushing a v* tag creates a PUBLISHED release (not a draft)
 # with both-platform installers, CLI binaries, SHA-256 checksums and an SBOM.
-# Unsigned until SignPath approval; the release body carries the SmartScreen
-# note. v0.0.1 is the Phase 0 skeleton.
+# Unsigned until code-signing approval; the release body carries the SmartScreen
+# note. Decision 20: every pre-1.0 tag (v0.*) is published as a PRE-RELEASE.
 on:
   push:
     tags: ['v*']
@@ -334,21 +334,30 @@ jobs:
             sha256sum -c SHA256SUMS
           )
 
-      # Decision 14: PUBLISHED, not draft (no --draft). The header states the
-      # Phase 0 skeleton status and the unsigned-installer SmartScreen note;
-      # GitHub's generated notes follow it.
+      # Decision 14: PUBLISHED, not draft (no --draft). Decision 20: any v0.*
+      # tag is a pre-release, so the flag is computed from the tag itself and
+      # cannot drift from the version the guard just checked. The header states
+      # pre-1.0 status and the unsigned-installer SmartScreen note; GitHub's
+      # generated notes follow it.
       - name: Create the published release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="$GITHUB_REF_NAME"
+          extra=()
+          if [[ "$TAG" == v0.* ]]; then
+            extra=(--prerelease)
+            echo "Pre-1.0 tag: publishing as a pre-release"
+          else
+            echo "Tag $TAG is 1.0 or later: publishing as a normal release"
+          fi
           cat > header.md <<'EOF'
-          **Phase 0 skeleton.** This release ships the empty Tauri 2 app and the
-          engine/CLI stubs; the comparison method itself is proven against real
-          Postgres 9.4 to 18 servers in `testdata/phase0/`.
+          **Pre-1.0 release.** Dmux is not yet 1.0: the UI, report formats and
+          comparison details can still change between minor versions. Every
+          pre-1.0 release is published as a GitHub pre-release.
 
-          **Unsigned installers.** Windows SmartScreen will warn until SignPath
-          signing approval lands (PLAN.md section 9). Verify every download
+          **Unsigned installers.** Windows SmartScreen will warn until
+          code-signing approval lands (PLAN.md section 9). Verify every download
           against `SHA256SUMS` before running it.
 
           Attached: Linux deb/rpm/AppImage installers, Windows NSIS/MSI
@@ -356,6 +365,9 @@ jobs:
           Windows CLI binaries, SHA-256 checksums, and CycloneDX SBOMs for the
           Rust workspace and the npm production dependencies.
           EOF
+          # The heredoc sits inside this indented run block, so strip that
+          # indentation: Markdown would otherwise render the header as code.
+          sed -i 's/^ *//' header.md
           gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f tag_name="$TAG" --jq .body > generated.md
           cat header.md generated.md > notes.md
@@ -370,5 +382,5 @@ jobs:
           fi
           printf 'Attaching %d files:\n' "${#assets[@]}"
           printf '  %s\n' "${assets[@]}"
-          gh release create "$TAG" --verify-tag --title "Dmux $TAG" \
-            --notes-file notes.md "${assets[@]}"
+          gh release create "$TAG" --verify-tag "${extra[@]}" \
+            --title "Dmux $TAG" --notes-file notes.md "${assets[@]}"
