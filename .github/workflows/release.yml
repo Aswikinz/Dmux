@@ -289,16 +289,41 @@ jobs:
 
       - name: Generate npm production SBOM (CycloneDX)
         run: |
-          mkdir -p sbom-npm-work
+          # cdxgen writes supporting output BESIDE its -o path, and v0.0.1 left
+          # a subdirectory in artifacts/ that way. Generate into scratch space
+          # and copy ONLY the BOM into artifacts/, so artifacts/ stays flat.
+          mkdir -p sbom-npm-work sbom-npm-out
           cp package.json pnpm-lock.yaml sbom-npm-work/
           npx --yes @cdxgen/cdxgen@13.8.0 -t pnpm --required-only --fail-on-error \
-            --spec-version 1.6 -o artifacts/sbom-npm.json sbom-npm-work
+            --spec-version 1.6 -o sbom-npm-out/sbom-npm.json sbom-npm-work
+          if [ ! -f sbom-npm-out/sbom-npm.json ]; then
+            echo "::error::cdxgen did not write sbom-npm-out/sbom-npm.json"
+            exit 1
+          fi
+          cp sbom-npm-out/sbom-npm.json artifacts/sbom-npm.json
+          # Fail closed if the BOM is not parseable JSON.
+          python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' artifacts/sbom-npm.json
 
       - name: Write and verify SHA-256 checksums
         run: |
-          cd artifacts
-          sha256sum -- * > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          # Diagnostics first: files only may ever be checked here, so any
+          # subdirectory (v0.0.1 hit "assets: Is a directory") is reported.
+          echo "Subdirectories under artifacts/ (diagnostic; none expected):"
+          find artifacts -mindepth 1 -maxdepth 1 -type d -print
+          # Top-level REGULAR files only, excluding SHA256SUMS itself. -print0
+          # / sort -z / xargs -0 keep odd filenames (spaces, leading dashes)
+          # intact; LC_ALL=C makes the ordering stable across runners.
+          mapfile -d '' files < <(find artifacts -mindepth 1 -maxdepth 1 -type f \
+            ! -name SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no files to checksum in artifacts/"
+            exit 1
+          fi
+          (
+            cd artifacts
+            printf '%s\0' "${files[@]}" | xargs -0 sha256sum -- > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
 
       # Decision 14: PUBLISHED, not draft (no --draft). The header states the
       # Phase 0 skeleton status and the unsigned-installer SmartScreen note;
@@ -325,5 +350,16 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f tag_name="$TAG" --jq .body > generated.md
           cat header.md generated.md > notes.md
+          # Attach top-level REGULAR files only (installers, CLI binaries,
+          # SBOMs, SHA256SUMS). A bare artifacts/* glob would hand directories
+          # to gh, which cannot upload them.
+          mapfile -d '' assets < <(find artifacts -mindepth 1 -maxdepth 1 -type f -print0 \
+            | LC_ALL=C sort -z)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no release assets found in artifacts/"
+            exit 1
+          fi
+          printf 'Attaching %d files:\n' "${#assets[@]}"
+          printf '  %s\n' "${assets[@]}"
           gh release create "$TAG" --verify-tag --title "Dmux $TAG" \
-            --notes-file notes.md artifacts/*
+            --notes-file notes.md "${assets[@]}"

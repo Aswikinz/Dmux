@@ -121,8 +121,141 @@ block (T003 §4) against `accounts_perf`; the only deviation is
 `statement_timeout='1800s'` instead of `'300s'`, which is too tight for a 20M-row
 scan (the engine uses the run window). Results: `phase0/RESULTS.md`, T005 section.
 
+## Public schema: `demo_bank` (T015)
+
+`demo_bank/` is the invented banking layout of PLAN.md 8.1: the only schema public
+tests use. Nothing in it comes from a real system or a licensed dictionary
+(decision 11); the table, column and code names are made up, and the data is
+synthetic.
+
+**Shape.** 41 tables, about 118,000 rows in the `small` size (20,000 transactions).
+Everything is Postgres 9.4-compatible — no `IDENTITY`, no generated columns, no
+declarative partitioning — because the old database of the pair is 9.6 and the
+schema is loaded there first.
+
+| Feature | Where |
+|---|---|
+| primary keys, composite keys, a composite foreign key | all tables; `account_holders`, `balances_daily`, `payment_items`; `transactions (account_id, currency_code)` → `accounts` |
+| foreign keys, including a self-reference | `gl_accounts.parent_id` → `gl_accounts` |
+| UNIQUE, CHECK, partial and functional indexes | throughout; `ux_customer_addresses_home`, `ix_customers_name` |
+| a table with **no key** (duplicates legal) | `audit_log` (10,495 rows) |
+| sequences (4) | `seq_branch`, `seq_gl_entry`, `seq_note`, `seq_dispute` |
+| 2 views, 1 materialised view | `v_account_balances`, `v_open_disputes`, `mv_branch_totals` |
+| plpgsql function + trigger | `fn_log_account_change` on `accounts` (writes `audit_log`) |
+| one large object | oid 7654321, referenced by `customer_documents.content_oid` |
+| types | `char(1)` flags, `char(n)`, `varchar(n)`, `numeric(20,4)`, one `money` column (`loans.penalty_charge`), `float8`/`real`, `timestamp(0)`, `timestamptz`, `date`, `bytea`, `json`, `jsonb`, `text[]`, `interval`, `numrange` |
+
+**Determinism.** `data.sql` never calls `random()`, `now()` or `current_date`. Every
+value derives from the row number `g` and `md5(g)`; the large object is created with
+a fixed oid (a generated one would change on every build, because the cluster-wide
+counter is not reset by `DROP DATABASE`); and the trigger takes its timestamp from
+the row's own `updated_at`, never from `now()`. Accented characters are written as
+`chr(<code>)` with codes 160–255 only, so the same pure-ASCII file loads unchanged
+into the LATIN1 old database and the UTF-8 new one. The data set mixes NULLs, empty
+strings and trailing spaces on purpose.
+
+```
+testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434), planted
+testdata/demo_bank/build.sh --no-plant      # identical data on both sides (verify.sh's build)
+testdata/demo_bank/build.sh 5435 5437       # old 9.4 -> new 18, other local ports
+testdata/demo_bank/verify.sh                # --no-plant build: old vs new, per-table digests
+testdata/demo_bank/verify.sh --baseline /tmp/demo_bank.digest   # + same data every run
+testdata/demo_bank/check_key.sh             # planted build: prove expected_diffs.json
+```
+
+`build.sh` drops and recreates the database **`demo_bank`** on the old server
+(LATIN1, C sort order), loads `schema.sql` then `data.sql`, dumps it with
+`pg_dump -Fc`, drops and recreates `demo_bank` on the new server (UTF-8), restores
+with `pg_restore`, and `ANALYZE`s both sides. It then applies `plant.sql` to the
+**new** database only (the PLAN.md 8.2 differences); `--no-plant` skips that step
+and keeps the two sides identical. It prints each server's version, encoding and
+collation, and a table/row summary. It only ever touches the database named
+`demo_bank` (plus the `postgres` maintenance database used to create it) and
+guards all four URLs with `phase0/guard.sh` — it can never reach the `bank`
+databases or anything that is not a local mock.
+
+`verify.sh` computes one digest per table on each side:
+`count(*) | md5(string_agg(row_hash, <empty> ORDER BY row_hash COLLATE "C"))`, where
+`row_hash` is `md5(convert_to(ROW(<normalised columns>)::text, 'UTF8'))`. Ordering is
+by the hash with an explicit `C` collation, so neither the physical row order nor the
+servers' text sort order can change the result; floats and `bytea` are hashed from
+their bytes and `money` is cast to `numeric` (PLAN.md 3.2, decision 4). It asserts
+that old and new agree on every table and that both sides have the same table set.
+With `--baseline FILE` it also compares against an earlier run's digests, which is
+how "two builds produce the same data" is proved; the file is written on first use.
+It exits non-zero on any mismatch. The same digests come out of the 9.4 → 18 pair,
+so the data set is identical across versions too. Run it on a `--no-plant` build:
+the planted build is meant to differ.
+
+Checked: build + verify green on 9.6 → 17 and on 9.4 → 18; two consecutive
+builds gave identical digests; a planted 0.01 `money` change, a NULL → empty-string
+change and a trailing-space change were each reported, while a reversed physical row
+order stayed quiet.
+
+### Answer key (T016)
+
+`expected_diffs.json` is the answer key of PLAN.md section 8.2: one versioned file
+(`version: 1`, `dataset: "demo_bank-small"`) with three lists.
+
+| List | Entries | Meaning |
+|---|---|---|
+| `must_report` | 15 (`m01`–`m15`) | every planted difference, with exact counts, keys, values and types |
+| `must_stay_quiet` | 6 (`q01`–`q06`) | identical data a naive tool would report; `q06` also expects an amber type change |
+| `runtime` | 1 (`r01`) | the one case that cannot be static: a row updated while the check runs |
+
+Every entry has `id`, `plan_ref` (`"8.2 row 1"`…`"8.2 row 13"`; the quiet rows are
+`"8.2 quiet row 1"`…), `object` (`schema.table[.column]`), `kind`, `expected` and
+`level` (`structure`, `counts` or `full_values`). The `expected` values are read
+straight from the planted databases and are exact — they use only invented
+`demo_bank` data, never a real name or a real row (decision 11).
+
+`plant.sql` plants them, in the new database only, after `build.sh`'s copy:
+
+| PLAN.md 8.2 | Planted change |
+|---|---|
+| row 1 | 12 rows deleted from `transactions` (ids listed in `m01`) |
+| row 2 | 3 duplicate rows added to the keyless `audit_log` |
+| row 3 | `accounts.balance` +0.01 on account 4999 (the audit trigger disabled for the one update) |
+| row 4 | one character changed in `transactions.narration` (19997) |
+| row 5 | an empty `transactions.narration` (7) turned into NULL |
+| row 6 | time of day dropped from `transactions.value_timestamp` (20000) |
+| row 7 | `user_roles.granted_by` dropped; `loans.settlement_ref` added |
+| row 8 | table `limits` → `product_limits`; column `fees.fee_name` → `fee_label` |
+| row 9 | `branches.city` widened from `varchar(60)` to `varchar(120)` (same amber class as the plan's 50 → 100) |
+| row 10 | `seq_gl_entry` set back to 7975 (old next value 8001, new 7976) |
+| row 11 | `ix_transactions_posted` dropped; `ck_transactions_fee` dropped and re-added `NOT VALID` |
+| row 12 | large object 7654321 removed (row 1 of `customer_documents` still points at it) |
+| row 13 | runtime only: see below |
+
+The stay-quiet cases: `balances_daily` becomes a declaratively partitioned table on
+the new side (three partitions, same name, same constraint and index names), the
+columns of `holidays` are reordered, and `kyc_checks.result` moves from `char(1)` to
+`varchar(1)`. The LATIN1 → UTF-8 accents, the C vs `en_US.utf8` sort order and the
+9.6 vs 17 float print need no planting: they are the old/new server difference
+itself, and `check_key.sh` proves they are present.
+
+`check_key.sh` is the database half of the answer-key test. It reads
+`expected_diffs.json`, repeats every claim as a read-only query against the two
+databases (guarded URLs, canonical settings block), and also re-runs `verify.sh`'s
+per-table digest for every table, mapping `limits` → `product_limits` and reading the
+partitioned `balances_daily` through its parent. It proves the key is true before the
+engine is graded against it, checks that every key entry is covered by a check, and
+exits non-zero on any mismatch. For `transactions`, `audit_log` and `accounts` it
+also proves that only the planted rows moved.
+
+The runtime case cannot be a static plant. `concurrent_update.sh 60` updates one
+invented `notes` row (note 1500) in the new database in a loop for 60 seconds, one
+committed transaction per update. The engine test harness starts it just after the
+first table's counts are read; the run must end as **changed during check** (amber),
+never PASS. It writes on purpose; it is harness code, guarded to local mocks.
+
+The whole answer-key build is one command:
+
+```
+testdata/demo_bank/build.sh        # build, copy, plant
+testdata/demo_bank/check_key.sh    # 129 checks, exit 0 only when the key is true
+```
+
 ## Still to build (Nina, Phase 1)
 
-- `demo_bank/`: the invented public schema and its generator
-- `build.py`: one command to build both databases at a chosen size
-- `expected_diffs.json`: the answer key (PLAN.md section 8.2)
+- `demo_bank/`: the `full` and `large` sizes (PLAN.md 8.1); `small` exists (T015)
