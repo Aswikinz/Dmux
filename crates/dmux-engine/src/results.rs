@@ -242,6 +242,66 @@ pub struct TableDetail {
     pub plain_words: Vec<String>,
 }
 
+/// The rule one column was compared by, in plain words (no values).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ColumnRule {
+    pub column: String,
+    pub rule: String,
+}
+
+/// A control total for one column with both sides' values (sums, not rows).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ControlTotalFact {
+    pub column: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// The independent spot check for one table.  `state` is `agreed`,
+/// `disagreed` or `not_run`; `note` is a plain-language reason (no values).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SpotFact {
+    pub state: String,
+    pub compared: Option<usize>,
+    pub differing: Option<usize>,
+    pub note: String,
+}
+
+/// Facts about how one table was checked, recorded so the results can explain
+/// a verdict (a PASS included).  Added after results version 3: every field
+/// defaults, and an empty map is not serialised, so older files still load and
+/// keep their digest.  Never carries row values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct TableFacts {
+    /// The key columns the rows were matched by (empty: compared as a counted set).
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    /// Every compared column with its rule.
+    #[serde(default)]
+    pub columns: Vec<ColumnRule>,
+    /// Buckets compared in total (equal, differing, missing and extra).
+    #[serde(default)]
+    pub buckets_total: Option<usize>,
+    #[serde(default)]
+    pub spot: Option<SpotFact>,
+    /// Change detection on the old side: `available`, `track_counts_off` or
+    /// `foreign_table`; `None` when it was not assessed.
+    #[serde(default)]
+    pub change_detection_old: Option<String>,
+    #[serde(default)]
+    pub change_detection_new: Option<String>,
+    /// Whether the change counters moved during this table's scans.
+    #[serde(default)]
+    pub changed_during_scan: Option<bool>,
+    /// Control totals for every summed column, both sides.
+    #[serde(default)]
+    pub control_totals: Vec<ControlTotalFact>,
+}
+
 /// The whole run's results.  This is the stable schema for UI, reports and hooks.
 ///
 /// Fields added in results version 2 carry `#[serde(default)]`, so version-1
@@ -326,6 +386,10 @@ pub struct RunResults {
     /// was a saved fingerprint file (audit M1).
     #[serde(default)]
     pub capture_sha256_new: Option<String>,
+    /// How each table was checked (rules, spot check, change detection, control
+    /// totals), keyed like `tables`.  Not serialised when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub table_facts: BTreeMap<String, TableFacts>,
 }
 
 impl Default for RunResults {
@@ -361,6 +425,7 @@ impl Default for RunResults {
             options_applied: false,
             capture_sha256_old: None,
             capture_sha256_new: None,
+            table_facts: BTreeMap::new(),
         }
     }
 }
@@ -578,6 +643,62 @@ pub fn any_options_applied(results: &RunResults) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn results_without_table_facts_serialise_without_the_key_and_keep_their_digest() {
+        // A results file written before table facts existed must load, and its
+        // self-verifying digest must still match after a round trip.
+        let r = finalise(RunResults::default());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("table_facts"));
+        let back: RunResults = serde_json::from_str(&json).unwrap();
+        assert!(back.table_facts.is_empty());
+        assert_eq!(sha256_of(&back), back.results_sha256);
+    }
+
+    #[test]
+    fn table_facts_round_trip_and_are_covered_by_the_digest() {
+        let mut r = RunResults::default();
+        r.table_facts.insert(
+            "s.t".into(),
+            TableFacts {
+                key_columns: vec!["id".into()],
+                columns: vec![ColumnRule {
+                    column: "id".into(),
+                    rule: "compared as an exact whole number".into(),
+                }],
+                buckets_total: Some(256),
+                spot: Some(SpotFact {
+                    state: "agreed".into(),
+                    compared: Some(200),
+                    differing: Some(0),
+                    note: String::new(),
+                }),
+                change_detection_old: Some("available".into()),
+                change_detection_new: Some("available".into()),
+                changed_during_scan: Some(false),
+                control_totals: vec![ControlTotalFact {
+                    column: "amount".into(),
+                    old: "1.50".into(),
+                    new: "1.50".into(),
+                }],
+            },
+        );
+        let r = finalise(r);
+        let back: RunResults = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(sha256_of(&back), back.results_sha256);
+        // Changing a recorded fact changes the digest.
+        let mut tampered = back.clone();
+        tampered.table_facts.get_mut("s.t").unwrap().buckets_total = Some(1);
+        assert_ne!(sha256_of(&tampered), back.results_sha256);
+    }
+
+    #[test]
+    fn table_facts_fields_all_default_so_a_partial_object_loads() {
+        let f: TableFacts = serde_json::from_str("{}").unwrap();
+        assert_eq!(f, TableFacts::default());
+    }
     use super::*;
     use crate::core::compare::Verdict::*;
 

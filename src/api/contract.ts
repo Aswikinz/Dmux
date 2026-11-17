@@ -87,12 +87,34 @@ export interface SchemaDiffNode {
   children?: SchemaDiffNode[];
 }
 
+/** One aligned line of the side-by-side structure view.  A missing `old`
+ *  leaves a gap on the left (the item exists only in the new database), a
+ *  missing `new` a gap on the right.  Rows come in tree order; `depth` 0 is a
+ *  schema (or extension), 1 a table, view, sequence, function or trigger, 2 a
+ *  column, constraint or index. */
+export interface StructureRow {
+  id: string;
+  depth: number;
+  kind: SchemaDiffNode['kind'];
+  name: string;
+  status: DiffKind | 'same';
+  old?: string;
+  new?: string;
+  /** True for rows that have child rows (schemas, and tables present on both sides). */
+  expandable: boolean;
+}
+
 export interface Inventory {
   schemas: SchemaDiffNode[];
   oldEncoding: string;
   newEncoding: string;
   oldCollation: string;
   newCollation: string;
+  /** Aligned rows for the side-by-side view.  Absent from older backends,
+   *  in which case the view is built from `schemas`. */
+  rows?: StructureRow[];
+  oldServerVersion?: string;
+  newServerVersion?: string;
 }
 
 export type MatchConfidence = 'exact' | 'case' | 'fuzzy';
@@ -211,6 +233,43 @@ export interface ColumnNote {
   note: string;
 }
 
+/** The rule one column was compared by, in plain words (never a value). */
+export interface ColumnRule {
+  column: string;
+  rule: string;
+}
+
+/** A control total with both sides' values (a sum, never a row). */
+export interface ControlTotalFact {
+  column: string;
+  old: string;
+  new: string;
+}
+
+export interface SpotCheckFact {
+  state: 'agreed' | 'disagreed' | 'not_run';
+  compared?: number;
+  differing?: number;
+  note: string;
+}
+
+/** Change detection on one side of one table. */
+export type ChangeDetectionState = 'available' | 'track_counts_off' | 'foreign_table';
+
+/** What the engine recorded about how one table was checked.  Absent for
+ *  structure-only tables, resumed tables and capture-file comparisons. */
+export interface TableFacts {
+  keyColumns: string[];
+  columns: ColumnRule[];
+  bucketsTotal?: number;
+  spot?: SpotCheckFact;
+  changeDetectionOld?: ChangeDetectionState;
+  changeDetectionNew?: ChangeDetectionState;
+  /** Whether the change counters moved while this table was being read. */
+  changedDuringScan?: boolean;
+  controlTotals: ControlTotalFact[];
+}
+
 export interface TableResult {
   tableId: string;
   schemaName: string;
@@ -220,6 +279,39 @@ export interface TableResult {
   checked: boolean;
   drillDown?: DrillDownRow[];
   columnNotes?: ColumnNote[];
+  oldRows?: number;
+  newRows?: number;
+  differingBuckets?: number;
+  missingBuckets?: number;
+  extraBuckets?: number;
+  missingRows?: number;
+  extraRows?: number;
+  changedRows?: number;
+  /** The engine's own reasons for this table's verdict. */
+  reasons?: string[];
+  facts?: TableFacts;
+  /** Columns of this table that were left out, each with its reason. */
+  ignoredColumns?: IgnoreItem[];
+}
+
+/** How one side of the run was connected (from the engine's record). */
+export interface ConnectionFact {
+  /** `verified`, `pinned`, `plaintext`, or empty for a saved capture file. */
+  tls: string;
+  plaintextReason?: string;
+  superuser: boolean;
+  superuserReason?: string;
+  canWrite: boolean;
+  serverVersion: string;
+  serverEncoding: string;
+}
+
+export interface RunFacts {
+  toolVersion: string;
+  mappingHash: string;
+  resultsSha256: string;
+  oldConnection: ConnectionFact;
+  newConnection: ConnectionFact;
 }
 
 export interface CoverageSummary {
@@ -245,6 +337,8 @@ export interface Results {
   optionsRecorded: boolean;
   /** Run-level warnings (can-write, superuser, row-level security, ...). */
   warnings: string[];
+  /** What was checked, run-wide.  Absent in browser-demo fixtures that do not model it. */
+  runFacts?: RunFacts;
 }
 
 export type ReportFormat = 'pdf' | 'excel';

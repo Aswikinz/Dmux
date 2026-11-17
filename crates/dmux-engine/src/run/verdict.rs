@@ -47,7 +47,8 @@ use crate::core::compare::{Comparison, NotPassReason};
 use crate::core::fingerprint::Decimal;
 use crate::results::{
     add_table, any_options_applied, apply_coverage, finalise, from_core, overall_verdict,
-    CheckLevel, ColumnNote, IgnoredItem, RunResults, StructureFinding, TableResult, Verdict,
+    CheckLevel, ColumnNote, IgnoredItem, RunResults, SpotFact, StructureFinding, TableFacts,
+    TableResult, Verdict,
 };
 
 use super::RunOutcome;
@@ -113,6 +114,9 @@ pub struct Evidence {
     pub column_notes: Vec<ColumnNote>,
     /// Minimum verdicts with their reasons.
     pub floors: Vec<(Verdict, String)>,
+    /// How the table was checked (rules, change detection, control totals);
+    /// the spot check, bucket total and change flag are filled in at finish.
+    pub facts: TableFacts,
 }
 
 impl Evidence {
@@ -135,8 +139,53 @@ impl Evidence {
             notes: Vec::new(),
             column_notes: Vec::new(),
             floors: Vec::new(),
+            facts: TableFacts::default(),
         }
     }
+}
+
+/// The facts a finished table's evidence supports: what the run recorded while
+/// scanning plus what the evidence itself says.  `None` for outcomes that
+/// scanned no data (structure only, missing, faults).
+fn facts_of(e: &Evidence) -> Option<TableFacts> {
+    let mut f = e.facts.clone();
+    match &e.outcome {
+        Outcome::Full(c) => {
+            f.buckets_total =
+                Some(c.equal_buckets + c.differing.len() + c.missing.len() + c.extra.len());
+            if e.level == CheckLevel::FullValues {
+                f.spot = Some(match &e.spot {
+                    Spot::Agrees {
+                        compared,
+                        differing,
+                    } => SpotFact {
+                        state: "agreed".into(),
+                        compared: Some(*compared),
+                        differing: Some(*differing),
+                        note: String::new(),
+                    },
+                    Spot::Disagrees(why) => SpotFact {
+                        state: "disagreed".into(),
+                        compared: None,
+                        differing: None,
+                        note: why.clone(),
+                    },
+                    Spot::NotRun(why) => SpotFact {
+                        state: "not_run".into(),
+                        compared: None,
+                        differing: None,
+                        note: why.clone(),
+                    },
+                });
+            }
+        }
+        Outcome::Counts(_) => {}
+        _ => return None,
+    }
+    if f.change_detection_old.is_some() {
+        f.changed_during_scan = Some(e.changed);
+    }
+    Some(f)
 }
 
 fn core_reason(r: &NotPassReason) -> &'static str {
@@ -416,6 +465,9 @@ impl Builder {
         let mut decided: Vec<(TableResult, bool)> = std::mem::take(&mut self.fixed);
         for e in &self.pending {
             decided.push(decide(e));
+            if let Some(f) = facts_of(e) {
+                self.results.table_facts.insert(e.table.clone(), f);
+            }
         }
         for (r, checked) in decided {
             if !checked {
@@ -548,6 +600,73 @@ mod tests {
             b.record(e);
         }
         b.finish()
+    }
+
+    #[test]
+    fn facts_record_spot_buckets_and_change_flag_for_a_scanned_table() {
+        let mut e = ev(full(true));
+        e.facts.change_detection_old = Some("available".into());
+        e.facts.change_detection_new = Some("track_counts_off".into());
+        let out = finish(vec![e]);
+        let f = &out.results.table_facts["s.t"];
+        // Two buckets, both equal.
+        assert_eq!(f.buckets_total, Some(2));
+        let spot = f.spot.as_ref().unwrap();
+        assert_eq!(
+            (spot.state.as_str(), spot.compared, spot.differing),
+            ("agreed", Some(2), Some(0))
+        );
+        assert_eq!(f.changed_during_scan, Some(false));
+        assert_eq!(f.change_detection_new.as_deref(), Some("track_counts_off"));
+    }
+
+    #[test]
+    fn facts_say_when_the_spot_check_did_not_run_or_disagreed_and_when_the_table_moved() {
+        let mut e = ev(full(true));
+        e.spot = Spot::NotRun("the table has no key".into());
+        e.changed = true;
+        e.facts.change_detection_old = Some("available".into());
+        let out = finish(vec![e]);
+        let f = &out.results.table_facts["s.t"];
+        assert_eq!(f.spot.as_ref().unwrap().state, "not_run");
+        assert_eq!(f.spot.as_ref().unwrap().note, "the table has no key");
+        assert_eq!(f.changed_during_scan, Some(true));
+
+        let mut e = ev(full(true));
+        e.spot = Spot::Disagrees("a value differs".into());
+        let out = finish(vec![e]);
+        let spot = out.results.table_facts["s.t"].spot.clone().unwrap();
+        assert_eq!(spot.state, "disagreed");
+        assert_eq!(out.results.verdict, Verdict::ToolFault);
+    }
+
+    #[test]
+    fn counts_tables_have_facts_but_no_spot_check_or_buckets() {
+        let mut e = Evidence::new(
+            "s.c",
+            CheckLevel::CountsAndTotals,
+            Outcome::Counts(CountsComparison {
+                old_rows: 3,
+                new_rows: 3,
+                old_totals: vec![],
+                new_totals: vec![],
+            }),
+        );
+        e.facts.change_detection_old = Some("available".into());
+        let out = finish(vec![e]);
+        let f = &out.results.table_facts["s.c"];
+        assert!(f.spot.is_none() && f.buckets_total.is_none());
+        assert_eq!(f.changed_during_scan, Some(false));
+    }
+
+    #[test]
+    fn structure_faults_and_missing_tables_have_no_facts() {
+        let out = finish(vec![
+            Evidence::new("s.a", CheckLevel::Structure, Outcome::Structure(vec![])),
+            Evidence::new("s.b", CheckLevel::FullValues, Outcome::MissingOnNew),
+            Evidence::new("s.c", CheckLevel::FullValues, Outcome::Fault("x".into())),
+        ]);
+        assert!(out.results.table_facts.is_empty());
     }
 
     #[test]

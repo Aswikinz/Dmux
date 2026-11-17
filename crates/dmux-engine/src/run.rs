@@ -1151,6 +1151,8 @@ async fn run_live(
             &mut b.results,
         )
         .await?;
+        e.facts.change_detection_old = Some(change_detection_word(old_cd));
+        e.facts.change_detection_new = Some(change_detection_word(new_cd));
         // A stop during the last query (which the server cancelled) must
         // never be recorded or stored as this table's result.
         checkpoint(config)?;
@@ -1296,6 +1298,13 @@ async fn scan_pair(
             e.ignored_columns = spec.ignored_columns.clone();
             e.columns_covered = Some(spec.columns_covered());
             e.column_notes = notes.clone();
+            e.facts.key_columns = spec
+                .key
+                .iter()
+                .filter_map(|i| spec.columns.get(*i))
+                .map(|c| c.old_name.clone())
+                .collect();
+            e.facts.columns = spec.columns.iter().map(column_rule_fact).collect();
             e
         })
     };
@@ -1344,6 +1353,7 @@ async fn scan_pair(
             match (o, n) {
                 (Ok((orows, ototals)), Ok((nrows, ntotals))) => {
                     export_control_totals(results, &p.path, &control_names, &ototals, &ntotals);
+                    let facts = control_facts(&control_names, &ototals, &ntotals);
                     with_coverage(Ok(Evidence::new(
                         &p.path,
                         p.level,
@@ -1354,6 +1364,10 @@ async fn scan_pair(
                             new_totals: ntotals,
                         }),
                     )))
+                    .map(|mut e| {
+                        e.facts.control_totals = facts;
+                        e
+                    })
                 }
                 (Err(e), _) | (_, Err(e)) => {
                     with_coverage(fault(format!("count scan failed: {e}")))
@@ -1403,6 +1417,8 @@ async fn scan_pair(
                 p.level,
                 Outcome::Full(comparison.clone()),
             )))?;
+            e.facts.control_totals =
+                control_facts(&control_names, &ofp.control_totals, &nfp.control_totals);
             drill(
                 config,
                 old_s,
@@ -1424,6 +1440,90 @@ async fn scan_pair(
             };
             Ok(e)
         }
+    }
+}
+
+fn change_detection_word(c: crate::consistency::SideChangeDetection) -> String {
+    use crate::consistency::SideChangeDetection as S;
+    match c {
+        S::Ok => "available",
+        S::TrackCountsOff => "track_counts_off",
+        S::ForeignTable => "foreign_table",
+    }
+    .to_string()
+}
+
+/// Every summed column with both sides' totals (sums, never row values).
+fn control_facts(
+    names: &[String],
+    old: &[crate::core::fingerprint::Decimal],
+    new: &[crate::core::fingerprint::Decimal],
+) -> Vec<crate::results::ControlTotalFact> {
+    names
+        .iter()
+        .zip(old.iter().zip(new.iter()))
+        .map(|(c, (o, n))| crate::results::ControlTotalFact {
+            column: c.clone(),
+            old: o.to_string(),
+            new: n.to_string(),
+        })
+        .collect()
+}
+
+/// One column's comparison rule in plain words, from its types and ticked options.
+pub(crate) fn column_rule_text(m: &crate::core::normalise::ColumnMapping) -> String {
+    use crate::core::normalise::PgType as T;
+    let (o, n) = (m.old_type.base(), m.new_type.base());
+    let mut rule = match (o, n) {
+        (T::Float4, T::Float8) | (T::Float8, T::Float4) => {
+            "compared by its exact 8-byte binary form (the 4-byte side is widened)".to_string()
+        }
+        (T::Float4, _) | (_, T::Float4) => "compared by its exact 4-byte binary form".to_string(),
+        (T::Float8, _) | (_, T::Float8) => "compared by its exact 8-byte binary form".to_string(),
+        (T::Geometric(_), _) => "compared by its exact binary form".to_string(),
+        (T::Bytea, _) => "compared by a fingerprint of its raw bytes".to_string(),
+        (T::Numeric(Some(a)), T::Numeric(Some(b))) if a.1 != b.1 => {
+            "compared as an exact decimal, both sides cast to the larger number of decimals"
+                .to_string()
+        }
+        (T::Numeric(_) | T::Money, _) => {
+            "compared as an exact decimal, digit for digit".to_string()
+        }
+        (T::Int2 | T::Int4 | T::Int8, _) => "compared as an exact whole number".to_string(),
+        (T::Date | T::Timestamp | T::Timestamptz | T::Time | T::Timetz | T::Interval, _) => {
+            "compared as an exact date or time value".to_string()
+        }
+        (T::Json | T::Jsonb, _) => {
+            "compared as normalised JSON (key order does not matter)".to_string()
+        }
+        (T::Array(_), _) => "compared element by element".to_string(),
+        (T::Range { .. } | T::Composite { .. } | T::Unknown(_) | T::Xml, _) => {
+            "compared by its printed form, which is not provably exact: needs review".to_string()
+        }
+        _ => "compared exactly as text".to_string(),
+    };
+    let opts = &m.options;
+    if let Some(d) = opts.round_decimals {
+        rule.push_str(&format!(
+            "; rounded to {d} decimals because you ticked that option"
+        ));
+    }
+    if opts.ignore_trailing_spaces {
+        rule.push_str("; trailing spaces ignored because you ticked that option");
+    }
+    if opts.null_equals_empty {
+        rule.push_str("; an empty value counts as NULL because you ticked that option");
+    }
+    if opts.date_only {
+        rule.push_str("; only the date part compared because you ticked that option");
+    }
+    rule
+}
+
+fn column_rule_fact(m: &crate::core::normalise::ColumnMapping) -> crate::results::ColumnRule {
+    crate::results::ColumnRule {
+        column: m.old_name.clone(),
+        rule: column_rule_text(m),
     }
 }
 
@@ -1604,6 +1704,90 @@ async fn spot_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapping(
+        old: crate::core::normalise::PgType,
+        new: crate::core::normalise::PgType,
+    ) -> crate::core::normalise::ColumnMapping {
+        crate::core::normalise::ColumnMapping {
+            old_name: "c".into(),
+            new_name: "c".into(),
+            old_type: old,
+            new_type: new,
+            options: Default::default(),
+            control_total: false,
+        }
+    }
+
+    #[test]
+    fn column_rules_are_plain_words_per_type() {
+        use crate::core::normalise::PgType as T;
+        let rule = |o: T, n: T| column_rule_text(&mapping(o, n));
+        assert_eq!(rule(T::Text, T::Text), "compared exactly as text");
+        assert_eq!(rule(T::Int4, T::Int8), "compared as an exact whole number");
+        assert_eq!(
+            rule(T::Float8, T::Float8),
+            "compared by its exact 8-byte binary form"
+        );
+        assert_eq!(
+            rule(T::Float4, T::Float4),
+            "compared by its exact 4-byte binary form"
+        );
+        assert!(rule(T::Float4, T::Float8).contains("widened"));
+        assert_eq!(
+            rule(T::Bytea, T::Bytea),
+            "compared by a fingerprint of its raw bytes"
+        );
+        assert!(
+            rule(T::Numeric(Some((18, 2))), T::Numeric(Some((18, 2)))).contains("exact decimal")
+        );
+        assert!(rule(T::Numeric(Some((18, 2))), T::Numeric(Some((19, 4))))
+            .contains("larger number of decimals"));
+        assert!(rule(T::Timestamp, T::Timestamptz).contains("date or time"));
+        assert!(rule(T::Jsonb, T::Jsonb).contains("normalised JSON"));
+        assert!(
+            rule(T::Unknown("ltree".into()), T::Unknown("ltree".into())).contains("needs review")
+        );
+    }
+
+    #[test]
+    fn ticked_options_appear_in_the_rule_with_their_reason() {
+        use crate::core::normalise::PgType as T;
+        let mut m = mapping(T::Numeric(Some((12, 4))), T::Numeric(Some((12, 4))));
+        m.options.round_decimals = Some(2);
+        m.options.ignore_trailing_spaces = true;
+        m.options.null_equals_empty = true;
+        m.options.date_only = true;
+        let r = column_rule_text(&m);
+        assert!(
+            r.contains("rounded to 2 decimals because you ticked that option"),
+            "{r}"
+        );
+        assert!(r.contains("trailing spaces ignored"), "{r}");
+        assert!(r.contains("empty value counts as NULL"), "{r}");
+        assert!(r.contains("only the date part"), "{r}");
+    }
+
+    #[test]
+    fn change_detection_words_are_stable() {
+        use crate::consistency::SideChangeDetection as S;
+        assert_eq!(change_detection_word(S::Ok), "available");
+        assert_eq!(change_detection_word(S::TrackCountsOff), "track_counts_off");
+        assert_eq!(change_detection_word(S::ForeignTable), "foreign_table");
+    }
+
+    #[test]
+    fn control_facts_keep_both_sides_even_when_equal() {
+        use crate::core::fingerprint::Decimal;
+        let f = control_facts(
+            &["amount".into()],
+            &[Decimal::parse("1.50").unwrap()],
+            &[Decimal::parse("1.5").unwrap()],
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].column, "amount");
+        assert_eq!(f[0].old, "1.50");
+    }
 
     /// Test-only connections.  Nothing here ships: the password is built at run
     /// time (from `DMUX_TEST_OLD_URL` when set), never written in the source.

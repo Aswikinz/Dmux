@@ -17,6 +17,8 @@ import type { Engine } from './engine';
 import type {
   CheckLevel,
   CheckPlan,
+  ChangeDetectionState,
+  ConnectionFact,
   ConnectionProfile,
   ConnectionTestResult,
   CoverageSummary,
@@ -35,8 +37,10 @@ import type {
   SaveProfileResult,
   SchemaDiffNode,
   ServerInfo,
+  StructureRow,
   SuperuserOverride,
   TableCheck,
+  TableFacts,
   TableProgress,
   TableResult,
   TableRunState,
@@ -121,6 +125,21 @@ interface RawSchemaDiff {
   old_collation: string;
   new_collation: string;
   entries: RawSchemaDiffEntry[];
+  /** Aligned side-by-side rows (absent from an older backend). */
+  rows?: RawStructureRow[];
+  old_server_version?: string;
+  new_server_version?: string;
+}
+
+interface RawStructureRow {
+  id: string;
+  depth: number;
+  kind: string;
+  name: string;
+  status: string;
+  old: string | null;
+  new: string | null;
+  expandable: boolean;
 }
 
 /** Engine `mapping::Mapping` rule kinds. */
@@ -302,6 +321,38 @@ interface RawTableResult {
   checked: boolean;
   drill_down: RawDrillDownRow[] | null;
   column_notes: RawColumnNote[];
+  old_rows?: number | null;
+  new_rows?: number | null;
+  differing_buckets?: number | null;
+  missing_buckets?: number | null;
+  extra_buckets?: number | null;
+  missing_rows?: number | null;
+  extra_rows?: number | null;
+  changed_rows?: number | null;
+  reasons?: string[];
+  facts?: RawTableFacts | null;
+  ignored_columns?: RawIgnored[];
+}
+
+interface RawTableFacts {
+  key_columns?: string[];
+  columns?: { column: string; rule: string }[];
+  buckets_total?: number | null;
+  spot?: { state: string; compared?: number | null; differing?: number | null; note: string } | null;
+  change_detection_old?: string | null;
+  change_detection_new?: string | null;
+  changed_during_scan?: boolean | null;
+  control_totals?: { column: string; old: string; new: string }[];
+}
+
+interface RawConnectionInfo {
+  tls: string;
+  plaintext_reason?: string | null;
+  superuser: boolean;
+  superuser_reason?: string | null;
+  can_write: boolean;
+  server_version: string;
+  server_encoding: string;
 }
 
 interface RawIgnored {
@@ -328,6 +379,10 @@ interface RawResults {
   options_applied: boolean;
   options_recorded: boolean;
   warnings: string[];
+  tool_version?: string;
+  mapping_hash?: string;
+  results_sha256?: string;
+  connections?: { old: RawConnectionInfo; new: RawConnectionInfo };
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +487,22 @@ function translateDiff(entries: RawSchemaDiffEntry[]): SchemaDiffNode[] {
     out.push(node);
   }
   return out;
+}
+
+const STRUCTURE_STATUSES = new Set(['same', 'missing', 'added', 'changed']);
+
+/** One aligned row.  An unknown status is shown as changed, never as same. */
+export function translateStructureRow(r: RawStructureRow): StructureRow {
+  return {
+    id: r.id,
+    depth: r.depth,
+    kind: r.kind as StructureRow['kind'],
+    name: r.name,
+    status: (STRUCTURE_STATUSES.has(r.status) ? r.status : 'changed') as StructureRow['status'],
+    old: r.old ?? undefined,
+    new: r.new ?? undefined,
+    expandable: r.expandable,
+  };
 }
 
 /** Convert an engine mapping status to the contract `MatchConfidence`. */
@@ -756,6 +827,48 @@ function translateProgress(raw: RawRunProgress): RunProgress {
   };
 }
 
+const CHANGE_STATES = new Set(['available', 'track_counts_off', 'foreign_table']);
+
+/** An unknown change-detection word is treated as unavailable, never as fine. */
+function mapChangeState(s: string | null | undefined): ChangeDetectionState | undefined {
+  if (s == null) return undefined;
+  return CHANGE_STATES.has(s) ? (s as ChangeDetectionState) : 'track_counts_off';
+}
+
+function translateFacts(f: RawTableFacts): TableFacts {
+  const spotState = f.spot?.state;
+  return {
+    keyColumns: f.key_columns ?? [],
+    columns: f.columns ?? [],
+    bucketsTotal: f.buckets_total ?? undefined,
+    // An unrecognised spot state is shown as "disagreed": never a quiet agree.
+    spot: f.spot
+      ? {
+          state: spotState === 'agreed' || spotState === 'not_run' ? spotState : 'disagreed',
+          compared: f.spot.compared ?? undefined,
+          differing: f.spot.differing ?? undefined,
+          note: f.spot.note,
+        }
+      : undefined,
+    changeDetectionOld: mapChangeState(f.change_detection_old),
+    changeDetectionNew: mapChangeState(f.change_detection_new),
+    changedDuringScan: f.changed_during_scan ?? undefined,
+    controlTotals: f.control_totals ?? [],
+  };
+}
+
+function translateConnection(c: RawConnectionInfo): ConnectionFact {
+  return {
+    tls: c.tls,
+    plaintextReason: c.plaintext_reason ?? undefined,
+    superuser: c.superuser,
+    superuserReason: c.superuser_reason ?? undefined,
+    canWrite: c.can_write,
+    serverVersion: c.server_version,
+    serverEncoding: c.server_encoding,
+  };
+}
+
 function translateResults(raw: RawResults): Results {
   const coverage: CoverageSummary = {
     totalTables: raw.coverage.total_tables,
@@ -799,6 +912,17 @@ function translateResults(raw: RawResults): Results {
       kind: n.kind,
       note: n.note,
     })),
+    oldRows: t.old_rows ?? undefined,
+    newRows: t.new_rows ?? undefined,
+    differingBuckets: t.differing_buckets ?? undefined,
+    missingBuckets: t.missing_buckets ?? undefined,
+    extraBuckets: t.extra_buckets ?? undefined,
+    missingRows: t.missing_rows ?? undefined,
+    extraRows: t.extra_rows ?? undefined,
+    changedRows: t.changed_rows ?? undefined,
+    reasons: t.reasons ?? [],
+    facts: t.facts ? translateFacts(t.facts) : undefined,
+    ignoredColumns: (t.ignored_columns ?? []).map((i) => ({ id: i.id, name: i.name, reason: i.reason })),
   }));
 
   return {
@@ -813,6 +937,15 @@ function translateResults(raw: RawResults): Results {
     // "options not recorded" rather than assume none (never a bare PASS).
     optionsRecorded: raw.options_recorded ?? false,
     warnings: raw.warnings ?? [],
+    runFacts: raw.connections
+      ? {
+          toolVersion: raw.tool_version ?? '',
+          mappingHash: raw.mapping_hash ?? '',
+          resultsSha256: raw.results_sha256 ?? '',
+          oldConnection: translateConnection(raw.connections.old),
+          newConnection: translateConnection(raw.connections.new),
+        }
+      : undefined,
   };
 }
 
@@ -918,6 +1051,9 @@ export function createTauriEngine(): Engine {
         newEncoding: diff.new_encoding,
         oldCollation: diff.old_collation,
         newCollation: diff.new_collation,
+        rows: diff.rows?.map(translateStructureRow),
+        oldServerVersion: diff.old_server_version,
+        newServerVersion: diff.new_server_version,
       };
     },
 

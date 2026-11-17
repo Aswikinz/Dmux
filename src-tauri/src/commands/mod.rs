@@ -14,3 +14,4 @@ pub mod data;
 pub mod gateway;
 pub mod profiles;
 pub mod report;
+pub mod structure_view;

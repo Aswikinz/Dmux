@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
-import { DiffTree } from '../components/DiffTree';
+import { StructureCompareView } from '../components/StructureCompareView';
+import { rowsFromNodes } from '../components/structureRows';
 import { ErrorCard } from '../design/ErrorCard';
 import { Switch } from '../components/Switch';
 import { Info } from 'lucide-react';
@@ -19,6 +20,11 @@ interface CompareStructureScreenProps {
   onBack: () => void;
 }
 
+/** "Label · PostgreSQL 9.6 · LATIN1", leaving out what is not known. */
+function sideDetail(label: string, version: string | undefined, encoding: string): string {
+  return [label, version ? `PostgreSQL ${version}` : '', encoding].filter(Boolean).join(' · ');
+}
+
 export function CompareStructureScreen({
   engine,
   oldProfile,
@@ -31,6 +37,11 @@ export function CompareStructureScreen({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showOnlyProblems, setShowOnlyProblems] = useState(false);
+  // Older backends send only the tree of differences; the view reads either.
+  const rows = useMemo(
+    () => inventory?.rows ?? (inventory ? rowsFromNodes(inventory.schemas) : []),
+    [inventory],
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -116,7 +127,18 @@ export function CompareStructureScreen({
                 </p>
               </div>
             )}
-            <DiffTree nodes={inventory.schemas} showOnlyProblems={showOnlyProblems} />
+            <StructureCompareView
+              rows={rows}
+              showOnlyProblems={showOnlyProblems}
+              old={{
+                title: 'Old database',
+                detail: sideDetail(oldProfile.label, inventory.oldServerVersion, inventory.oldEncoding),
+              }}
+              new={{
+                title: 'New database',
+                detail: sideDetail(newProfile.label, inventory.newServerVersion, inventory.newEncoding),
+              }}
+            />
           </Panel>
           <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
