@@ -7,6 +7,9 @@ pub mod inventory;
 pub mod mapping;
 pub mod schema_diff;
 
+pub mod core;
+pub mod ident;
+
 /// The engine version, taken from the crate manifest at compile time.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
