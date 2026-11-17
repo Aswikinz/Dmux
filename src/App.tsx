@@ -45,7 +45,7 @@ const stepLabels: { id: Step; label: string }[] = [
 
 // The engine is resolved per runtime (see src/api/engineSelection.ts): the real
 // Tauri backend inside the desktop app for the structure half (the data half
-// still mocks until T022), the deterministic mock in the browser / Vitest /
+// is stubbed until T022), the deterministic mock in the browser / Vitest /
 // Playwright, and a forced fixture for UI tests.
 
 function AppShell() {

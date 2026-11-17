@@ -4,8 +4,9 @@
 -- taken from any real system or licensed dictionary (decision 11). Do not add
 -- real vendor names, real dictionary file names or real data to this file.
 --
--- Scope: the "small" size of demo_bank. It exists so the engine, the answer key
--- and the UI have a realistic shape to work on:
+-- Scope: the public `demo_bank` schema for every size of PLAN.md 8.1 (T015
+-- built it; T031 added the `large` size in data.sql). It exists so the engine,
+-- the answer key and the UI have a realistic shape to work on:
 --   * primary keys, composite keys, foreign keys (including a composite FK),
 --     UNIQUE, CHECK, partial and functional indexes;
 --   * a table with no key at all (audit_log, duplicates allowed);
@@ -301,7 +302,8 @@ CREATE TABLE demo_bank.transaction_types (
   CONSTRAINT ck_transaction_types_affects CHECK (affects_balance IN ('Y', 'N'))
 );
 
--- The large history table of the small size: 20,000 rows.
+-- The large history table: 20,000 rows in the small size, 20,000,000 in the
+-- large one (data.sql scales it with the transaction multiplier).
 CREATE TABLE demo_bank.transactions (
   transaction_id     bigint        NOT NULL,
   account_id         bigint        NOT NULL,

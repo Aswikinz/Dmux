@@ -1,20 +1,23 @@
 import { browser, $, expect } from '@wdio/globals';
 
-// The one smoke test: the real built app opens and shows the guided flow.
-// Linux drives WebKitGTK through WebKitWebDriver under Xvfb; Windows drives
-// WebView2 through an auto-managed msedgedriver.
+// The one smoke test: the real built app opens and shows the shipped shell.
+// It checks rendered content, not just that a window appeared, so a broken
+// bundle or a missing embedded asset fails CI. Linux drives WebKitGTK through
+// WebKitWebDriver under Xvfb; Windows drives WebView2 through an auto-managed
+// msedgedriver.
 describe('Dmux smoke test', () => {
-  it('opens the window and shows the Connect screen', async () => {
+  it('shows the app shell and the Connect screen in the Dmux window', async () => {
     await expect(browser).toHaveTitle('Dmux');
 
-    // Stable shell strings (post-T020): the sidebar brand and the first
-    // screen's heading, both present on launch before any connection.
-    const brand = await $('aside .text-xl');
-    await expect(brand).toBeDisplayed();
-    await expect(brand).toHaveText('Dmux');
+    const main = await $('main');
+    await expect(main).toBeDisplayed();
 
-    const heading = await $('h2');
+    const heading = await $('//main//h2[normalize-space(.)="Connect"]');
     await expect(heading).toBeDisplayed();
-    await expect(heading).toHaveText('Connect');
+
+    const body = await $('body');
+    // The section label is uppercased by CSS, and WebDriver returns the
+    // rendered (uppercase) text, so match case-insensitively.
+    await expect(body).toHaveText(expect.stringMatching(/old database/i));
   });
 });

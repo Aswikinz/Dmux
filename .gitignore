@@ -24,6 +24,8 @@ coverage/
 .wdio*
 e2e/logs/
 e2e/artifacts/
+
+# Playwright UI test artifacts
 test-results/
 playwright-report/
 

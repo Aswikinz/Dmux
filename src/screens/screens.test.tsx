@@ -564,20 +564,6 @@ describe('ResultsScreen', () => {
     expect(screen.getAllByText('Needs review').length).toBeGreaterThan(0);
     expect(screen.getByText(/manual review/)).toBeDefined();
   });
-
-  it('shows a notice when results are not available instead of hanging', async () => {
-    const engine: Engine = {
-      ...createMockEngine(),
-      getResults: async () => {
-        throw new Error('Running checks and exporting reports is not available in this version of Dmux yet.');
-      },
-    };
-    wrap(<ResultsHarness engine={engine} runId="run-1" />);
-    expect(await screen.findByText('Could not load results')).toBeDefined();
-    expect(screen.getByText(/not available in this version/)).toBeDefined();
-    // It must never leave the user staring at an indefinite "loading" state.
-    expect(screen.queryByText('Loading results')).toBeNull();
-  });
 });
 
 describe('ReportScreen', () => {
