@@ -1,0 +1,27 @@
+[package]
+name = "dmux-report"
+description = "Dmux report generation: PDF summary, Excel detail and run log from a results file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dmux-engine = { path = "../dmux-engine" }
+# PDF summary is generated entirely in Rust (PLAN.md 5): no browser printing.
+# genpdf is pure Rust (printpdf + rusttype), Apache-2.0 OR MIT; it embeds the
+# bundled Liberation fonts (OFL-1.1, permissive — see fonts/OFL-1.1.txt).
+genpdf = "0.2.0"
+# Excel detail via rust_xlsxwriter (MIT OR Apache-2.0), the same library the
+# plan names. Lists longer than 1,048,576 rows overflow to CSV.
+rust_xlsxwriter = "0.102.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+hex = "0.4.3"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+# Read a generated .xlsx back (it is a ZIP) to assert keys/row-values never leak.
+# rust_xlsxwriter itself cannot parse; zip + a string scan is sufficient.
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

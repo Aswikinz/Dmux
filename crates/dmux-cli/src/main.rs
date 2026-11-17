@@ -16,6 +16,7 @@ use dmux_engine::mapping::{from_json as mapping_from_json, Mapping};
 use dmux_engine::results::CheckLevel;
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
+use dmux_report::verify::verify_results_file;
 
 /// PLAN.md 4.8 exit codes.
 const EXIT_PASS: u8 = 0;
@@ -44,6 +45,8 @@ enum Command {
     Compare(CompareArgs),
     /// Run a saved verification definition (TOML or JSON).
     Run(RunArgs),
+    /// Render the PDF summary, Excel detail and run log from a results file.
+    Report(ReportArgs),
 }
 
 /// Shared connection arguments for the commands that talk to a database.
@@ -156,6 +159,26 @@ struct RunArgs {
     out: Option<PathBuf>,
 }
 
+/// Report arguments: render artefacts from a results file (PLAN.md 4.7).
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// The results JSON file written by `compare` / `run` (SHA-256 verified).
+    #[arg(long, value_name = "FILE")]
+    results: PathBuf,
+    /// Write the PDF summary to this path.
+    #[arg(long, value_name = "FILE")]
+    pdf: Option<PathBuf>,
+    /// Write the Excel detail workbook to this path.
+    #[arg(long, value_name = "FILE")]
+    xlsx: Option<PathBuf>,
+    /// Write the run log to this path (`.json` for JSON, text otherwise).
+    #[arg(long, value_name = "FILE")]
+    log: Option<PathBuf>,
+    /// Include key / covered-column names in the detail (default: off).
+    #[arg(long)]
+    include_keys: bool,
+}
+
 /// Parse the `--tls` mode string into a [`TlsMode`].
 fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, String> {
     match tls {
@@ -207,6 +230,7 @@ async fn main() -> ExitCode {
         Command::Capture(args) => run_capture(args).await,
         Command::Compare(args) => run_compare(args).await,
         Command::Run(args) => run_run(args).await,
+        Command::Report(args) => run_report(args),
     }
 }
 
@@ -419,6 +443,52 @@ async fn run_compare(args: CompareArgs) -> ExitCode {
 
     emit_results(args.out.as_deref(), &outcome.results);
     ExitCode::from(outcome.exit_code)
+}
+
+/// Render the report artefacts from a results file, verifying its SHA-256 first
+/// (refuse tampered input — PLAN.md 2.4).
+fn run_report(args: ReportArgs) -> ExitCode {
+    // Verify the results file before rendering anything.
+    let verification = match verify_results_file(&args.results) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+    let results = verification.results;
+    let raw = verification.raw;
+    let sha256 = verification.sha256;
+
+    let options = dmux_report::ReportOptions {
+        include_keys: args.include_keys,
+    };
+
+    if let Some(pdf) = args.pdf.as_deref() {
+        if let Err(e) = dmux_report::pdf::write_summary(&results, &raw, &sha256, &options, pdf) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(xlsx) = args.xlsx.as_deref() {
+        if let Err(e) = dmux_report::xlsx::write_detail(&results, &raw, &sha256, &options, xlsx) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(log) = args.log.as_deref() {
+        if let Err(e) = dmux_report::log::write_run_log(&results, &raw, &options, log) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+
+    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() {
+        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx and/or --log)");
+        return ExitCode::from(EXIT_FAIL);
+    }
+
+    ExitCode::from(EXIT_PASS)
 }
 
 fn emit_results(path: Option<&std::path::Path>, results: &dmux_engine::results::RunResults) {
@@ -651,6 +721,21 @@ mod tests {
             Command::Compare(_)
         ));
         assert!(matches!(parse(&["run", "def.toml"]), Command::Run(_)));
+        assert!(matches!(
+            parse(&[
+                "report",
+                "--results",
+                "r.json",
+                "--pdf",
+                "out.pdf",
+                "--xlsx",
+                "out.xlsx",
+                "--log",
+                "out.txt",
+                "--include-keys"
+            ]),
+            Command::Report(_)
+        ));
     }
 
     #[test]

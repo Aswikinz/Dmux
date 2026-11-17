@@ -57,6 +57,13 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CC0-1.0",
+    # ISC (permissive, OSI-approved): needed by the rustls stack — ring
+    # ("Apache-2.0 AND ISC"), rustls-webpki and untrusted. Compatible with this
+    # repo's Apache-2.0 licence.
+    "ISC",
+    # CDLA-Permissive-2.0 (permissive data licence): the webpki-roots CA bundle
+    # (v0.26.11 and its v1.0.12 successor), which is certificate data, not code.
+    "CDLA-Permissive-2.0",
     "MIT",
     "MIT-0",
     "MPL-2.0",
