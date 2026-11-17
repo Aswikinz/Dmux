@@ -3,7 +3,9 @@
 # The license allow-list below is built from the ACTUAL dependency tree
 # (`cargo deny list`), not guessed. It is permissive-only: OSI-approved
 # permissive licences plus MPL-2.0 (weak, file-level copyleft) and the Unicode
-# data licence. No wildcards. A licence not listed in `allow` is denied by
+# data licence. No wildcard version requirements on registry dependencies
+# (unversioned workspace-internal path deps are the one allowed exception; see
+# [bans]). A licence not listed in `allow` is denied by
 # default, so a new dependency with an unapproved licence is surfaced loudly at
 # review time.
 #
@@ -24,6 +26,15 @@ yanked = "deny"
 unsound = "all"
 unmaintained = "all"
 ignore = [
+    # RUSTSEC-2026-0370/0371/0372 are "unmaintained", NOT vulnerabilities: the zbus
+    # project folded zvariant, zvariant_derive and zbus_names back into zbus
+    # (z-galaxy/zbus#2043); no standalone successor exists yet. They arrive only via
+    # keyring -> secret-service -> zbus (the Linux Secret Service password store).
+    # Revisit when keyring/secret-service move to the merged zbus. Real
+    # vulnerabilities still fail the build.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
     # RUSTSEC-2024-0370 is "unmaintained", NOT a vulnerability: proc-macro-error
     # is a transitive proc-macro helper (via darling/derive_more/ref-cast in the
     # Tauri tree) with no known flaw and no successor. Removing it needs upstream
@@ -39,8 +50,12 @@ ignore = [
 [bans]
 # Duplicate versions are common in a deep Tauri tree; warn, do not fail.
 multiple-versions = "warn"
-# No wildcard version requirements are allowed anywhere.
+# No wildcard version requirements are allowed for registry dependencies.
 wildcards = "deny"
+# Workspace-internal path dependencies (dmux-cli -> dmux-engine) carry no version;
+# they are never published, so a version requirement would be noise. Every
+# workspace member sets `publish = false`; registry deps are still checked.
+allow-wildcard-paths = true
 
 [sources]
 # Everything must come from the crates.io registry. No git or unknown sources.
@@ -57,6 +72,13 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CC0-1.0",
+    # ISC (permissive, OSI-approved): needed by the rustls stack — ring
+    # ("Apache-2.0 AND ISC"), rustls-webpki and untrusted. Compatible with this
+    # repo's Apache-2.0 licence.
+    "ISC",
+    # CDLA-Permissive-2.0 (permissive data licence): the webpki-roots CA bundle
+    # (v0.26.11 and its v1.0.12 successor), which is certificate data, not code.
+    "CDLA-Permissive-2.0",
     "MIT",
     "MIT-0",
     "MPL-2.0",
