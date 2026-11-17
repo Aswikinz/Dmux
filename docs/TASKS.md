@@ -34,6 +34,8 @@ Status: todo, doing, review, done, blocked.
 
 ## Phase 1–7 (speed mode, decision 15)
 
+**T024 state at checkpoint 2:** merge with main done, verify_envelope switched, CLI ConfigError (cleartext-logging) + tokio::fs fixed, e2e green. BLOCKER before merge: genpdf 0.2.0 (unmaintained) pulls lopdf 0.26 with RUSTSEC-2026-0187 (DoS in load_mem; unreachable — we only write PDFs — but real vulnerabilities are never ignored) ⇒ replace genpdf with printpdf ≥0.11 (lopdf ≥0.44) and re-render; also drops 5 unmaintained transitive crates. Then Opus gate. Note: the agent rebuilt demo_bank on 5433/5434 (shared-DB rule breach; Maya verified the answer key still checks).
+
 **Resume checkpoint 2 (2026-11-17, owner offline).** Published: v0.2.0. Main = CLI data comparison + hooks + structure wiring. In flight (resume by session ID; work is on disk in each worktree): T040 data-half wiring + real cancellation (RunControl) + remove production RunConfig::default + run.rs test creds → ses_e186be0e5ffeCBgwRZsTI31Ka7 (Opus) · T024 reports: merge with main in progress (main.rs hunks), switch to dmux_hooks::verify_envelope, CLI cleartext-logging + async file I/O fixes → ses_e1835e60bffeuKbyCc59sVYKha · T041 CodeQL/Sonar fixes (test-credential literals, /tmp report path, assertion-less tests, async process, shell [[ ]], TS smells) → ses_e17cacd58ffeI8Gf6tY607fbYl. After each: Opus gate (T040, T024, T041 security), merge, v0.3.0, then T026 Opus security audit → v1.0.0. Follow-ups owed: nightly runtime_change wiring (Kenji), concurrent_update.sh restore (Nina), DBA guide "pause replay on replicas" (Ella).
 
 **T031 MUST be rebased with `git rebase --onto main 686e8d9` before merging (it branched from the purged tainted board commit; the pre-push hook will refuse it otherwise).**
