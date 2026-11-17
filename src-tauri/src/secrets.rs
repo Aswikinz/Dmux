@@ -145,6 +145,9 @@ pub struct InMemoryPasswordStore {
     /// When set, `delete` returns an OS-style failure (leaving the entry in
     /// place) to exercise the fail-closed path.
     fail_delete: bool,
+    /// When set, `set` returns a "password not saved" error (leaving the entry
+    /// unchanged) to exercise the set-failure warning path.
+    fail_set: bool,
 }
 
 #[cfg(test)]
@@ -153,6 +156,7 @@ impl InMemoryPasswordStore {
         Self {
             entries: HashMap::new(),
             fail_delete: false,
+            fail_set: false,
         }
     }
 
@@ -162,7 +166,25 @@ impl InMemoryPasswordStore {
         Self {
             entries: HashMap::new(),
             fail_delete: true,
+            fail_set: false,
         }
+    }
+
+    /// Return a store whose `set` always fails (simulating a keychain that
+    /// refuses to store, e.g. a keychain-less host).  `delete` still works so a
+    /// stale password is removable.
+    pub fn with_failing_set() -> Self {
+        Self {
+            entries: HashMap::new(),
+            fail_delete: false,
+            fail_set: true,
+        }
+    }
+
+    /// Inject a password directly, bypassing `set` (used to pre-seed a "saved"
+    /// password before a later operation's set fails).
+    pub fn inject(&mut self, key: &str, password: &str) {
+        self.entries.insert(key.to_string(), password.to_string());
     }
 
     /// Whether a password is currently stored for `key`.
@@ -181,6 +203,11 @@ impl Default for InMemoryPasswordStore {
 #[cfg(test)]
 impl PasswordStore for InMemoryPasswordStore {
     fn set(&mut self, key: &str, password: &str) -> Result<(), CommandError> {
+        if self.fail_set {
+            return Err(CommandError::Keychain {
+                message: NOT_SAVED_MESSAGE.to_string(),
+            });
+        }
         self.entries.insert(key.to_string(), password.to_string());
         Ok(())
     }

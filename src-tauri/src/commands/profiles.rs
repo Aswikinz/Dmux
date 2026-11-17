@@ -82,26 +82,21 @@ pub fn do_save_profile(
 
     let mut warning = None;
 
-    // Fail-closed password hygiene: whenever this call will leave the id
-    // WITHOUT a freshly-supplied password, any password that may still exist
-    // for it must be removed BEFORE the profile changes on disk, so a stale
-    // secret can never be reused against new connection details.
-    if password.is_none() {
-        //   - an update that changed connection fields, or
-        //   - a brand-new profile (whose id may still hold a leftover entry
-        //     orphaned by an earlier deletion),
-        // both require clearing any existing entry.
-        let must_clear = !is_update || fields_changed;
-        if must_clear {
-            state
-                .keychain()?
-                .delete(&incoming.id)
-                .map_err(|_| CommandError::PasswordRemoveFailed)?;
-            // Only warn when we dropped a password the user knew about (an
-            // update), not when clearing an unreachable orphan on a new profile.
-            if is_update {
-                warning = Some(PASSWORD_REMOVED_MESSAGE.to_string());
-            }
+    // Fail-closed password hygiene.  Whenever the id is brand new OR any
+    // connection field changed, remove the existing keychain entry FIRST —
+    // regardless of whether a new password is supplied — so a stale secret can
+    // never be re-bound to new details.  Only a label-only change on an
+    // existing id keeps the password untouched.
+    let must_clear = !is_update || fields_changed;
+    if must_clear {
+        state
+            .keychain()?
+            .delete(&incoming.id)
+            .map_err(|_| CommandError::PasswordRemoveFailed)?;
+        // Warn only when we dropped a password the user knew about (an update
+        // with no replacement), not when clearing an unreachable orphan.
+        if is_update && password.is_none() {
+            warning = Some(PASSWORD_REMOVED_MESSAGE.to_string());
         }
     }
 
@@ -393,11 +388,26 @@ mod tests {
             .expect("state")
     }
 
+    /// Build an [`AppState`] with `store` as its password store, an EXISTING
+    /// profile row (host `127.0.0.1`) in SQLite, and `old_pw` already injected
+    /// as the saved password — i.e. a pre-existing profile+password pair, seeded
+    /// directly (bypassing `set`/`delete`) so a failing store can still model
+    /// an already-generated situation.
+    fn seeded_state(store: InMemoryPasswordStore, old_pw: &str) -> AppState {
+        let mut store = store;
+        store.inject("prod", old_pw);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let s = AppState::with_password_store(path, Box::new(store)).expect("state");
+        let seeded = as_stored(&profile(|_| {}));
+        s.store().unwrap().save(&seeded).unwrap();
+        s
+    }
+
     #[test]
     fn failed_password_removal_aborts_the_save_and_leaves_the_profile_unchanged() {
-        let s = failing_delete_state();
-        // Seed an existing profile with a stored password.
-        do_save_profile(profile(|_| {}), Some("s3cr3t".to_string()), &s).unwrap();
+        let s = seeded_state(InMemoryPasswordStore::with_failing_delete(), "s3cr3t");
 
         // Changing the host without a new password must try to delete the old
         // password; when the delete fails, the whole save is aborted.
@@ -433,8 +443,7 @@ mod tests {
 
     #[test]
     fn delete_profile_with_failing_keychain_delete_aborts_and_keeps_the_row_and_password() {
-        let s = failing_delete_state();
-        do_save_profile(profile(|_| {}), Some("s3cr3t".to_string()), &s).unwrap();
+        let s = seeded_state(InMemoryPasswordStore::with_failing_delete(), "s3cr3t");
 
         let err = do_delete_profile("prod", &s).unwrap_err();
         assert!(
@@ -506,5 +515,68 @@ mod tests {
         assert!(s.store().unwrap().get("prod").unwrap().is_none());
         // The leftover password was not silently left paired with a new profile.
         assert_eq!(saved_password(&s, "prod").unwrap(), "orphan-pw");
+    }
+
+    // --- Field change with a new password whose set fails ---
+
+    fn failing_set_state_with_old_password(old_pw: &str) -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let mut store = InMemoryPasswordStore::with_failing_set();
+        store.inject("prod", old_pw);
+        AppState::with_password_store(path, Box::new(store)).expect("state")
+    }
+
+    #[test]
+    fn field_change_with_new_password_leaves_no_entry_when_set_fails() {
+        let s = failing_set_state_with_old_password("old-pw");
+        // Seed an existing profile row with the original connection fields.
+        let seeded = as_stored(&profile(|_| {}));
+        s.store().unwrap().save(&seeded).unwrap();
+
+        // Change the host AND supply a new password whose set will fail.
+        let res = do_save_profile(
+            profile(|p| p.host = "new.example.com".to_string()),
+            Some("new-pw".to_string()),
+            &s,
+        )
+        .unwrap();
+
+        // The profile is saved with the new host.
+        let stored = s.store().unwrap().get("prod").unwrap().unwrap();
+        assert_eq!(stored.host, "new.example.com");
+
+        // No password entry remains: the old one was deleted, the new set
+        // failed, so nothing is re-bound to the changed host.
+        assert!(matches!(
+            saved_password(&s, "prod"),
+            Err(CommandError::PasswordMissing { .. })
+        ));
+
+        // The "password not saved" warning is surfaced.
+        assert!(
+            res.warning
+                .as_deref()
+                .is_some_and(|w| w.contains("asked each run")),
+            "expected a password-not-saved warning, got {:?}",
+            res.warning
+        );
+    }
+
+    #[test]
+    fn label_only_change_with_a_new_password_stores_the_new_password() {
+        let s = test_state();
+        do_save_profile(profile(|_| {}), Some("old-pw".to_string()), &s).unwrap();
+        // A label-only change with a fresh password updates the password without
+        // first deleting it (nothing was re-bound).
+        let res = do_save_profile(
+            profile(|p| p.label = "Renamed".to_string()),
+            Some("new-pw".to_string()),
+            &s,
+        )
+        .unwrap();
+        assert!(res.warning.is_none());
+        assert_eq!(saved_password(&s, "prod").unwrap(), "new-pw");
     }
 }
