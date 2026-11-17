@@ -29,7 +29,6 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
       const res = await engine.exportReport({
         format,
         includeKeys,
-        filePath: '/tmp/dmux-report',
       });
       if (res.ok) {
         setResultMessage(`${format.toUpperCase()} report saved to ${res.filePath}`);

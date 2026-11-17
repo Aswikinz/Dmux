@@ -87,7 +87,7 @@ export function DataTable<T extends object>({
         className="overflow-auto rounded-lg border border-slate-200 dark:border-slate-700"
         style={{ maxHeight: '60vh' }}
         tabIndex={0}
-        role="region"
+        role="grid"
         aria-label="Table results"
       >
         <table className="w-full border-collapse text-sm">

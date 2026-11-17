@@ -213,7 +213,10 @@ export interface ReportRequest {
   format: ReportFormat;
   /** Include row keys in the exported report (off by default). */
   includeKeys: boolean;
-  filePath: string;
+  /** Destination chosen by the user (Tauri dialog, T024/T040). Optional until
+   *  the picker exists: no temp-path default is used, and the engine is free to
+   *  choose a safe, user-triggered location. */
+  filePath?: string;
 }
 
 export interface ReportResult {

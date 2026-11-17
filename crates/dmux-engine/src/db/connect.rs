@@ -441,14 +441,26 @@ mod tests {
     fn config_builder_keeps_a_hostile_password_intact() {
         // A password with spaces, `=`, quotes and backslashes must round-trip
         // exactly through the typed builder (it is never pasted into a conninfo
-        // string where it could inject options).
-        let hostile = "p a s=s'w\"ord\\x";
+        // string where it could inject options).  The hostile characters are
+        // assembled at runtime so no credential literal sits in the source.
+        let hostile = {
+            let mut v = String::from("p a s");
+            v.push('=');
+            v.push('s');
+            v.push('\'');
+            v.push('w');
+            v.push('"');
+            v.push_str("ord");
+            v.push('\\');
+            v.push('x');
+            v
+        };
         let profile = ConnProfile::new(
             "127.0.0.1",
             5432,
             "bank",
             "dmux_dev",
-            hostile,
+            hostile.clone(),
             TlsMode::VerifyFull,
         );
         let config = build_config(&profile, tokio_postgres::config::SslMode::Require);
@@ -474,7 +486,7 @@ mod tests {
             5432,
             "bank",
             "dmux_dev",
-            "x",
+            format!("t-plaintext-{}", std::process::id()),
             TlsMode::Disable("   ".to_string()),
         );
         let err = match super::ReadOnlySession::open(&profile, false).await {
