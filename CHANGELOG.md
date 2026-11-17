@@ -3,7 +3,7 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
-## 1.0.0 (unreleased)
+## 1.0.0 (2026-11-18)
 
 The first stable version. It closes the findings of the security and false-PASS
 audit, so no audit finding still allows a false PASS.
