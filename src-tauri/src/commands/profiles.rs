@@ -98,8 +98,18 @@ pub fn do_save_profile(
     // existing id keeps the password untouched.
     let must_clear = !is_update || fields_changed;
     if must_clear {
-        // The session password belongs to the old fields too.
-        state.session_passwords()?.forget(&incoming.id);
+        // A session password is bound to the exact connection fields it was
+        // typed for.  Keep it only when it was typed for exactly the fields
+        // being saved (a Test connection just before this save); for any other
+        // fields it belongs to old details and is forgotten.  Checked before
+        // the keychain step, so a keychain that refuses the delete (no
+        // keychain on this machine) cannot cost the user that password.
+        {
+            let mut sessions = state.session_passwords()?;
+            if !sessions.contains(&incoming.id, &stored_fields_hash(&incoming)) {
+                sessions.forget(&incoming.id);
+            }
+        }
         state
             .keychain()?
             .delete(&incoming.id)

@@ -1672,4 +1672,39 @@ mod tests {
         assert!(!format!("{err} {err:?}").contains(&old_pw));
         assert!(resolve(&no_password(other), &state).is_err());
     }
+
+    /// The CI no-keychain case: a password typed and proven by Test connection
+    /// is cached for exactly those fields; the automatic save that follows is
+    /// refused because the keychain cannot even delete; Compare structure must
+    /// still find the password.  Changed fields must still never get it.
+    #[test]
+    fn a_refused_save_never_costs_the_tested_session_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::state::AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::unavailable_everywhere()),
+        )
+        .expect("state");
+        let secret = test_secret();
+        let p = ui_profile("old-profile", "db.bank");
+        state.session_passwords().unwrap().put(
+            "old-profile",
+            crate::secrets::input_fields_hash(&p),
+            &secret,
+        );
+        let saved =
+            crate::commands::profiles::do_save_profile(p.clone(), Some(secret.clone()), &state);
+        assert!(
+            matches!(saved, Err(CommandError::PasswordRemoveFailed)),
+            "{saved:?}"
+        );
+        let got = resolve(&no_password(p.clone()), &state).expect("the tested password is kept");
+        assert_eq!(got.password, secret);
+        // A save with different fields forgets it (and still fails closed).
+        let mut moved = p;
+        moved.host = "other.bank".to_string();
+        let _ = crate::commands::profiles::do_save_profile(moved.clone(), None, &state);
+        assert!(state.session_passwords().unwrap().is_empty());
+        assert!(resolve(&no_password(moved), &state).is_err());
+    }
 }

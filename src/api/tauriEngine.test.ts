@@ -1292,3 +1292,20 @@ describe('mapping suggestions, edits and rules', () => {
     );
   });
 });
+
+describe('error text', () => {
+  it('never shows [object Object] and explains the typed backend errors', async () => {
+    const { describeError } = await import('./tauriEngine');
+    expect(describeError({ kind: 'password_missing' })).toContain('no password is stored');
+    expect(describeError({ kind: 'password_remove_failed' })).toContain('keeps the password in memory');
+    expect(describeError({ kind: 'database', message: 'connection refused' })).toBe('connection refused');
+    expect(describeError(new Error('boom'))).toBe('boom');
+    expect(describeError('plain')).toBe('plain');
+    for (const odd of [{}, { foo: 1 }, null, undefined, 42]) {
+      const text = describeError(odd);
+      expect(text).not.toContain('[object Object]');
+      expect(text.length).toBeGreaterThan(0);
+    }
+  });
+});
+

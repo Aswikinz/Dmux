@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -214,7 +215,7 @@ export function ResultsScreen({
         }
       } catch (e) {
         if (mounted) {
-          setError(e instanceof Error ? e.message : String(e));
+          setError(describeError(e));
         }
       }
     }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -66,7 +67,7 @@ export function MapScreen({
         }
       } catch (e) {
         if (mounted) {
-          setError(e instanceof Error ? e.message : String(e));
+          setError(describeError(e));
         }
       } finally {
         if (mounted) {
@@ -101,7 +102,7 @@ export function MapScreen({
     try {
       onMappingChange(await engine.editMapping(mapping, edits));
     } catch (e) {
-      setEditError(e instanceof Error ? e.message : String(e));
+      setEditError(describeError(e));
     } finally {
       setEditBusy(false);
     }

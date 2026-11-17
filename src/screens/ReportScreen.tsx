@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -61,7 +62,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
         setError(res.error ?? 'The report could not be saved.');
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     } finally {
       setExporting(null);
     }

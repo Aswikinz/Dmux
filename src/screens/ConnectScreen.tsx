@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -586,7 +587,7 @@ export function ConnectScreen({
   }
 
   function describeThrown(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+    return describeError(error);
   }
 
   async function saveOld() {

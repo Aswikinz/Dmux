@@ -73,12 +73,12 @@ async function fillProfile(side: 'Old database' | 'New database', port: string):
 async function saveAndTest(side: 'Old database' | 'New database', index: number): Promise<void> {
   await clickProfileButton('Save', index);
   // The keychain variant requires Save to actually store the password, so the
-  // later steps can read it back. A missing "Password saved in keychain" here
+  // later steps can read it back. A missing "Password is in your system keychain" here
   // means the keychain did not start/unlock — the timeoutMsg says so.
   await waitForBodyText(
-    (t) => (t.match(/Password saved in keychain/g) ?? []).length >= index + 1,
+    (t) => (t.match(/Password is in your system keychain/g) ?? []).length >= index + 1,
     20_000,
-    `${side} "Password saved in keychain" (is gnome-keyring unlocked?)`,
+    `${side} "Password is in your system keychain" (is gnome-keyring unlocked?)`,
   );
 
   await clickProfileButton('Test connection', index);

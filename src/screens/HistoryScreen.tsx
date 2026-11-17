@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import { FolderOpen, ScrollText } from 'lucide-react';
 import { Panel } from '../design/Panel';
@@ -34,7 +35,7 @@ function matchesQuery(row: HistoryEntry, q: string): boolean {
 }
 
 function describeThrown(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return describeError(error);
 }
 
 export function HistoryScreen({ engine, onOpenResults }: HistoryScreenProps) {

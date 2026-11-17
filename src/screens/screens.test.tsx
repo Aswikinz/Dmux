@@ -390,6 +390,19 @@ describe('CompareStructureScreen', () => {
     expect(await screen.findByText('Could not compare structure')).toBeDefined();
   });
 
+  it('shows a backend error as plain words, never [object Object]', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      compareStructure: async () => {
+        throw { kind: 'password_missing', reason: 'no_keychain', profile: 'old-profile' };
+      },
+    };
+    wrap(<StructureHarness engine={engine} />);
+    expect(await screen.findByText('Could not compare structure')).toBeDefined();
+    expect(screen.getByText(/no password is stored for this profile/)).toBeDefined();
+    expect(screen.queryByText(/object Object/)).toBeNull();
+  });
+
   it('shows an encoding difference as information, with a plain explanation', async () => {
     const base = createMockEngine();
     const engine: Engine = {

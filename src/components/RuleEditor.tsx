@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Plus, Trash2 } from 'lucide-react';
 import { Button } from '../design/Button';
 import { Input } from '../design/Input';
@@ -57,7 +58,7 @@ export function RuleEditor({ rules, onPreview, onApply }: RuleEditorProps) {
     try {
       await action();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }

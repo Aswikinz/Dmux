@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -48,7 +49,7 @@ export function RunScreen({
         }
       } catch (e) {
         if (mounted) {
-          setError(e instanceof Error ? e.message : String(e));
+          setError(describeError(e));
         }
       }
     }
@@ -87,7 +88,7 @@ export function RunScreen({
         const next = await engine.pollRun(progress.runId);
         onProgressChange(next);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(describeError(e));
       }
     }, 500);
     return () => {
@@ -110,7 +111,7 @@ export function RunScreen({
         setVerdict({ word: r.verdict, label: qualifiedVerdictLabel(r) });
       })
       .catch((e: unknown) => {
-        if (mounted) setVerdictError(e instanceof Error ? e.message : String(e));
+        if (mounted) setVerdictError(describeError(e));
       });
     return () => {
       mounted = false;
@@ -126,7 +127,7 @@ export function RunScreen({
       );
       onProgressChange(next);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     }
   }
 
@@ -137,7 +138,7 @@ export function RunScreen({
       const next = await engine.cancelRun(progress.runId);
       onProgressChange(next);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     } finally {
       setCancelling(false);
     }

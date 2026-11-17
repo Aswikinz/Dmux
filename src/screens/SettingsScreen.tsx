@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -44,7 +45,7 @@ export function SettingsScreen({ engine }: SettingsScreenProps) {
         if (mounted) apply(s);
       })
       .catch((e: unknown) => {
-        if (mounted) setError(e instanceof Error ? e.message : String(e));
+        if (mounted) setError(describeError(e));
       });
     return () => {
       mounted = false;
@@ -358,5 +359,5 @@ function FolderList({ settings }: { settings: AppSettings }) {
 }
 
 function describe(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  return describeError(e);
 }

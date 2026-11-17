@@ -1009,7 +1009,9 @@ function mapDrillKind(kind: string): DrillDownRow['kind'] {
 }
 
 /** Turn a thrown (serde-tagged) backend error into a readable string. */
-function describeError(error: unknown): string {
+/** Plain text for anything a backend call or a screen can throw: a typed
+ *  backend error, an Error, or anything else.  Never "[object Object]". */
+export function describeError(error: unknown): string {
   const e = error as Partial<RawCommandError>;
   if (e && typeof e === 'object' && typeof e.kind === 'string') {
     if (e.kind === 'untrusted_cert' && typeof e.fingerprint === 'string') {
@@ -1024,12 +1026,17 @@ function describeError(error: unknown): string {
     if (e.kind === 'password_missing') {
       return 'no password is stored for this profile; type the password to connect this run';
     }
+    if (e.kind === 'password_remove_failed') {
+      return 'The connection works, but it could not be saved because the system keychain could not be updated. Dmux keeps the password in memory until you close the app.';
+    }
     if (typeof e.message === 'string') {
       return e.message;
     }
     return e.kind;
   }
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'Something went wrong, and Dmux could not describe it.';
 }
 
 // ---------------------------------------------------------------------------

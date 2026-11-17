@@ -336,6 +336,17 @@ impl InMemoryPasswordStore {
         }
     }
 
+    /// No usable keychain at all: storing fails, reading reports no keychain,
+    /// and deleting fails too (as on a machine with no Secret Service).
+    pub fn unavailable_everywhere() -> Self {
+        Self {
+            entries: HashMap::new(),
+            fail_delete: true,
+            fail_set: true,
+            unavailable: true,
+        }
+    }
+
     /// Inject a password directly, bypassing `set` (used to pre-seed a "saved"
     /// password before a later operation's set fails).
     pub fn inject(&mut self, key: &str, password: &str) {
