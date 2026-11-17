@@ -85,9 +85,17 @@ export function ChooseChecksScreen({
       setError(null);
       try {
         const result = await engine.buildCheckPlan(mapping);
+        // The starting level from Settings ('suggested' keeps the engine's own).
+        const start = await engine
+          .getSettings()
+          .then((st) => st.startingLevel)
+          .catch(() => 'suggested' as const);
+        const preset: PresetId =
+          start === 'full-values' ? 'full' : start === 'suggested' ? 'suggested' : start;
         if (mounted) {
-          onPlanChange(result);
-          setSelectedPreset('suggested');
+          suggestedRef.current = Object.fromEntries(result.tables.map((t) => [t.tableId, t.level]));
+          onPlanChange(preset === 'suggested' ? result : applyPreset(result, preset, suggestedRef.current));
+          setSelectedPreset(preset);
         }
       } catch (e) {
         if (mounted) {

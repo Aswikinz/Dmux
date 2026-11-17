@@ -240,6 +240,61 @@ pub fn envelope_sha256(envelope: &serde_json::Value) -> String {
     sha256_hex(canonical.as_bytes())
 }
 
+/// The JSON form of one finding inside an envelope (marked `custom_checks`).
+pub fn finding_json(f: &Finding) -> serde_json::Value {
+    let severity = match f.severity {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Fail => "fail",
+    };
+    let mut v = serde_json::json!({
+        "id": f.id,
+        "severity": severity,
+        "message": f.message,
+        "source": "custom_checks"
+    });
+    if let Some(t) = &f.table {
+        v["table"] = serde_json::Value::String(t.clone());
+    }
+    v
+}
+
+/// Build the self-verifying envelope `{ results, hooks, envelope_sha256 }` that
+/// `dmux run --hooks` writes and `dmux_report::verify` reads.  `scripts` pairs
+/// each script's file name with its result, in run order.
+pub fn build_envelope(
+    results: &serde_json::Value,
+    scripts: &[(String, &HookResult)],
+) -> serde_json::Value {
+    let mut custom_checks: Vec<serde_json::Value> = Vec::new();
+    let mut script_rows: Vec<serde_json::Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for (name, res) in scripts {
+        for w in &res.warnings {
+            warnings.push(format!("{name}: {w}"));
+        }
+        script_rows.push(serde_json::json!({
+            "script": name,
+            "sha256": res.script_hash,
+            "findings": res.findings.iter().map(finding_json).collect::<Vec<_>>(),
+        }));
+        for f in &res.findings {
+            custom_checks.push(finding_json(f));
+        }
+    }
+    let mut envelope = serde_json::json!({
+        "results": results,
+        "hooks": {
+            "custom_checks": custom_checks,
+            "scripts": script_rows,
+            "warnings": warnings,
+        }
+    });
+    let digest = envelope_sha256(&envelope);
+    envelope["envelope_sha256"] = serde_json::Value::String(digest);
+    envelope
+}
+
 /// Verify an envelope's integrity: recompute the digest and compare it to the
 /// stored `envelope_sha256`.  Returns an error string describing the mismatch,
 /// or `Ok(())` when the content is unchanged.
@@ -858,6 +913,31 @@ fn kill_group(child: &mut std::process::Child) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_envelope_is_self_verifying_and_carries_evidence() {
+        let res = HookResult {
+            script_hash: "abc".into(),
+            findings: vec![Finding {
+                id: "f1".into(),
+                severity: Severity::Fail,
+                table: Some("s.t".into()),
+                message: "bad".into(),
+            }],
+            warnings: vec!["slow".into()],
+        };
+        let env = build_envelope(
+            &serde_json::json!({"verdict": "PASS"}),
+            &[("check.py".to_string(), &res)],
+        );
+        assert!(verify_envelope(&env).is_ok());
+        assert_eq!(env["hooks"]["scripts"][0]["sha256"], "abc");
+        assert_eq!(env["hooks"]["custom_checks"][0]["source"], "custom_checks");
+        assert_eq!(env["hooks"]["warnings"][0], "check.py: slow");
+        let mut forged = env.clone();
+        forged["hooks"]["custom_checks"] = serde_json::json!([]);
+        assert!(verify_envelope(&forged).is_err());
+    }
+
     use super::*;
 
     #[test]

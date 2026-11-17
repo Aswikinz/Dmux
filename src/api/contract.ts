@@ -245,6 +245,79 @@ export interface Results {
   optionsRecorded: boolean;
   /** Run-level warnings (can-write, superuser, row-level security, ...). */
   warnings: string[];
+  /** Present only when custom checks ran for this run.  `verdict` above already
+   *  includes any custom failure. */
+  customChecks?: CustomChecks;
+}
+
+export type CustomSeverity = 'info' | 'warning' | 'fail';
+
+export interface CustomFinding {
+  id: string;
+  severity: CustomSeverity;
+  /** Already stripped of control characters by the backend; shown as text. */
+  message: string;
+  table?: string;
+}
+
+/** What the custom checks (the user's Python scripts) reported for a run. */
+export interface CustomChecks {
+  findings: CustomFinding[];
+  /** Each script that ran, with the SHA-256 of the code that ran. */
+  scripts: { name: string; sha256: string }[];
+  /** Scripts that did not run, timed out or returned bad output. */
+  warnings: string[];
+}
+
+/** One script in the chosen custom-checks folder. */
+export interface ScriptEntry {
+  name: string;
+  /** False when Dmux refuses to run it; `reason` says why. */
+  usable: boolean;
+  reason?: string;
+}
+
+export interface FolderScan {
+  /** Set when the whole folder is refused or unreadable. */
+  folderProblem?: string;
+  scripts: ScriptEntry[];
+}
+
+/** The app settings the Settings screen edits.  Appearance lives in the UI. */
+export interface AppSettings {
+  customChecksEnabled: boolean;
+  /** Chosen with a native folder dialog opened by the backend. */
+  hooksFolder?: string;
+  folderScan?: FolderScan;
+  /** A Python chosen with a native file dialog; absent means automatic. */
+  pythonPath?: string;
+  pythonSource: 'chosen' | 'bundled' | 'auto';
+  /** The interpreter that would run now; absent when none can be found. */
+  pythonFound?: string;
+  timeoutSecs: number;
+  /** The honest warning shown wherever custom checks are on. */
+  warning: string;
+  /** The check level a new plan starts from ('suggested' keeps the engine's own). */
+  startingLevel: 'suggested' | 'structure' | 'counts' | 'full-values';
+  /** Parallel scans per side (at least 1). */
+  oldParallelism: number;
+  newParallelism: number;
+  /** Where the Report screen's "include row keys" box starts. */
+  includeKeysDefault: boolean;
+  appVersion: string;
+  /** Where Dmux keeps its data (read-only). */
+  dataDir: string;
+  licence: string;
+}
+
+/** What the webview may change.  It never sends a path. */
+export interface AppSettingsUpdate {
+  customChecksEnabled?: boolean;
+  timeoutSecs?: number;
+  startingLevel?: AppSettings['startingLevel'];
+  oldParallelism?: number;
+  newParallelism?: number;
+  includeKeysDefault?: boolean;
 }
 
 export type ReportFormat = 'pdf' | 'excel';

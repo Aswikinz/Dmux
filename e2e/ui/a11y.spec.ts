@@ -81,3 +81,30 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await check('report');
   });
 }
+
+/** The Settings page (every section), in both appearances. */
+for (const colorScheme of ['light', 'dark'] as const) {
+  test(`Settings is accessible in ${colorScheme} mode`, async ({ page }) => {
+    await page.emulateMedia({ colorScheme });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    for (const section of ['Appearance', 'Run defaults', 'Reports', 'Custom checks', 'About']) {
+      await expect(page.getByRole('heading', { name: section, exact: true })).toBeVisible();
+    }
+    // Show the folder list too: one script that runs and one that is refused.
+    await page.getByRole('button', { name: 'Choose folder…' }).click();
+    await expect(page.getByText(/Refused:/)).toBeVisible();
+    await page.waitForFunction(() =>
+      document.getAnimations().every((a) => a.playState !== 'running'),
+    );
+    const results = await new AxeBuilder({ page }).analyze();
+    const serious = results.violations.filter(
+      (v) => v.impact === 'serious' || v.impact === 'critical',
+    );
+    expect(
+      serious,
+      serious.map((v) => `${v.id}: ${v.nodes.map((n) => n.failureSummary).join(' | ')}`).join('\n'),
+    ).toEqual([]);
+  });
+}

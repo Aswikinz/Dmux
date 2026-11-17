@@ -15,6 +15,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Engine } from './engine';
 import type {
+  AppSettings,
+  AppSettingsUpdate,
+  CustomSeverity,
   CheckLevel,
   CheckPlan,
   ConnectionProfile,
@@ -328,6 +331,89 @@ interface RawResults {
   options_applied: boolean;
   options_recorded: boolean;
   warnings: string[];
+  custom_checks?: {
+    findings: { id: string; severity: string; message: string; table: string | null }[];
+    scripts: { name: string; sha256: string }[];
+    warnings: string[];
+  } | null;
+}
+
+interface RawSettings {
+  custom_checks_enabled: boolean;
+  hooks_folder: string | null;
+  scan: {
+    folder_problem: string | null;
+    scripts: { name: string; usable: boolean; reason: string | null }[];
+  } | null;
+  python_path: string | null;
+  python_source: 'chosen' | 'bundled' | 'auto';
+  python_found: string | null;
+  timeout_secs: number;
+  warning: string;
+  starting_level: string;
+  old_parallelism: number;
+  new_parallelism: number;
+  include_keys_default: boolean;
+  app_version: string;
+  data_dir: string;
+  licence: string;
+}
+
+/** Map the backend settings; text from the file system stays plain text. */
+export function translateSettings(raw: RawSettings): AppSettings {
+  return {
+    customChecksEnabled: raw.custom_checks_enabled,
+    hooksFolder: raw.hooks_folder ?? undefined,
+    folderScan: raw.scan
+      ? {
+          folderProblem: raw.scan.folder_problem ?? undefined,
+          scripts: raw.scan.scripts.map((s) => ({
+            name: s.name,
+            usable: s.usable,
+            reason: s.reason ?? undefined,
+          })),
+        }
+      : undefined,
+    pythonPath: raw.python_path ?? undefined,
+    pythonSource: raw.python_source,
+    pythonFound: raw.python_found ?? undefined,
+    timeoutSecs: raw.timeout_secs,
+    warning: raw.warning,
+    startingLevel: mapStartingLevel(raw.starting_level),
+    oldParallelism: raw.old_parallelism,
+    newParallelism: raw.new_parallelism,
+    includeKeysDefault: raw.include_keys_default,
+    appVersion: raw.app_version,
+    dataDir: raw.data_dir,
+    licence: raw.licence,
+  };
+}
+
+/** An unknown starting level keeps the engine's own suggestion. */
+function mapStartingLevel(raw: string): AppSettings['startingLevel'] {
+  switch (raw) {
+    case 'structure':
+    case 'counts':
+      return raw;
+    case 'full_values':
+      return 'full-values';
+    default:
+      return 'suggested';
+  }
+}
+
+/** Run a settings command; a failure becomes a plain `Error` with readable text. */
+async function settingsCall(command: string, args?: Record<string, unknown>): Promise<AppSettings> {
+  try {
+    return translateSettings(await invoke<RawSettings>(command, args));
+  } catch (error) {
+    throw new Error(describeError(error), { cause: error });
+  }
+}
+
+/** Unknown custom-check severities are shown as failures, never hidden. */
+function mapSeverity(raw: string): CustomSeverity {
+  return raw === 'info' || raw === 'warning' ? raw : 'fail';
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +899,18 @@ function translateResults(raw: RawResults): Results {
     // "options not recorded" rather than assume none (never a bare PASS).
     optionsRecorded: raw.options_recorded ?? false,
     warnings: raw.warnings ?? [],
+    customChecks: raw.custom_checks
+      ? {
+          findings: raw.custom_checks.findings.map((f) => ({
+            id: f.id,
+            severity: mapSeverity(f.severity),
+            message: f.message,
+            table: f.table ?? undefined,
+          })),
+          scripts: raw.custom_checks.scripts,
+          warnings: raw.custom_checks.warnings,
+        }
+      : undefined,
   };
 }
 
@@ -1024,6 +1122,34 @@ export function createTauriEngine(): Engine {
       } catch (error) {
         return { ok: false, error: describeError(error) };
       }
+    },
+    async getSettings(): Promise<AppSettings> {
+      return settingsCall('get_settings');
+    },
+    async updateSettings(update: AppSettingsUpdate): Promise<AppSettings> {
+      return settingsCall('update_settings', {
+        input: {
+          custom_checks_enabled: update.customChecksEnabled,
+          timeout_secs: update.timeoutSecs,
+          starting_level:
+            update.startingLevel === 'full-values' ? 'full_values' : update.startingLevel,
+          old_parallelism: update.oldParallelism,
+          new_parallelism: update.newParallelism,
+          include_keys_default: update.includeKeysDefault,
+        },
+      });
+    },
+    async chooseHooksFolder(): Promise<AppSettings> {
+      return settingsCall('choose_hooks_folder');
+    },
+    async clearHooksFolder(): Promise<AppSettings> {
+      return settingsCall('clear_hooks_folder');
+    },
+    async choosePython(): Promise<AppSettings> {
+      return settingsCall('choose_python');
+    },
+    async clearPython(): Promise<AppSettings> {
+      return settingsCall('clear_python');
     },
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');

@@ -10,6 +10,7 @@ import { ChooseChecksScreen } from './screens/ChooseChecksScreen';
 import { RunScreen } from './screens/RunScreen';
 import { ResultsScreen } from './screens/ResultsScreen';
 import { ReportScreen } from './screens/ReportScreen';
+import { SettingsScreen } from './screens/SettingsScreen';
 import type { Engine } from './api/engine';
 import { resolveEngine } from './api/engineSelection';
 import type {
@@ -21,7 +22,7 @@ import type {
   RunProgress,
   Results,
 } from './api/contract';
-import { Moon, Sun, Zap, ZapOff, Menu } from 'lucide-react';
+import { Moon, Sun, Zap, ZapOff, Menu, Settings } from 'lucide-react';
 
 const stepOrder: Step[] = [
   'connect',
@@ -53,6 +54,7 @@ function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [engine] = useState<Engine>(() => resolveEngine());
   const [step, setStep] = useState<Step>('connect');
+  const [showSettings, setShowSettings] = useState(false);
   const [completed, setCompleted] = useState<Set<Step>>(new Set());
 
   const [oldProfile, setOldProfile] = useState<ConnectionProfile>(defaultOldProfile());
@@ -146,8 +148,27 @@ function AppShell() {
           steps={stepLabels}
           current={step}
           completed={completed}
-          onSelect={goToStep}
+          onSelect={(next) => {
+            setShowSettings(false);
+            goToStep(next);
+          }}
+          suspended={showSettings}
         />
+        <div className="mt-4 border-t border-black/[0.06] pt-3 dark:border-white/[0.08]">
+          <button
+            type="button"
+            onClick={() => setShowSettings(true)}
+            aria-current={showSettings ? 'page' : undefined}
+            className={`flex h-9 w-full items-center gap-3 rounded-lg px-2.5 text-left text-[13px] font-medium transition-colors duration-150 ${
+              showSettings
+                ? 'bg-accent-600 text-white shadow-[0_1px_2px_rgba(30,27,75,0.3)] dark:bg-accent-500'
+                : 'text-slate-700 hover:bg-black/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.07]'
+            }`}
+          >
+            <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>Settings</span>
+          </button>
+        </div>
         <div className="mt-auto flex items-center gap-1 px-1">
           <Button
             variant="ghost"
@@ -180,7 +201,16 @@ function AppShell() {
             <Menu className="h-5 w-5" />
           </Button>
         </div>
-        <div key={step} className="mx-auto w-full max-w-6xl animate-fade-up">
+        {showSettings && (
+          <div key="settings" className="mx-auto w-full max-w-6xl animate-fade-up">
+            <SettingsScreen engine={engine} />
+          </div>
+        )}
+        <div
+          key={step}
+          hidden={showSettings}
+          className="mx-auto w-full max-w-6xl animate-fade-up"
+        >
           {step === 'connect' && (
             <ConnectScreen
               engine={engine}

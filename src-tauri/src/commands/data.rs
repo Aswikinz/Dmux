@@ -214,6 +214,9 @@ pub struct ResultsDto {
     pub options_recorded: bool,
     /// Run-level warnings (can-write, superuser, row-level security, ...).
     pub warnings: Vec<String>,
+    /// Custom checks (Python scripts), present only when they ran for this run.
+    /// The `verdict` above already includes any custom failure.
+    pub custom_checks: Option<crate::hooks::CustomChecksDto>,
 }
 
 // ---------------------------------------------------------------------------
@@ -463,8 +466,10 @@ pub(crate) fn start_run_with(
     let mapping = validate_mapping(&input.mapping)?;
     let old_profile = resolve(&input.old, state)?;
     let new_profile = resolve(&input.new, state)?;
-    let old_parallelism = input.old_parallelism.unwrap_or(2);
-    let new_parallelism = input.new_parallelism.unwrap_or(4);
+    // The request's limits, else the ones saved in Settings (2 and 4 by default).
+    let prefs = crate::prefs::Prefs::load(&*state.store()?)?;
+    let (old_parallelism, new_parallelism) =
+        crate::prefs::effective_parallelism(input.old_parallelism, input.new_parallelism, &prefs);
     if old_parallelism == 0 || new_parallelism == 0 {
         return Err(CommandError::InvalidInput {
             message: "the parallel-scan limits must be at least 1".to_string(),
@@ -491,6 +496,7 @@ pub(crate) fn start_run_with(
 
     let manager = Arc::clone(&state.runs);
     manager.insert(&run_id, RunHandle::new(config, Some(resume_store)));
+    manager.set_hook_plan(&run_id, crate::hooks::plan_for_new_run(state)?);
     let ticket = manager
         .begin_first(&run_id)
         .ok_or_else(|| CommandError::internal("the new run could not be started"))?;
@@ -513,6 +519,9 @@ fn spawn_drive_task(manager: &Arc<RunManager>, run_id: &str, ticket: DriveTicket
             let config = ticket.config;
             let out =
                 tauri::async_runtime::block_on(async { run(&config).await }).map(|o| o.results);
+            // Custom checks run here, on this blocking thread, before the run
+            // is reported finished (so results never appear without them).
+            crate::hooks::after_run(&manager, &rid, generation, &out);
             manager.finish(&rid, generation, out);
         }
     });
@@ -727,7 +736,17 @@ pub async fn get_results(
 
 pub(crate) fn get_results_with(run_id: &str, state: &AppState) -> Result<ResultsDto, CommandError> {
     let results = state.runs.results(run_id)?;
-    Ok(map_results(run_id, &results))
+    // Custom checks, when they ran: the folded results, the verdict that
+    // includes any custom failure, and the findings themselves.
+    match state.runs.hook_run(run_id)? {
+        None => Ok(map_results(run_id, &results)),
+        Some(hooks) => {
+            let mut dto = map_results(run_id, &hooks.results);
+            dto.verdict = verdict_string(hooks.displayed_verdict());
+            dto.custom_checks = Some(crate::hooks::CustomChecksDto::from_run(&hooks));
+            Ok(dto)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +859,7 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
         options_applied: results.options_applied,
         options_recorded: dmux_engine::results::options_recorded(results),
         warnings: results.warnings.clone(),
+        custom_checks: None,
     }
 }
 

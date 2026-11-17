@@ -380,15 +380,55 @@ options ticked and every query sent.
 
 - **Run history.** Every run, with its verdict, coverage and date. Open one to review or
   re-export it, or to repeat it from its saved definition.
-- **Scripts.** Optional custom checks, written in Python by the bank's own team. A custom check
-  runs with your full permissions. Only run scripts you trust. Dmux strips the
-  environment and never hands a script the database passwords or connections, but it does
-  not sandbox the script itself. On Linux, Dmux refuses a script, or a scripts folder, that
-  is group- or world-writable or owned by someone else, because anyone who could edit it
-  could run commands as you. Findings appear in the report marked as custom checks.
-  Off unless switched on.
-- **Settings.** Theme, including the reduced effects theme for remote desktops; the run
-  window; parallel-scan limits; where history is kept; and purging.
+- **Settings.** The Settings page is at the bottom of the left-hand list, below the steps.
+  It has five sections:
+  - **Appearance.** Light, dark, or match your computer, and a reduced effects switch for
+    remote desktops. The two small icons at the bottom of the left-hand list change the same
+    settings.
+  - **Run defaults.** The check level a new plan starts from (Dmux's own suggestion unless you
+    pick another), and how many scans run at once on the old and the new database (2 and 4
+    to begin with, never fewer than 1). Use a lower number on a busy production server. You
+    can still change the levels for a single run on the Choose checks step.
+  - **Reports.** Whether the "include row keys" box on the Report step starts ticked. It is off
+    unless you turn it on, and you still decide for each export.
+  - **Custom checks.** See below.
+  - **About.** The Dmux version, the folder where Dmux keeps its settings and history (shown
+    for information; you cannot change it here), and the licence.
+
+### Custom checks
+
+A custom check is a small Python script written by your own team. After Dmux compares the
+databases, it gives each script a summary of the results (table names, counts and verdicts,
+never passwords, connections or row values) and the script can add findings of its own.
+
+**A custom check runs with your full permissions. Only run scripts you trust.** Dmux does not
+sandbox a script. It starts the script with a nearly empty environment and never hands it a
+password or a connection, but a script can still read your files and use your network.
+
+Custom checks are **off** until you turn them on in Settings.
+
+1. Open **Settings**, then **Custom checks**, and switch on "Run custom checks after each
+   comparison".
+2. Choose **Choose folder** and pick the folder that holds your scripts (files ending in
+   `.py`). Dmux lists each script and says whether it will run. On Linux and macOS it
+   refuses a script, or a folder, that other users on the computer could change, or that
+   belongs to another user, and it tells you why. Fix the permissions and the script is
+   accepted. On Windows this check is not available, so the warning above matters even more.
+3. Dmux finds Python for you. If the Windows build ships its own Python (a `python` folder
+   next to the app), that one is used first. You can choose a different Python with
+   **Choose Python**, or go back to automatic.
+4. Set the time limit for each script. A script that runs longer is stopped, and the run
+   shows a warning.
+
+Every time you start a run while custom checks are on, Dmux shows the warning again and asks
+you to confirm before it starts.
+
+On the Results step, the **Custom checks** section lists every finding with its severity
+(Failed, Warning or Note) and its message. A failed custom check makes the overall verdict
+FAIL, so a run with a failing custom check never shows PASS. A script that could not run, ran
+too long or returned something unreadable is shown as a warning and lifts a clean PASS to
+WARNING. The exported report includes the findings and the SHA-256 of each script that ran, so
+anyone can later check which code produced them.
 
 > **TODO (wiring):** screenshots and the final labels for these three pages.
 

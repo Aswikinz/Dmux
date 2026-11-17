@@ -24,6 +24,12 @@ fn main() {
             "cancel_run",
             "get_results",
             "export_report",
+            "get_settings",
+            "update_settings",
+            "choose_hooks_folder",
+            "clear_hooks_folder",
+            "choose_python",
+            "clear_python",
         ]),
     ))
     .expect("failed to run tauri build script");

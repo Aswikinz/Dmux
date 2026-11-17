@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -20,6 +20,20 @@ interface ReportScreenProps {
 
 export function ReportScreen({ engine, results, onBack, onRestart }: ReportScreenProps) {
   const [includeKeys, setIncludeKeys] = useState(false);
+  // The box starts from the Settings default (off unless the user changed it);
+  // it stays an explicit choice for every export.
+  useEffect(() => {
+    let mounted = true;
+    engine
+      .getSettings()
+      .then((s) => {
+        if (mounted) setIncludeKeys(s.includeKeysDefault);
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [engine]);
   const [exporting, setExporting] = useState<ReportFormat | null>(null);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

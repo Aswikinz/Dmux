@@ -1,5 +1,7 @@
 import type { Engine } from './engine';
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
@@ -487,6 +489,21 @@ export interface MockEngineOptions {
  * inputs so tests are stable.
  */
 export function createMockEngine(options: MockEngineOptions = {}): Engine {
+  // Custom checks start off, like the real app.
+  const settings: AppSettings = {
+    customChecksEnabled: false,
+    pythonSource: 'auto',
+    pythonFound: '/usr/bin/python3',
+    timeoutSecs: 60,
+    startingLevel: 'suggested',
+    oldParallelism: 2,
+    newParallelism: 4,
+    includeKeysDefault: false,
+    appVersion: version,
+    dataDir: '/home/you/.local/share/verify.dmux.desktop',
+    licence: 'Apache-2.0',
+    warning: 'A custom check runs with your full permissions. Only run scripts you trust.',
+  };
   let currentRunId = 0;
   let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
@@ -636,6 +653,54 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       // so the "saved to …" message stays meaningful.
       const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
       return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
+    },
+
+    async getSettings(): Promise<AppSettings> {
+      return { ...settings };
+    },
+    async updateSettings(update: AppSettingsUpdate): Promise<AppSettings> {
+      if (update.customChecksEnabled !== undefined) {
+        settings.customChecksEnabled = update.customChecksEnabled;
+      }
+      if (update.timeoutSecs !== undefined) {
+        settings.timeoutSecs = update.timeoutSecs;
+      }
+      if (update.startingLevel !== undefined) settings.startingLevel = update.startingLevel;
+      if (update.oldParallelism !== undefined) settings.oldParallelism = update.oldParallelism;
+      if (update.newParallelism !== undefined) settings.newParallelism = update.newParallelism;
+      if (update.includeKeysDefault !== undefined) {
+        settings.includeKeysDefault = update.includeKeysDefault;
+      }
+      return { ...settings };
+    },
+    async chooseHooksFolder(): Promise<AppSettings> {
+      // The mock "dialog" always picks a sample folder with one good script and
+      // one that is refused, so the Settings screen shows both states.
+      settings.hooksFolder = '/home/you/custom-checks';
+      settings.folderScan = {
+        scripts: [
+          { name: 'balance_totals.py', usable: true },
+          { name: 'shared_script.py', usable: false, reason: 'other users on this computer can change it; make it writable only by you' },
+        ],
+      };
+      return { ...settings };
+    },
+    async clearHooksFolder(): Promise<AppSettings> {
+      settings.hooksFolder = undefined;
+      settings.folderScan = undefined;
+      return { ...settings };
+    },
+    async choosePython(): Promise<AppSettings> {
+      settings.pythonPath = '/usr/bin/python3';
+      settings.pythonFound = '/usr/bin/python3';
+      settings.pythonSource = 'chosen';
+      return { ...settings };
+    },
+    async clearPython(): Promise<AppSettings> {
+      settings.pythonPath = undefined;
+      settings.pythonFound = '/usr/bin/python3';
+      settings.pythonSource = 'auto';
+      return { ...settings };
     },
 
     async getVersion(): Promise<string> {
