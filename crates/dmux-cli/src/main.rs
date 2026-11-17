@@ -16,6 +16,7 @@ use dmux_engine::mapping::{from_json as mapping_from_json, Mapping};
 use dmux_engine::results::CheckLevel;
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
+use dmux_hooks::{Finding, HookSpec, Severity};
 
 /// PLAN.md 4.8 exit codes.
 const EXIT_PASS: u8 = 0;
@@ -44,6 +45,8 @@ enum Command {
     Compare(CompareArgs),
     /// Run a saved verification definition (TOML or JSON).
     Run(RunArgs),
+    /// Run Python hooks over a results JSON file and print their findings.
+    Hook(HookArgs),
 }
 
 /// Shared connection arguments for the commands that talk to a database.
@@ -154,6 +157,31 @@ struct RunArgs {
     /// Write the results JSON to this path (stdout by default).
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
+    /// Run every Python hook in this directory after the run (off by default).
+    #[arg(long, value_name = "DIR")]
+    hooks: Option<PathBuf>,
+    /// Hook time limit in seconds (default 60).
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    hook_timeout: u64,
+    /// Python interpreter to run hooks with (default: auto-discover python3/python).
+    #[arg(long, value_name = "PATH")]
+    python: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct HookArgs {
+    /// The run's results JSON file (`-` reads stdin).
+    #[arg(value_name = "RESULTS")]
+    results: String,
+    /// A directory of Python hook scripts, or a single script.
+    #[arg(value_name = "HOOKS")]
+    hooks: PathBuf,
+    /// Hook time limit in seconds (default 60).
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    timeout: u64,
+    /// Python interpreter (default: auto-discover python3/python).
+    #[arg(long, value_name = "PATH")]
+    python: Option<PathBuf>,
 }
 
 /// Parse the `--tls` mode string into a [`TlsMode`].
@@ -207,6 +235,7 @@ async fn main() -> ExitCode {
         Command::Capture(args) => run_capture(args).await,
         Command::Compare(args) => run_compare(args).await,
         Command::Run(args) => run_run(args).await,
+        Command::Hook(args) => run_hook(args).await,
     }
 }
 
@@ -433,6 +462,183 @@ fn emit_results(path: Option<&std::path::Path>, results: &dmux_engine::results::
     }
 }
 
+fn emit_json_value(path: Option<&std::path::Path>, value: &serde_json::Value) {
+    let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
+    match path {
+        Some(p) => {
+            if let Err(e) = fs::write(p, &json) {
+                eprintln!("dmux: failed to write results: {e}");
+            }
+        }
+        None => println!("{json}"),
+    }
+}
+
+/// Run the `dmux hook` command: read a results file (or stdin), run the given
+/// hook script(s), and print their findings as JSON marked `custom_checks`.
+async fn run_hook(args: HookArgs) -> ExitCode {
+    let results_value = match read_results_json(&args.results) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let mut specs = match discover_hook_specs(&args.hooks, args.timeout, args.python.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+    for spec in &mut specs {
+        if let Some(p) = args.python.as_deref() {
+            spec.interpreter = Some(p.to_path_buf());
+        }
+    }
+
+    let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let envelope = envelope_results(&results_value, &specs, &hook_results);
+    emit_json_value(None, &envelope);
+
+    if hook_causes_non_pass(&hook_results) {
+        ExitCode::from(EXIT_FAIL)
+    } else if hook_results.iter().any(|r| !r.warnings.is_empty()) {
+        ExitCode::from(EXIT_WARN)
+    } else {
+        ExitCode::from(EXIT_PASS)
+    }
+}
+
+/// Read a results JSON value from a path, or stdin for `-`.
+fn read_results_json(path: &str) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let text = if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| e.to_string())?;
+        buf
+    } else {
+        fs::read_to_string(path).map_err(|e| e.to_string())?
+    };
+    serde_json::from_str(&text).map_err(|e| format!("results are not valid JSON: {e}"))
+}
+
+/// Collect one [`HookSpec`] per `.py` file in a directory, or a single script.
+fn discover_hook_specs(
+    path: &std::path::Path,
+    timeout_secs: u64,
+    interpreter: Option<&std::path::Path>,
+) -> Result<Vec<HookSpec>, String> {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(path)
+            .map_err(|e| format!("cannot read hooks dir {}: {e}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "py"))
+            .collect();
+        entries.sort();
+        entries
+    } else if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        return Err(format!("hooks path not found: {}", path.display()));
+    };
+
+    if files.is_empty() {
+        return Err(format!("no Python hooks found in {}", path.display()));
+    }
+
+    let mut specs = Vec::with_capacity(files.len());
+    for f in files {
+        specs.push(HookSpec {
+            script: f,
+            interpreter: interpreter.map(PathBuf::from),
+            timeout: std::time::Duration::from_secs(timeout_secs),
+        });
+    }
+    Ok(specs)
+}
+
+/// Build the JSON envelope a hook-enabled `run` / `hook` emits: the results
+/// plus each script's hash and its findings, marked `custom_checks`.
+fn envelope_results(
+    results: &serde_json::Value,
+    specs: &[HookSpec],
+    hook_results: &[dmux_hooks::HookResult],
+) -> serde_json::Value {
+    let mut custom_checks: Vec<serde_json::Value> = Vec::new();
+    let mut scripts: Vec<serde_json::Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for (spec, res) in specs.iter().zip(hook_results.iter()) {
+        let script_name = spec
+            .script
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec.script.display().to_string());
+        for w in &res.warnings {
+            warnings.push(format!("{script_name}: {w}"));
+        }
+        scripts.push(serde_json::json!({
+            "script": script_name,
+            "sha256": res.script_hash,
+            "findings": res.findings.iter().map(finding_json).collect::<Vec<_>>(),
+        }));
+        for f in &res.findings {
+            custom_checks.push(finding_json(f));
+        }
+    }
+
+    serde_json::json!({
+        "results": results,
+        "hooks": {
+            "custom_checks": custom_checks,
+            "scripts": scripts,
+            "warnings": warnings,
+        }
+    })
+}
+
+fn finding_json(f: &Finding) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": f.id,
+        "severity": severity_str(f.severity),
+        "message": f.message,
+        "source": "custom_checks"
+    });
+    if let Some(t) = &f.table {
+        v["table"] = serde_json::Value::String(t.clone());
+    }
+    v
+}
+
+fn severity_str(s: Severity) -> &'static str {
+    match s {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Fail => "fail",
+    }
+}
+
+/// True when any `fail` finding means the overall verdict must not be PASS
+/// (PLAN 4.9: a `fail` finding forces the verdict off PASS; info/warning do not,
+/// and findings can never raise a non-PASS to PASS).
+fn hook_causes_non_pass(results: &[dmux_hooks::HookResult]) -> bool {
+    results
+        .iter()
+        .any(|r| r.findings.iter().any(|f| f.severity == Severity::Fail))
+}
+
 async fn run_run(args: RunArgs) -> ExitCode {
     let mut config = match load_definition(&args.definition) {
         Ok(c) => c,
@@ -452,8 +658,43 @@ async fn run_run(args: RunArgs) -> ExitCode {
         }
     };
 
-    emit_results(args.out.as_deref(), &outcome.results);
-    ExitCode::from(outcome.exit_code)
+    let mut exit_code = outcome.exit_code;
+
+    // Hooks are opt-in and off by default (PLAN 4.9).
+    if let Some(dir) = args.hooks.as_deref() {
+        let mut specs = match discover_hook_specs(dir, args.hook_timeout, args.python.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("dmux run: hooks: {e}");
+                return ExitCode::from(EXIT_FAIL);
+            }
+        };
+        for spec in &mut specs {
+            if let Some(p) = args.python.as_deref() {
+                spec.interpreter = Some(p.to_path_buf());
+            }
+        }
+
+        let results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
+        let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("dmux run: hooks: {e}");
+                return ExitCode::from(EXIT_FAIL);
+            }
+        };
+
+        let envelope = envelope_results(&results_value, &specs, &hook_results);
+        if hook_causes_non_pass(&hook_results) && exit_code == EXIT_PASS {
+            // A `fail` finding must never allow a clean PASS to stand.
+            exit_code = EXIT_FAIL;
+        }
+        emit_json_value(args.out.as_deref(), &envelope);
+    } else {
+        emit_results(args.out.as_deref(), &outcome.results);
+    }
+
+    ExitCode::from(exit_code)
 }
 
 /// The on-disk run definition (TOML or JSON).  This is the shape `dmux run`
@@ -592,8 +833,8 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_superuser_requires_reason, parse_level, parse_tls_mode, Cli, Command, DiffArgs,
-        EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        allow_superuser_requires_reason, hook_causes_non_pass, parse_level, parse_tls_mode, Cli,
+        Command, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
@@ -690,5 +931,84 @@ mod tests {
             }
             _ => panic!("expected diff"),
         }
+    }
+
+    #[test]
+    fn run_args_accept_hooks_opt_in() {
+        // Hooks are opt-in: without `--hooks` the field is None.
+        let cmd = Cli::try_parse_from(["dmux", "run", "def.toml"]).expect("parse");
+        match cmd.command {
+            Command::Run(args) => {
+                assert!(args.hooks.is_none());
+                assert_eq!(args.hook_timeout, 60);
+                assert!(args.python.is_none());
+            }
+            _ => panic!("expected run"),
+        }
+
+        let cmd = Cli::try_parse_from([
+            "dmux",
+            "run",
+            "def.toml",
+            "--hooks",
+            "hooks/",
+            "--hook-timeout",
+            "30",
+            "--python",
+            "/usr/bin/python3",
+        ])
+        .expect("parse");
+        match cmd.command {
+            Command::Run(args) => {
+                assert_eq!(args.hooks, Some(std::path::PathBuf::from("hooks/")));
+                assert_eq!(args.hook_timeout, 30);
+                assert_eq!(
+                    args.python,
+                    Some(std::path::PathBuf::from("/usr/bin/python3"))
+                );
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn hook_args_shape() {
+        let cmd = Cli::try_parse_from(["dmux", "hook", "results.json", "hooks/"]).expect("parse");
+        match cmd.command {
+            Command::Hook(args) => {
+                assert_eq!(args.results, "results.json");
+                assert_eq!(args.hooks, std::path::PathBuf::from("hooks/"));
+                assert_eq!(args.timeout, 60);
+            }
+            _ => panic!("expected hook"),
+        }
+    }
+
+    #[test]
+    fn hook_cause_non_pass_only_on_fail() {
+        use dmux_hooks::Finding;
+        let info = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "a".into(),
+                severity: Severity::Info,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        assert!(!hook_causes_non_pass(&[info]));
+
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "a".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        assert!(hook_causes_non_pass(&[fail]));
     }
 }
