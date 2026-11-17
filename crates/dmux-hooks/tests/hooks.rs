@@ -206,6 +206,65 @@ fn secrets_are_stripped_from_hook_environment() {
 }
 
 #[test]
+fn large_input_with_nonreading_script_is_killed_at_limit() {
+    if !python_available() {
+        require_python();
+        return;
+    }
+    let script = fixtures().join("never_reads_stdin.py");
+    let mut spec = HookSpec::new(&script);
+    spec.timeout = Duration::from_millis(500);
+
+    // A results payload well over the ~64 KiB pipe buffer: writing it must not
+    // block, even though the script never reads stdin.
+    let big = serde_json::json!({
+        "run_id": "run",
+        "pad": "x".repeat(250 * 1024),
+        "tables": {}
+    });
+
+    let start = std::time::Instant::now();
+    let result = run_hook(&spec, &big).expect("run_hook returns");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "non-reading script with large input was not killed at the limit"
+    );
+    assert!(
+        result.warnings.iter().any(|w| w.contains("timed out")),
+        "expected a timeout warning, got {:?}",
+        result.warnings
+    );
+    assert!(result.findings.is_empty());
+}
+
+#[test]
+fn oversized_input_is_refused_not_truncated() {
+    if !python_available() {
+        require_python();
+        return;
+    }
+    let script = fixtures().join("valid_hook.py");
+    let spec = HookSpec::new(&script);
+
+    // A payload over the 1 MiB input cap: the runner must refuse to run the
+    // hook and record a warning, never send truncated JSON.
+    let huge = serde_json::json!({
+        "run_id": "run",
+        "pad": "x".repeat(dmux_hooks::MAX_INPUT_BYTES + 1),
+    });
+
+    let result = run_hook(&spec, &huge).expect("run_hook returns");
+    assert!(result.findings.is_empty());
+    assert!(
+        result.warnings.iter().any(|w| w.contains("input limit")),
+        "oversized input should be refused with a warning, got {:?}",
+        result.warnings
+    );
+}
+
+#[test]
 fn fail_finding_is_returned_with_fail_severity() {
     if !python_available() {
         require_python();

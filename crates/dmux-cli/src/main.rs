@@ -675,7 +675,7 @@ async fn run_run(args: RunArgs) -> ExitCode {
             }
         }
 
-        let results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
+        let mut results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
         let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
             Ok(r) => r,
             Err(e) => {
@@ -684,17 +684,75 @@ async fn run_run(args: RunArgs) -> ExitCode {
             }
         };
 
-        let envelope = envelope_results(&results_value, &specs, &hook_results);
-        if hook_causes_non_pass(&hook_results) && exit_code == EXIT_PASS {
-            // A `fail` finding must never allow a clean PASS to stand.
-            exit_code = EXIT_FAIL;
+        // A custom-check `fail` must change the *written* verdict, never only
+        // the exit code (false PASS).  Timeouts / crashes / invalid output are
+        // warnings and must lift a clean PASS exit to 2.
+        let has_fail = hook_causes_non_pass(&hook_results);
+        let has_warning = hook_results.iter().any(|r| !r.warnings.is_empty());
+
+        if has_fail {
+            apply_custom_fail(&mut results_value, &hook_results);
+            if exit_code == EXIT_PASS {
+                exit_code = EXIT_FAIL;
+            }
+        } else if has_warning && exit_code == EXIT_PASS {
+            exit_code = EXIT_WARN;
         }
+
+        let envelope = envelope_results(&results_value, &specs, &hook_results);
         emit_json_value(args.out.as_deref(), &envelope);
     } else {
         emit_results(args.out.as_deref(), &outcome.results);
     }
 
     ExitCode::from(exit_code)
+}
+
+/// Fold a custom-check `fail` finding into the results' verdict.  The written
+/// results must carry the FINAL verdict: a `fail` finding turns a PASS into
+/// FAIL with reason "custom check <id> failed".  It never lowers a FAIL back to
+/// PASS and never raises a non-PASS run, so a run that already FAILED stays
+/// FAILED with its own reasons intact.
+fn apply_custom_fail(results: &mut serde_json::Value, hook_results: &[dmux_hooks::HookResult]) {
+    let fail_ids: Vec<String> = hook_results
+        .iter()
+        .flat_map(|r| r.findings.iter())
+        .filter(|f| f.severity == Severity::Fail)
+        .map(|f| f.id.clone())
+        .collect();
+    if fail_ids.is_empty() {
+        return;
+    }
+
+    // The verdict vocabulary the engine serialises: PASS, FAIL, WIDELY_DIFFERENT,
+    // NEEDS_REVIEW, CHANGED_DURING_CHECK, TOOL_FAULT, WARNING.
+    let current = results.get("verdict").and_then(|v| v.as_str());
+    // A failure finding must never downgrade an already non-PASS verdict into
+    // PASS, and it must force PASS to FAIL.
+    let new_verdict = match current {
+        Some("PASS") => Some("FAIL".to_string()),
+        // Keep the existing (already non-PASS) verdict; it is at least as grave.
+        Some(other) => Some(other.to_string()),
+        None => Some("FAIL".to_string()),
+    };
+    if let Some(v) = new_verdict {
+        results["verdict"] = serde_json::Value::String(v);
+    }
+
+    // Record the reason next to the other verdict notes.  RunResults uses a
+    // top-level "warnings" array; append so the report explains the FAIL.
+    let mut reasons: Vec<String> = fail_ids
+        .iter()
+        .map(|id| format!("custom check {id} failed"))
+        .collect();
+    if let Some(arr) = results.get_mut("warnings").and_then(|v| v.as_array_mut()) {
+        for r in &reasons {
+            arr.push(serde_json::Value::String(r.clone()));
+        }
+    } else {
+        results["warnings"] =
+            serde_json::Value::Array(reasons.drain(..).map(serde_json::Value::String).collect());
+    }
 }
 
 /// The on-disk run definition (TOML or JSON).  This is the shape `dmux run`
@@ -833,8 +891,8 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_superuser_requires_reason, hook_causes_non_pass, parse_level, parse_tls_mode, Cli,
-        Command, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        allow_superuser_requires_reason, apply_custom_fail, hook_causes_non_pass, parse_level,
+        parse_tls_mode, Cli, Command, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
@@ -1010,5 +1068,61 @@ mod tests {
             warnings: vec![],
         };
         assert!(hook_causes_non_pass(&[fail]));
+    }
+
+    #[test]
+    fn custom_fail_forces_verdict_fail_in_written_results() {
+        use dmux_hooks::Finding;
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over threshold".into(),
+            }],
+            warnings: vec![],
+        };
+
+        // A PASS verdict must flip to FAIL with the reason recorded.
+        let mut pass_results = serde_json::json!({ "verdict": "PASS", "warnings": [] });
+        apply_custom_fail(&mut pass_results, std::slice::from_ref(&fail));
+        assert_eq!(pass_results["verdict"], "FAIL");
+        assert!(
+            pass_results["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str() == Some("custom check custom.total failed")),
+            "reason not recorded: {:?}",
+            pass_results["warnings"]
+        );
+
+        // An already-FAIL verdict must never be raised back to PASS.
+        let mut fail_results = serde_json::json!({ "verdict": "FAIL", "warnings": [] });
+        apply_custom_fail(&mut fail_results, std::slice::from_ref(&fail));
+        assert_eq!(fail_results["verdict"], "FAIL");
+
+        // A non-PASS, non-FAIL verdict stays as-is (never lowered to PASS).
+        let mut tf = serde_json::json!({ "verdict": "TOOL_FAULT", "warnings": [] });
+        apply_custom_fail(&mut tf, std::slice::from_ref(&fail));
+        assert_eq!(tf["verdict"], "TOOL_FAULT");
+    }
+
+    #[test]
+    fn custom_fail_with_no_fail_findings_is_a_noop() {
+        let mut results = serde_json::json!({ "verdict": "PASS", "warnings": [] });
+        let info = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "a".into(),
+                severity: Severity::Info,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        apply_custom_fail(&mut results, &[info]);
+        assert_eq!(results["verdict"], "PASS");
     }
 }

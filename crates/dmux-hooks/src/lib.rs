@@ -44,8 +44,10 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// bloating the report).
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 
-/// Defence-in-depth cap on the results payload written to a hook's stdin.
-const STDIN_HEADER_BYTES: usize = 0x10_00_00;
+/// Upper bound on the results payload we are willing to hand a hook.  A run's
+/// results are small (counts, hashes, names), so anything at or over this size
+/// is suspicious; we refuse to run the hook rather than send truncated JSON.
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 /// One finding returned by a hook — the exact schema PLAN.md 4.9 spells out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +207,7 @@ fn is_sensitive_key(key: &str) -> bool {
 pub fn hash_script(path: &Path) -> Result<String, HookError> {
     let bytes = std::fs::read(path)
         .map_err(|e| HookError::ReadScript(path.display().to_string(), e.to_string()))?;
-    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+    Ok(sha256_hex(&bytes))
 }
 
 /// Resolve the interpreter: explicit path, then `DMUX_PYTHON`, then `python3`,
@@ -278,15 +280,11 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
     if !spec.script.is_file() {
         return Err(HookError::ScriptNotFound(spec.script.display().to_string()));
     }
-    let script_hash = hash_script(&spec.script)?;
+    // Hash the script's bytes first: this digest is the code that actually ran.
+    let script_bytes = std::fs::read(&spec.script)
+        .map_err(|e| HookError::ReadScript(spec.script.display().to_string(), e.to_string()))?;
+    let script_hash = sha256_hex(&script_bytes);
     let interpreter = discover_interpreter(spec)?;
-
-    // Resolve the script to an absolute path: the child runs in a fresh temp
-    // working directory, so a relative script path would no longer resolve.
-    let script_abs = spec
-        .script
-        .canonicalize()
-        .unwrap_or_else(|_| spec.script.clone());
 
     let payload = serde_json::to_vec(&results_payload(results))
         .map_err(|e| HookError::Runtime(e.to_string()))?;
@@ -295,13 +293,41 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
     // and from any stray files.
     let workdir = tempfile::tempdir().map_err(|e| HookError::Runtime(e.to_string()))?;
 
+    // Copy the hashed bytes into the workdir and execute THAT copy, so the
+    // recorded SHA-256 is exactly the code that ran (a script on disk cannot be
+    // swapped between hashing and execution).  Keep the original file name for
+    // the interpreter so `__file__` and tracebacks still look sensible.
+    let script_name = spec
+        .script
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hook.py".to_string());
+    let script_copy = workdir.path().join(&script_name);
+    std::fs::write(&script_copy, &script_bytes).map_err(|e| HookError::Runtime(e.to_string()))?;
+
     let start = std::time::Instant::now();
     let mut warnings = Vec::new();
     let mut findings = Vec::new();
 
+    // Refuse a payload at or over the input cap before spawning anything: we
+    // never send truncated JSON to a script.
+    if payload.len() >= MAX_INPUT_BYTES {
+        warnings.push(format!(
+            "hook {} not run: results payload ({} bytes) exceeds the {}-byte input limit",
+            spec.script.display(),
+            payload.len(),
+            MAX_INPUT_BYTES
+        ));
+        return Ok(HookResult {
+            script_hash,
+            findings,
+            warnings,
+        });
+    }
+
     match spawn_and_collect(
         interpreter,
-        &script_abs,
+        &script_copy,
         spec,
         workdir.path(),
         &payload,
@@ -354,6 +380,11 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
     })
 }
 
+/// SHA-256 hex digest of a byte slice.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
 /// Run every hook in order against the same payload.
 pub fn run_hooks(
     specs: &[HookSpec],
@@ -400,11 +431,79 @@ pub fn validate_finding(f: &Finding) -> Result<(), String> {
     {
         return Err("finding contains control characters".to_string());
     }
+    if contains_format_or_bidi(&f.id)
+        || contains_format_or_bidi(&f.message)
+        || f.table.as_deref().is_some_and(contains_format_or_bidi)
+    {
+        return Err("finding contains Unicode format/bidi characters".to_string());
+    }
     Ok(())
 }
 
+/// True when a string holds a C0/C1 control character (newline, tab, escape,
+/// any of `char::is_control`).
 pub fn contains_control(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
+}
+
+/// True when a string holds a Unicode format, bidi or other `Cf` (format)
+/// character.  These are invisible and can reorder or spoof visible text, so
+/// they are rejected from untrusted findings (see PLAN.md 6.3: script output is
+/// untrusted input).  This covers U+200B–U+200F, U+202A–U+202E, U+2066–U+2069,
+/// U+FEFF and every other `Cf` code point.
+pub fn contains_format_or_bidi(s: &str) -> bool {
+    s.chars().any(|c| {
+        // \u{200B}..\u{200F}: zero-width space, ZW non-joiner/joiner, LRM, RLM.
+        // \u{202A}..\u{202E}: LRE/RLE/PDF/LRO/RLO (bidi embedding/direction).
+        // \u{2066}..\u{2069}: LRI/RLI/FSI/PDI (bidi isolation).
+        // \u{FEFF} and the general category Cf cover the rest (soft hyphen,
+        // zero-width no-break space, tag characters, etc.).
+        matches!(c, '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+            || is_format_category(c)
+    })
+}
+
+fn is_format_category(c: char) -> bool {
+    // General category `Cf` (Format).  Rust's std has no public category API,
+    // so we match the specific ranges that make up `Cf`, plus the explicit
+    // code points above, to be conservative and not reject legitimate scripts.
+    // Cf = U+00AD, U+0600..05, U+061C, U+06DD, U+070F, U+0890..91, U+08E2,
+    //      U+180E, U+200B..0F, U+202A..2E, U+2060..64, U+2066..6F,
+    //      U+FEFF, U+FFF9..FB, U+110BD, U+110CD, U+13430..38, ...
+    matches!(
+        c,
+        '\u{00AD}'                       // soft hyphen
+            | '\u{061C}'                 // Arabic letter mark
+            | '\u{180E}'                 // Mongolian vowel separator
+            | '\u{2060}'..='\u{2064}'    // word joiner, invisible operators
+            | '\u{FEFF}'                 // zero-width no-break space (BOM)
+            | '\u{FFF9}'..='\u{FFFB}'    // interlinear annotation chars
+    )
+}
+
+/// Escape a value before it goes into a spreadsheet cell, so a finding's text
+/// cannot be interpreted as a CSV/formula injection.
+///
+/// Spreadsheet apps treat a cell starting with `=`, `+`, `-`, `@`, or a tab or
+/// carriage return, as a formula or directive.  Prefix such a value with `'`
+/// (a text marker) so it stays inert text.  This is the helper the report
+/// build (T024) calls for every untrusted field it drops into a cell; it must
+/// also quote values containing `,`, `"`, `\n` per its own CSV quoting rules.
+pub fn sanitize_for_spreadsheet(value: &str) -> String {
+    let first = value.chars().next();
+    let needs_prefix =
+        matches!(first, Some('=' | '+' | '-' | '@' | '\t' | '\r')) || value.starts_with('\u{FEFF}');
+    if needs_prefix {
+        let mut out = String::with_capacity(value.len() + 1);
+        out.push('\'');
+        out.push_str(value);
+        out
+    } else {
+        value.to_string()
+    }
 }
 
 enum Collect {
@@ -426,8 +525,12 @@ fn spawn_and_collect(
     start: std::time::Instant,
 ) -> Collect {
     let mut cmd = Command::new(&interpreter);
+    // `-I` (isolated) ignores PYTHON* env vars and user site-packages; `-u`
+    // (unbuffered) makes stdout flush so we can read findings as they come.
+    // Both go BEFORE the script path so they are interpreter options, never
+    // part of the script's argv.
+    cmd.args(["-I", "-u"]);
     cmd.arg(script);
-    cmd.args(["-u"]);
     cmd.current_dir(workdir);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -455,23 +558,29 @@ fn spawn_and_collect(
         Err(e) => return Collect::Spawn(e.to_string()),
     };
 
-    // Write stdin (bounded), then close it so the script sees EOF.
-    {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            let to_write = payload.len().min(STDIN_HEADER_BYTES);
-            let _ = stdin.write_all(&payload[..to_write]);
-        }
-    }
-
     // Drain stdout and stderr on their own threads (bounded).  Each thread sends
     // its bytes over a channel when the pipe closes, so the main loop can see
     // "child + both pipes done" without ever blocking on a join while a child
-    // that forked a grandchild keeps a pipe open.
+    // that forked a grandchild keeps a pipe open.  These MUST start before the
+    // stdin write below: a script that never reads stdin would otherwise block
+    // us on a full pipe.
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let stdout_thread = spawn_reader(child.stdout.take(), MAX_OUTPUT_BYTES, stdout_tx);
     let stderr_thread = spawn_reader(child.stderr.take(), MAX_OUTPUT_BYTES, stderr_tx);
+
+    // Write stdin on its own thread so a full pipe (a script that never reads
+    // its input) can never stall the parent; the time limit below still holds
+    // and kills the whole group.  A broken pipe (early exit) is ignored.
+    let stdin_payload = payload.to_vec();
+    let mut child_stdin = child.stdin.take();
+    let stdin_thread = std::thread::spawn(move || {
+        use std::io::Write;
+        if let Some(mut stdin) = child_stdin.take() {
+            let _ = stdin.write_all(&stdin_payload);
+        }
+        // Dropping `stdin` here closes the child's stdin, signalling EOF.
+    });
 
     let limit_ms = spec.timeout.as_millis() as u64;
     let mut status = None;
@@ -529,6 +638,9 @@ fn spawn_and_collect(
                 std::thread::sleep(Duration::from_millis(10));
             }
             let _ = child.wait();
+            // Don't wait on the stdin writer here: a never-reading script keeps
+            // the pipe open, and we are tearing the process group down anyway.
+            let _ = stdin_thread.join();
             let stderr = stderr_bytes.unwrap_or_default();
             return Collect::TimedOut {
                 limit_ms,
@@ -539,6 +651,7 @@ fn spawn_and_collect(
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    let _ = stdin_thread.join();
     let stdout_bytes = stdout_bytes.unwrap_or_default();
     let stderr_bytes = stderr_bytes.unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
@@ -703,5 +816,53 @@ mod tests {
         assert_eq!(scrubbed["run_id"], "r");
         assert!(scrubbed["nested"]["password"].is_null());
         assert_eq!(scrubbed["nested"]["keep"], "ok");
+    }
+
+    #[test]
+    fn format_and_bidi_characters_are_detected() {
+        // Explicit bidi/format controls.
+        for c in [
+            '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert!(
+                contains_format_or_bidi(&c.to_string()),
+                "{c:?} should be rejected"
+            );
+        }
+        // Other Cf category code points.
+        assert!(contains_format_or_bidi("\u{00AD}")); // soft hyphen
+        assert!(contains_format_or_bidi("\u{061C}")); // Arabic letter mark
+        assert!(contains_format_or_bidi("\u{2060}")); // word joiner
+                                                      // Plain text is fine.
+        assert!(!contains_format_or_bidi("normal text"));
+        assert!(!contains_format_or_bidi("café")); // non-ASCII letter, not Cf
+    }
+
+    #[test]
+    fn finding_with_bidi_char_is_rejected() {
+        let f = Finding {
+            id: "x".into(),
+            severity: Severity::Info,
+            table: None,
+            message: "evil\u{202E}payload".into(),
+        };
+        assert!(validate_finding(&f).is_err());
+    }
+
+    #[test]
+    fn spreadsheet_sanitizer_escapes_prefixes() {
+        for (raw, expected) in [
+            ("=SUM(A1)", "'=SUM(A1)"),
+            ("+cmd", "'+cmd"),
+            ("-cmd", "'-cmd"),
+            ("@cmd", "'@cmd"),
+            ("\tnasty", "'\tnasty"),
+            ("\rreturn", "'\rreturn"),
+            ("\u{FEFF}boom", "'\u{FEFF}boom"),
+            ("safe value", "safe value"),
+            ("-40", "'-40"), // negative numbers still need the text marker
+        ] {
+            assert_eq!(sanitize_for_spreadsheet(raw), expected, "for {raw:?}");
+        }
     }
 }
