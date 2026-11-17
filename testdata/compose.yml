@@ -79,6 +79,36 @@ services:
     # Postgres 18 images keep their data one level up.
     volumes: ["dmux-new18:/var/lib/postgresql"]
 
+  # TLS-only database (T052): Postgres 17 with ssl=on and a hostssl-only
+  # pg_hba, for the M4/M9 TLS tests. Behind the `tls` profile so the default
+  # `up` is unchanged. Certificates come from testdata/tls/out/ (run
+  # testdata/tls/make-certs.sh first); the pg_hba.conf is committed next to
+  # that script. The keys are owned by the container's postgres uid (999).
+  tls:
+    <<: *common
+    profiles: ["tls"]
+    image: docker.io/library/postgres:17
+    container_name: dmux-tls
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
+      - -c
+      - ssl_ca_file=/certs/ca.crt
+      - -c
+      - hba_file=/etc/pg_hba.conf
+    ports: ["127.0.0.1:5439:5432"]
+    volumes:
+      - dmux-tls:/var/lib/postgresql/data
+      - ./tls/out/server.crt:/certs/server.crt:ro
+      - ./tls/out/server.key:/certs/server.key:ro
+      - ./tls/out/ca.crt:/certs/ca.crt:ro
+      - ./tls/pg_hba.conf:/etc/pg_hba.conf:ro
+
 volumes:
   dmux-old:
   dmux-new:
@@ -86,3 +116,4 @@ volumes:
   dmux-new12:
   dmux-new15:
   dmux-new18:
+  dmux-tls:
