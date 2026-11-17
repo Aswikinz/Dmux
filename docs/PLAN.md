@@ -1,6 +1,6 @@
 # Dmux – Project Plan
 
-Version of 16 November 2026. The owner approves changes to this file; agents propose them through Maya.
+Version of 17 November 2026 (updated for v1.0.0; see DECISIONS 23–28). The owner approves changes to this file; agents propose them through Maya.
 
 Dmux is a desktop app that proves a PostgreSQL migration copied every row and value, built for people who do not write SQL. This plan was rewritten after a full review: the comparison method, the testing approach and the build order all changed to close the risks listed in section 2.
 
@@ -64,9 +64,9 @@ A verification tool has one unforgivable failure: saying PASS when the data diff
 
 | Challenge | What goes wrong | How Dmux handles it |
 | --- | --- | --- |
-| The laptop cannot reach the database | Production databases sit behind jump servers | A command-line runner with the same engine runs on the jump server; its results file opens in the desktop app |
+| The laptop cannot reach the database | Production databases sit behind jump servers | A command-line runner with the same engine runs on the jump server and renders the PDF and Excel reports from its results file; opening that file in the desktop app is planned after version 1.0 |
 | Locked-down PCs | Unsigned installers are blocked, users have no admin rights, machines are offline | Signed builds, a per-user installer, a portable build, an offline installer, no auto-update and no telemetry |
-| Old servers and odd logins | Self-signed certificates, old encryption, Kerberos | Dmux shows the certificate fingerprint to trust once; an unencrypted connection needs a visible choice that is recorded in the report; Kerberos login is not supported in version 1 |
+| Old servers and odd logins | Self-signed certificates, a bank's private certificate authority, old encryption, Kerberos | Dmux accepts the bank's CA file and still checks the host name; otherwise it shows the certificate fingerprint to trust once; an unencrypted connection needs a visible choice that is recorded in the report; Kerberos login is not supported in version 1 |
 | Remote desktops and weak graphics | Blur effects stutter over remote desktop and on Linux | A "reduced effects" theme with solid panels switches on automatically when blur is slow |
 | Runs that take hours | The laptop sleeps, the VPN drops, the app is closed | Results are saved per table as they finish; a run resumes where it stopped; sleep is blocked during a run |
 | Sensitive data in reports | Account numbers appear in the list of differing rows | Row values are shown on screen only; reports include keys only when ticked; local history can be purged |
@@ -136,7 +136,7 @@ The same rule runs on both sides, and every rule is covered by the cross-version
 | Extension and unknown types | Printed form, with a warning in the report |
 | NULL | Its own marker, never equal to an empty value |
 
-The user may tick four recorded options per column: ignore trailing spaces, treat NULL and empty as the same, compare the date only, or round to a set number of decimals. Each ticked option is listed in the report. Free-form SQL is not accepted.
+The user may tick four recorded options per column: ignore trailing spaces, treat NULL and empty as the same, compare the date only, or round to a set number of decimals. Each ticked option is listed per column in the results and on the report's first page, and a PASS that relied on one reads "PASS (with options)". Free-form SQL is not accepted.
 
 ### 3.3 Saved fingerprints
 
@@ -144,11 +144,12 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 
 - This covers in-place upgrades, where the old server is stopped before the new one starts, and networks where one machine cannot reach both databases.
 - The mapping must be fixed at capture time. An in-place upgrade keeps every name, so the identity mapping works.
+- Every file records the version of the normalisation rules it was captured with. A file made under other rules, or one that does not say, is refused and must be captured again; a file made by another Dmux release with the same rules is accepted with a warning. Dmux recomputes from the file's own column types which tables need review, and refuses a file whose stored flag says otherwise. Files over 64 MiB are refused.
 - Without a live old database, Dmux reports which tables and how many buckets differ, but cannot list the rows.
 
 ### 3.4 Consistency and the independent spot check
 
-- **Change detection.** Before and after each table, Dmux reads that table's insert, update and delete counters. If they moved, the result is "changed during check". The write-ahead log position is recorded at the start and end of every run.
+- **Change detection.** Before and after each table, Dmux reads that table's insert, update and delete counters. If they moved, the result is "changed during check". Where the counters cannot work (`track_counts` off, or a foreign table), the table is NEEDS REVIEW, "change detection unavailable", and is not reused on resume. On a replica, a replay position that moves during a table marks it changed during check. The write-ahead log position is recorded at the start and end of every run.
 - **Spot check.** For each keyed table, Dmux fetches 200 rows by key from both sides and compares them value by value in the app, without using the hash path. A disagreement between the spot check and the fingerprint is reported as a tool fault, not a data result.
 
 ## 4. Features
@@ -157,7 +158,8 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 
 - Saved profiles with host, port, database, user and encryption mode, each marked **Old database** or **New database**.
 - **Test connection** reports the server version, text encoding, encryption state, whether the login can write or is a superuser, whether a pooler sits in between, and whether `md5` works.
-- Passwords live in the operating system's keychain. Where no keychain exists, Dmux asks for the password at each run.
+- Passwords live in the operating system's keychain. Where no keychain exists, a password the user types is kept in memory for that app session only, bound to the exact connection details it was typed for, and forgotten when those details change, the profile is deleted or the app closes. Run definition files never hold a password; the command-line runner reads it from an environment variable.
+- Encryption can use the bank's own certificate authority: a CA file on the profile, or `--ca-file` / `ca_file` on the command line.
 - The setup guide gives administrators a short script that creates a `dmux_reader` login with SELECT rights only.
 
 ### 4.2 Inventory and schema diff
@@ -177,7 +179,8 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 
 ### 4.3 Mapping
 
-- Rules come first: old schema to new schema, and prefix or suffix renames. One rule can map hundreds of tables.
+- Rules come first: old schema to new schema, and prefix or suffix renames. Rules apply to table names only, never to columns. One rule can map hundreds of tables.
+- Two old tables, or two old columns, mapping to the same new target are refused.
 - Then names are matched exactly, then ignoring case. When ignoring case is ambiguous, Dmux asks.
 - Fuzzy matches are only suggestions, shown with a confidence score, and each needs a tick.
 - The user works through a "needs attention" queue, not a thousand-row board. A picker or drag and drop fixes a single match.
@@ -187,7 +190,7 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 ### 4.4 Choosing checks
 
 - Each table gets a level: Structure, Counts and totals, or Full values.
-- Presets cover the common cases, such as "full values for everything" or "counts for all, full values for selected tables".
+- Presets reassign every table's level in one step: the suggested levels, full values for every table, counts and totals for every table (then pick tables for full values), or structure only. Changing one table by hand makes the plan custom.
 - Tables can be selected by schema, name pattern or size.
 - Dmux suggests control-total columns, such as number columns whose names contain `amt` or `bal`, and the user confirms them.
 
@@ -211,19 +214,19 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 - The overall verdict and coverage line come first, then tables with failures at the top.
 - Each failure card says what is wrong, how big the gap is and what to do next, for example "The new database has 12 fewer rows than the old one in the transaction history table".
 - The drill-down view lists missing, extra and changed rows, with the differing columns side by side.
-- Exports: a PDF summary with a sign-off block, and an Excel file with the detail. Lists longer than Excel's 1,048,576-row limit go to CSV.
+- Exports: a PDF summary with a sign-off block, and an Excel file with the detail. Lists longer than Excel's 1,048,576-row limit go to CSV. In the desktop app the Report screen saves either file through the system's save dialog; the file is rendered from the app's own verified copy of the finished run's results, readable by its owner only, and includes row keys only when the user ticks that option.
 - The run log records the user, time, tool version, profiles, mapping version, options ticked and every query sent.
 
 ### 4.8 Command-line runner
 
 - `dmux capture`, `dmux compare` and `dmux run <definition file>` use the same engine as the app.
 - Exit codes are 0 for pass, 1 for fail and 2 for warnings, so runs can be scripted.
-- A results file written on a jump server opens in the desktop app for review and reporting.
+- `dmux report` renders the PDF and Excel reports from a results file written on a jump server, after checking its SHA-256. Opening that file in the desktop app for review is planned after version 1.0.
 
 ### 4.9 Python hooks
 
 - A script receives the run's results as JSON and returns extra findings, which appear in the report marked as custom checks.
-- Scripts never receive database passwords or connections.
+- Scripts never receive database passwords or connections. They are not sandboxed: a script runs with the user's full permissions, Dmux says so whenever hooks run, and a script that other users can change is refused.
 - Hooks are off by default. Each script's hash is recorded in the run log, and scripts run with a time limit.
 - The Windows build ships its own Python, and the Flatpak uses the Python in its runtime.
 
@@ -267,7 +270,7 @@ These rules bind every agent and every release. The security reviewer checks eac
 4. **Gentle on the server.** Statement timeout, 5-second lock timeout, a parallel-scan limit and working Cancel.
 5. **Secrets stay secret.** Passwords are never written to SQLite, logs, reports, error messages or the UI's state.
 6. **No row data leaves the machine.** Logs and reports hold counts, hashes and names. Row values appear on screen only, and keys are exported only when the user ticks the option.
-7. **Encryption is visible.** Dmux tries a verified encrypted connection first. An untrusted certificate is shown by fingerprint for the user to trust once. An unencrypted connection needs an explicit choice, which is recorded in the report.
+7. **Encryption is visible.** Dmux tries a verified encrypted connection first. An untrusted certificate is shown by fingerprint for the user to trust once. A bank's private certificate authority can be supplied as a CA file; host names are still checked. An unencrypted connection needs an explicit choice, which is recorded in the report.
 8. **No network calls** except to the configured databases. No telemetry and no auto-update.
 9. **Tight app permissions.** Tauri capabilities allow only the commands the UI needs, with a strict content security policy and no remote content.
 10. **Verifiable releases.** Signed installers, SHA-256 checksums, a software bill of materials, and build actions pinned to exact commits.
@@ -287,16 +290,16 @@ The app is a guided, step-by-step flow, so a non-technical user always knows whe
 4. **Choose checks.** Pick levels and tables, with a live time estimate.
 5. **Run.** Progress per table, time remaining, Pause and Cancel.
 6. **Results.** Verdict and coverage first, failures at the top.
-7. **Report.** Export the PDF and Excel files.
+7. **Report.** Save the PDF and Excel files through the system's save dialog.
 
 Run history, scripts and settings sit below the steps.
 
 **Design rules.**
 
-- Glassmorphic look: frosted panels with a 16px blur over a soft gradient, and a thin light border.
-- Panels stay at least 70% opaque behind text, so contrast meets WCAG AA (4.5:1) in light and dark themes.
-- **Reduced effects theme.** Solid panels with the same layout. It switches on automatically when blur renders slowly, such as over remote desktop, and the design must look finished in this theme too.
-- Status never relies on colour alone. Every PASS, FAIL, WARNING and "changed during check" carries an icon and a word.
+- An Apple-style look built on the app icon's colours: white and light grey surfaces with indigo-blue accents and the icon's teal for completed steps, a translucent sidebar with the app icon, grouped cards, large step titles with a one-line explanation, and short, subtle motion that is switched off when the system asks for reduced motion. Light and dark modes.
+- Panels stay at least 70% opaque behind text, so contrast meets WCAG AA (4.5:1) in light and dark themes. An automated accessibility check runs on every step in both modes.
+- **Reduced effects theme.** Solid panels with the same layout, without translucency or shadows. It switches on automatically when blur renders slowly, such as over remote desktop, and the design must look finished in this theme too.
+- Status never relies on colour alone. Every verdict carries an icon and a word, spelled the same everywhere: PASS, FAIL, WARNING, NEEDS REVIEW, CHANGED DURING CHECK, TOOL FAULT, WIDELY DIFFERENT. The overall verdict is stated prominently, with one plain sentence, as soon as a run ends.
 - Plain words everywhere: "old database" and "new database", never "source DSN". Any technical term gets a one-line explanation on hover.
 - Scale first. Every list is virtualised, searchable and filterable, and every bulk action works on a selection.
 - The whole flow works by keyboard, including mapping.
