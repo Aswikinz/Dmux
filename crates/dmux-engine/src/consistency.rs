@@ -1,20 +1,20 @@
-//! Consistency and the independent spot check (PLAN.md 3.4).
+//! Consistency (PLAN.md 3.4): change counters and the WAL position.
 //!
-//! * **Change detection**: read `pg_stat_user_tables.n_tup_ins/upd/del` before
-//!   and after each table's scan (9.4-safe).  If any counter moved, the table's
-//!   verdict is CHANGED_DURING_CHECK and can never PASS.
-//! * **WAL position**: recorded at run start/end with the version-branched
-//!   function (`pg_current_wal_lsn` on 10+, `pg_current_xlog_location` before).
-//! * **Spot check**: for keyed tables, fetch 200 rows by key from both sides
-//!   (bound parameters, deterministic key selection that does not depend on
-//!   text sort order) and compare their normalised values in the app, without
-//!   the hash path.  A disagreement with the fingerprint verdict is a TOOL_FAULT.
+//! * **Change detection**: `pg_stat_user_tables.n_tup_ins/upd/del` (9.4-safe)
+//!   is read for every table before the scans and after them; a table whose
+//!   counters moved is CHANGED_DURING_CHECK and can never PASS.  These are
+//!   server statistics, flushed by each writing backend with a short delay
+//!   (up to about a second), so a write committed in the last moment before the
+//!   final read may not be visible yet; the DBA guide's advice to run on a
+//!   frozen source or a replica is the backstop.
+//! * **WAL position**: recorded at run start and end and per finished table,
+//!   version-branched, and replica-safe.
+//!
+//! The independent spot check lives in `run::spot`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_postgres::Transaction;
-
-use crate::ident::quote_qualified;
 
 /// Errors from consistency queries.
 #[derive(Debug, Error)]
@@ -85,22 +85,37 @@ pub struct WalPosition {
     pub function: String,
 }
 
+/// The SQL that reads the WAL position for a server version.  On a primary it
+/// is the current insert position; on a replica (in recovery, where
+/// `pg_current_wal_lsn()` raises an error) it is the last replayed position,
+/// so a run against a replica (the advice in the DBA guide) never aborts here.
+pub fn wal_position_sql(version_num: i32) -> (&'static str, &'static str) {
+    if version_num >= 100000 {
+        (
+            "pg_current_wal_lsn",
+            "SELECT CASE WHEN pg_catalog.pg_is_in_recovery() \
+             THEN pg_catalog.pg_last_wal_replay_lsn()::pg_catalog.text \
+             ELSE pg_catalog.pg_current_wal_lsn()::pg_catalog.text END",
+        )
+    } else {
+        (
+            "pg_current_xlog_location",
+            "SELECT CASE WHEN pg_catalog.pg_is_in_recovery() \
+             THEN pg_catalog.pg_last_xlog_replay_location()::pg_catalog.text \
+             ELSE pg_catalog.pg_current_xlog_location()::pg_catalog.text END",
+        )
+    }
+}
+
 /// Read the current WAL position, version-branched.  `version_num` is the
 /// server's `server_version_num` (e.g. 90624 for 9.6, 170000 for 17).
 pub async fn read_wal_position(
     txn: &Transaction<'_>,
     version_num: i32,
 ) -> Result<WalPosition, ConsistencyError> {
-    let function = if version_num >= 100000 {
-        "pg_current_wal_lsn"
-    } else {
-        "pg_current_xlog_location"
-    };
-    // Both functions exist only on their side of the 10 boundary; a permission
-    // failure or older minor that lacks it degrades to None, never an abort.
-    let query = format!("SELECT pg_catalog.{function}()::pg_catalog.text");
+    let (function, sql) = wal_position_sql(version_num);
     let lsn = txn
-        .query_opt(&query, &[])
+        .query_opt(sql, &[])
         .await?
         .and_then(|r| r.try_get::<_, Option<String>>(0).ok())
         .flatten();
@@ -108,49 +123,6 @@ pub async fn read_wal_position(
         lsn,
         function: function.to_string(),
     })
-}
-
-/// The number of rows the spot check fetches per keyed table (PLAN.md 3.4).
-pub const SPOT_CHECK_ROWS: u64 = 200;
-
-/// A deterministic, order-independent sample of key values for the spot check:
-/// key values whose `md5(key::text)` hash is the smallest N.  This selects the
-/// same rows on both sides regardless of text sort order, and never depends on
-/// `ORDER BY` over the data.  Keys are returned as their text form; the caller
-/// compares them side by side in the app.
-///
-/// `key_expr` is the single key column (the plan's first key column, or the
-/// row key hash for keyless tables which are skipped here).
-pub async fn sample_keys(
-    txn: &Transaction<'_>,
-    schema: &str,
-    table: &str,
-    key_column: &str,
-    limit: u64,
-) -> Result<Vec<Option<String>>, ConsistencyError> {
-    let qualified = quote_qualified(schema, table)?;
-    let key_ident = crate::ident::quote_ident(key_column)?;
-    let sql = format!(
-        "SELECT {key_ident}::pg_catalog.text AS k \
-         FROM {qualified} \
-         WHERE {key_ident} IS NOT NULL \
-         ORDER BY md5({key_ident}::pg_catalog.text) \
-         LIMIT $1"
-    );
-    let rows = txn.query(&sql, &[&(limit as i64)]).await?;
-    Ok(rows.into_iter().map(|r| r.try_get(0).ok()).collect())
-}
-
-/// Compare two sides' spot-check samples value by value.  Returns `Ok(true)`
-/// when every sampled key is present on both sides with the same normalised
-/// value, `Ok(false)` otherwise.  A missing key on one side or a differing value
-/// is a disagreement, which the caller turns into TOOL_FAULT.
-pub fn spot_check_agrees(old: &[Option<String>], new: &[Option<String>]) -> bool {
-    let mut o = old.to_vec();
-    let mut n = new.to_vec();
-    o.sort();
-    n.sort();
-    o == n
 }
 
 #[cfg(test)]
@@ -174,28 +146,20 @@ mod tests {
     }
 
     #[test]
-    fn wal_function_is_version_branched() {
-        // Pure helper: the function name is picked by the caller from version_num.
-        let pick = |n: i32| {
-            if n >= 100000 {
-                "pg_current_wal_lsn"
-            } else {
-                "pg_current_xlog_location"
-            }
-        };
-        assert_eq!(pick(90624), "pg_current_xlog_location");
-        assert_eq!(pick(170000), "pg_current_wal_lsn");
-        assert_eq!(pick(100000), "pg_current_wal_lsn");
-    }
-
-    #[test]
-    fn spot_check_agrees_on_same_values() {
-        let a = vec![Some("x".to_string()), None, Some("y".to_string())];
-        let mut b = a.clone();
-        assert!(spot_check_agrees(&a, &b));
-        b[0] = Some("z".to_string());
-        assert!(!spot_check_agrees(&a, &b));
-        let fewer = vec![Some("x".to_string()), None];
-        assert!(!spot_check_agrees(&a, &fewer));
+    fn wal_function_is_version_branched_and_replica_safe() {
+        assert_eq!(wal_position_sql(90624).0, "pg_current_xlog_location");
+        assert_eq!(wal_position_sql(170000).0, "pg_current_wal_lsn");
+        assert_eq!(wal_position_sql(100000).0, "pg_current_wal_lsn");
+        for v in [90400, 90624, 100000, 180000] {
+            let sql = wal_position_sql(v).1;
+            assert!(sql.contains("pg_is_in_recovery()"), "{v}");
+            assert!(!sql.contains('$'), "no interpolation");
+        }
+        assert!(wal_position_sql(90400)
+            .1
+            .contains("pg_last_xlog_replay_location"));
+        assert!(wal_position_sql(170000)
+            .1
+            .contains("pg_last_wal_replay_lsn"));
     }
 }

@@ -1,74 +1,84 @@
 //! The per-run resume store (PLAN.md 4.6): a bundled SQLite database that saves
-//! each table's verdict as it finishes, so a crashed or interrupted run resumes
+//! each table's result as it finishes, so a crashed or interrupted run resumes
 //! where it stopped.
 //!
+//! Resume is only safe when nothing has changed, so the store is keyed:
+//!
+//! * the store records the **run key** (run-definition hash, mapping hash, tool
+//!   version) and the run id.  [`Store::bind`] keeps the stored results and the
+//!   run id only when the key is identical; otherwise it clears every stored
+//!   table and starts a new run id;
+//! * every saved table carries the change counters of both sides and the WAL
+//!   position at the moment it finished.  The runner re-reads the counters on
+//!   resume and rescans the table if they moved;
+//! * only conclusive results are reused, and a row that cannot be read back is
+//!   reported as [`Loaded::Unreadable`], which the runner rescans; nothing is
+//!   ever silently dropped.  Every write error is returned to the caller.
+//!
 //! It **never** stores passwords or row values (rule 7): only counts, hashes,
-//! verdicts and column names.  Keys are stored only when the user ticked export,
-//! which is a caller decision reflected in the record.
+//! verdicts, names and reasons.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::core::fingerprint::BucketSummary;
-use crate::core::fingerprint::Decimal;
-use crate::results::{CheckLevel, Verdict};
+use crate::consistency::ChangeCounters;
+use crate::results::{CheckLevel, TableResult, Verdict};
 
 /// Errors from the resume store.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("could not encode a stored result: {0}")]
+    Encode(String),
 }
 
-/// One table's saved result (counts and digest only; no row values).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Store format version, recorded in `run_meta`; a store from another version
+/// is cleared rather than trusted.
+pub const STORE_VERSION: &str = "2";
+
+/// What a saved table result was computed against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct RunKey {
+    pub definition_hash: String,
+    pub mapping_hash: String,
+    pub tool_version: String,
+}
+
+/// One table's saved result (no row values).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct StoredTableResult {
     pub table: String,
     pub level: CheckLevel,
-    #[serde(with = "serde_verdict")]
-    pub verdict: Verdict,
-    pub old_rows: Option<u64>,
-    pub new_rows: Option<u64>,
-    pub bucket_digits: u8,
-    pub buckets_old: Option<Vec<BucketSummary>>,
-    pub buckets_new: Option<Vec<BucketSummary>>,
-    pub control_totals_old: Vec<Decimal>,
-    pub control_totals_new: Vec<Decimal>,
-    pub needs_review: bool,
-    pub reasons: Vec<String>,
+    pub result: TableResult,
+    /// Change counters of each side when the table finished.
+    pub counters_old: ChangeCounters,
+    pub counters_new: ChangeCounters,
+    /// New-side WAL position when the table finished.
+    pub wal_lsn: Option<String>,
 }
 
-mod serde_verdict {
-    use super::Verdict;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Verdict, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(match v {
-            Verdict::Pass => "PASS",
-            Verdict::Fail => "FAIL",
-            Verdict::WidelyDifferent => "WIDELY_DIFFERENT",
-            Verdict::NeedsReview => "NEEDS_REVIEW",
-            Verdict::ChangedDuringCheck => "CHANGED_DURING_CHECK",
-            Verdict::ToolFault => "TOOL_FAULT",
-            Verdict::Warning => "WARNING",
-        })
+impl StoredTableResult {
+    /// Only a result that reached a conclusion may be reused; a fault or a
+    /// changed-during-check result is always rescanned.
+    pub fn is_reusable(&self) -> bool {
+        matches!(
+            self.result.verdict,
+            Verdict::Pass | Verdict::Fail | Verdict::WidelyDifferent | Verdict::NeedsReview
+        )
     }
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Verdict, D::Error> {
-        let s = String::deserialize(d)?;
-        Ok(match s.as_str() {
-            "PASS" => Verdict::Pass,
-            "FAIL" => Verdict::Fail,
-            "WIDELY_DIFFERENT" => Verdict::WidelyDifferent,
-            "NEEDS_REVIEW" => Verdict::NeedsReview,
-            "CHANGED_DURING_CHECK" => Verdict::ChangedDuringCheck,
-            "TOOL_FAULT" => Verdict::ToolFault,
-            "WARNING" => Verdict::Warning,
-            _ => Verdict::ToolFault,
-        })
-    }
+/// The outcome of reading one stored table back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Loaded {
+    Missing,
+    /// A row exists but cannot be decoded: the runner must rescan the table.
+    Unreadable,
+    Found(Box<StoredTableResult>),
 }
 
 /// The resume store handle.
@@ -76,43 +86,40 @@ pub struct Store {
     conn: Connection,
 }
 
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS run_meta (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS table_results (
+         table_name TEXT PRIMARY KEY,
+         json TEXT NOT NULL
+     );";
+
 impl Store {
     /// Open (or create) the store at `path`, with the schema created if needed.
     pub fn open(path: &std::path::Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS run_meta (
-                 key TEXT PRIMARY KEY,
-                 value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS table_results (
-                 table_name TEXT PRIMARY KEY,
-                 json TEXT NOT NULL
-             );",
-        )?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
 
     /// Open an in-memory store (tests).
     pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE run_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE table_results (table_name TEXT PRIMARY KEY, json TEXT NOT NULL);",
-        )?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Store { conn })
     }
 
     /// Read a run-metadata value.
     pub fn meta(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let mut stmt = self
+        Ok(self
             .conn
-            .prepare("SELECT value FROM run_meta WHERE key = ?1")?;
-        let mut rows = stmt.query(params![key])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row.get(0)?)),
-            None => Ok(None),
-        }
+            .query_row(
+                "SELECT value FROM run_meta WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Write a run-metadata value.
@@ -125,11 +132,34 @@ impl Store {
         Ok(())
     }
 
+    /// Bind the store to a run key and return the run id to use.
+    ///
+    /// When the stored key (and store version) equals `key`, the stored run id
+    /// is returned and the saved tables are kept for resume.  Otherwise every
+    /// saved table is cleared, `new_run_id` is recorded with the key, and it is
+    /// returned.
+    pub fn bind(&self, key: &RunKey, new_run_id: &str) -> Result<String, StoreError> {
+        let same = self.meta("store_version")?.as_deref() == Some(STORE_VERSION)
+            && self.meta("definition_hash")?.as_deref() == Some(key.definition_hash.as_str())
+            && self.meta("mapping_hash")?.as_deref() == Some(key.mapping_hash.as_str())
+            && self.meta("tool_version")?.as_deref() == Some(key.tool_version.as_str());
+        if same {
+            if let Some(id) = self.meta("run_id")? {
+                return Ok(id);
+            }
+        }
+        self.clear_tables()?;
+        self.set_meta("store_version", STORE_VERSION)?;
+        self.set_meta("definition_hash", &key.definition_hash)?;
+        self.set_meta("mapping_hash", &key.mapping_hash)?;
+        self.set_meta("tool_version", &key.tool_version)?;
+        self.set_meta("run_id", new_run_id)?;
+        Ok(new_run_id.to_string())
+    }
+
     /// Save one finished table's result.
     pub fn save_table(&self, result: &StoredTableResult) -> Result<(), StoreError> {
-        let json = serde_json::to_string(result).map_err(|e| {
-            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })?;
+        let json = serde_json::to_string(result).map_err(|e| StoreError::Encode(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO table_results(table_name, json) VALUES(?1, ?2)
              ON CONFLICT(table_name) DO UPDATE SET json = excluded.json",
@@ -138,23 +168,31 @@ impl Store {
         Ok(())
     }
 
-    /// Load every saved table result.
-    pub fn load_tables(&self) -> Result<Vec<StoredTableResult>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT json FROM table_results")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let json = row?;
-            out.push(serde_json::from_str(&json).map_err(|e| {
-                StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?);
-        }
-        Ok(out)
+    /// Read one table back.  A row that fails to decode is
+    /// [`Loaded::Unreadable`], never an error that drops the table.
+    pub fn load_table(&self, table: &str) -> Result<Loaded, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json FROM table_results WHERE table_name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match json {
+            None => Loaded::Missing,
+            Some(j) => match serde_json::from_str::<StoredTableResult>(&j) {
+                Ok(s) if s.table == table => Loaded::Found(Box::new(s)),
+                _ => Loaded::Unreadable,
+            },
+        })
     }
 
-    /// The set of table names already finished (for `--resume` skip).
+    /// The names of every table with a saved row (readable or not).
     pub fn finished_tables(&self) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT table_name FROM table_results")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT table_name FROM table_results ORDER BY table_name")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -168,53 +206,131 @@ impl Store {
         self.conn.execute("DELETE FROM table_results", [])?;
         Ok(())
     }
+
+    /// Overwrite a stored row with arbitrary text (tests: corrupt a row).
+    #[doc(hidden)]
+    pub fn put_raw(&self, table: &str, json: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO table_results(table_name, json) VALUES(?1, ?2)
+             ON CONFLICT(table_name) DO UPDATE SET json = excluded.json",
+            params![table, json],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample() -> StoredTableResult {
+    fn key(d: &str) -> RunKey {
+        RunKey {
+            definition_hash: d.into(),
+            mapping_hash: "m".into(),
+            tool_version: "0.0.1".into(),
+        }
+    }
+
+    fn stored(table: &str, verdict: Verdict) -> StoredTableResult {
         StoredTableResult {
-            table: "demo_bank.accounts".into(),
+            table: table.into(),
             level: CheckLevel::FullValues,
-            verdict: Verdict::Fail,
-            old_rows: Some(100),
-            new_rows: Some(99),
-            bucket_digits: 3,
-            buckets_old: Some(vec![BucketSummary {
-                bucket: 0,
-                n: 1,
-                s: [0; 4],
-            }]),
-            buckets_new: None,
-            control_totals_old: vec![Decimal::parse("1.5").unwrap()],
-            control_totals_new: vec![Decimal::parse("1.5").unwrap()],
-            needs_review: false,
-            reasons: vec!["counts differ".into()],
+            result: TableResult {
+                table: table.into(),
+                level: CheckLevel::FullValues,
+                verdict,
+                old_rows: Some(100),
+                new_rows: Some(99),
+                columns_covered: Some(vec!["id".into()]),
+                differing_buckets: Some(1),
+                missing_buckets: Some(0),
+                extra_buckets: Some(0),
+                missing_rows: Some(1),
+                extra_rows: Some(0),
+                changed_rows: Some(0),
+                reasons: vec!["row counts differ".into()],
+            },
+            counters_old: ChangeCounters::default(),
+            counters_new: ChangeCounters {
+                n_tup_ins: 1,
+                n_tup_upd: 2,
+                n_tup_del: 3,
+            },
+            wal_lsn: Some("0/16B3748".into()),
         }
     }
 
     #[test]
-    fn round_trips_tables_and_meta() {
-        let store = Store::open_memory().unwrap();
-        store.set_meta("run_id", "abc123").unwrap();
-        assert_eq!(store.meta("run_id").unwrap().as_deref(), Some("abc123"));
-
-        store.save_table(&sample()).unwrap();
-        let loaded = store.load_tables().unwrap();
-        assert_eq!(loaded, vec![sample()]);
-        assert_eq!(store.finished_tables().unwrap(), vec!["demo_bank.accounts"]);
-
-        store.clear_tables().unwrap();
-        assert!(store.load_tables().unwrap().is_empty());
+    fn round_trips_a_table() {
+        let s = Store::open_memory().unwrap();
+        s.save_table(&stored("s.a", Verdict::Fail)).unwrap();
+        assert_eq!(
+            s.load_table("s.a").unwrap(),
+            Loaded::Found(Box::new(stored("s.a", Verdict::Fail)))
+        );
+        assert_eq!(s.load_table("s.b").unwrap(), Loaded::Missing);
+        assert_eq!(s.finished_tables().unwrap(), vec!["s.a"]);
     }
 
     #[test]
-    fn stores_no_password_or_row_values_by_construction() {
-        // The schema has only table_name + json; the json holds counts/hashes.
-        let json = serde_json::to_string(&sample()).unwrap();
-        assert!(json.contains("counts"));
-        assert!(!json.contains("secret_row_value"));
+    fn run_id_is_stable_for_the_same_key_and_new_for_another() {
+        let s = Store::open_memory().unwrap();
+        let id1 = s.bind(&key("d1"), "run-1").unwrap();
+        assert_eq!(id1, "run-1");
+        s.save_table(&stored("s.a", Verdict::Pass)).unwrap();
+        // Same key: the stored id and tables survive, the proposed id is ignored.
+        assert_eq!(s.bind(&key("d1"), "run-2").unwrap(), "run-1");
+        assert_eq!(s.finished_tables().unwrap(), vec!["s.a"]);
+        // Any key difference: tables cleared, new id.
+        assert_eq!(s.bind(&key("d2"), "run-3").unwrap(), "run-3");
+        assert!(s.finished_tables().unwrap().is_empty());
+        let mut k = key("d2");
+        k.tool_version = "9.9.9".into();
+        s.save_table(&stored("s.a", Verdict::Pass)).unwrap();
+        assert_eq!(s.bind(&k, "run-4").unwrap(), "run-4");
+        assert!(s.finished_tables().unwrap().is_empty());
+        let mut k = key("d2");
+        k.mapping_hash = "other".into();
+        assert_eq!(s.bind(&k, "run-5").unwrap(), "run-5");
+    }
+
+    #[test]
+    fn an_unreadable_row_is_reported_not_dropped() {
+        let s = Store::open_memory().unwrap();
+        s.put_raw("s.a", "{not json").unwrap();
+        assert_eq!(s.load_table("s.a").unwrap(), Loaded::Unreadable);
+        // A row stored under another table's name is not trusted either.
+        s.put_raw(
+            "s.b",
+            &serde_json::to_string(&stored("s.x", Verdict::Pass)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(s.load_table("s.b").unwrap(), Loaded::Unreadable);
+        assert_eq!(s.finished_tables().unwrap(), vec!["s.a", "s.b"]);
+    }
+
+    #[test]
+    fn only_conclusive_results_are_reusable() {
+        assert!(stored("s.a", Verdict::Pass).is_reusable());
+        assert!(stored("s.a", Verdict::Fail).is_reusable());
+        assert!(!stored("s.a", Verdict::ToolFault).is_reusable());
+        assert!(!stored("s.a", Verdict::ChangedDuringCheck).is_reusable());
+        assert!(!stored("s.a", Verdict::Warning).is_reusable());
+    }
+
+    #[test]
+    fn save_errors_are_returned() {
+        let s = Store::open_memory().unwrap();
+        s.conn.execute_batch("DROP TABLE table_results").unwrap();
+        assert!(s.save_table(&stored("s.a", Verdict::Pass)).is_err());
+        assert!(s.load_table("s.a").is_err());
+    }
+
+    #[test]
+    fn stores_no_row_values_by_construction() {
+        let json = serde_json::to_string(&stored("s.a", Verdict::Pass)).unwrap();
+        for field in ["counters_old", "result", "wal_lsn"] {
+            assert!(json.contains(field));
+        }
     }
 }
