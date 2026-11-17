@@ -26,6 +26,16 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio_postgres::GenericClient;
 
+/// The version of the normalisation rules: the SQL this module emits for each
+/// type, option and type pair.  Every fingerprint file records it, and a file
+/// captured under any other rules version is refused (decision 23, audit H3),
+/// because its hashes mean something else.
+///
+/// **Bump this whenever a change here alters the SQL that `plan_column` or
+/// `side_expr` emits for any input** (a new type rule, a changed cast, a new
+/// option), even when the change looks harmless.
+pub const NORMALISE_RULES_VERSION: u32 = 1;
+
 /// A declared column type, parsed from `format_type()` output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PgType {

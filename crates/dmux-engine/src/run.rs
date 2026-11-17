@@ -1891,6 +1891,7 @@ mod tests {
         let file = crate::fingerprint_file::FingerprintFile {
             format_version: crate::fingerprint_file::FINGERPRINT_VERSION,
             tool_version: String::new(),
+            normalise_rules_version: Some(crate::core::normalise::NORMALISE_RULES_VERSION),
             mapping_hash: c.mapping.mapping_hash.clone(),
             server: crate::fingerprint_file::CapturedServer {
                 version_num: 170000,
