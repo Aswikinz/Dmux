@@ -1,7 +1,7 @@
 {
   "name": "dmux-verify",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Dmux — proves a PostgreSQL migration copied every row and value (Phase 0 skeleton)",
   "type": "module",
   "packageManager": "pnpm@12.21.0",
@@ -11,18 +11,28 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:ui": "playwright test",
     "test:e2e": "wdio run e2e/wdio.conf.ts",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
+    "@tanstack/react-virtual": "^3.14.26",
+    "@tauri-apps/api": "2.12.5",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.73.0",
     "react": "19.3.1",
-    "react-dom": "19.3.1"
+    "react-dom": "19.3.1",
+    "tailwind-merge": "^3.7.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
     "@eslint/js": "10.0.1",
+    "@playwright/test": "1.65.1",
     "@tailwindcss/vite": "4.3.5",
     "@tauri-apps/cli": "2.12.4",
     "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "16.3.3",
     "@types/mocha": "10.0.10",
     "@types/node": "26.6.6",

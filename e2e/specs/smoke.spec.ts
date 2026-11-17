@@ -1,17 +1,20 @@
 import { browser, $, expect } from '@wdio/globals';
 
-// The one Phase 0 smoke test: the real built app opens and shows the
-// placeholder screen. Linux drives WebKitGTK through WebKitWebDriver under
-// Xvfb; Windows drives WebView2 through an auto-managed msedgedriver.
+// The one smoke test: the real built app opens and shows the guided flow.
+// Linux drives WebKitGTK through WebKitWebDriver under Xvfb; Windows drives
+// WebView2 through an auto-managed msedgedriver.
 describe('Dmux smoke test', () => {
-  it('shows the placeholder screen in the Dmux window', async () => {
+  it('opens the window and shows the Connect screen', async () => {
     await expect(browser).toHaveTitle('Dmux');
 
-    const heading = await $('h1');
-    await expect(heading).toBeDisplayed();
-    await expect(heading).toHaveText('Dmux — migration verification');
+    // Stable shell strings (post-T020): the sidebar brand and the first
+    // screen's heading, both present on launch before any connection.
+    const brand = await $('aside .text-xl');
+    await expect(brand).toBeDisplayed();
+    await expect(brand).toHaveText('Dmux');
 
-    const body = await $('body');
-    await expect(body).toHaveText(expect.stringContaining('Phase 0 skeleton'));
+    const heading = await $('h2');
+    await expect(heading).toBeDisplayed();
+    await expect(heading).toHaveText('Connect');
   });
 });
