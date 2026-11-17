@@ -37,6 +37,11 @@ async function clickProfileButton(text: string, index: number): Promise<void> {
   await buttons[index].click();
 }
 
+/** One diagnostic line so a hung run shows which step it reached. */
+function step(n: number, name: string): void {
+  console.log(`STEP ${n}: ${name}`);
+}
+
 async function waitForBodyText(
   predicate: (text: string) => boolean,
   timeout: number,
@@ -44,7 +49,7 @@ async function waitForBodyText(
 ): Promise<void> {
   await browser.waitUntil(async () => predicate(await $('body').getText()), {
     timeout,
-    timeoutMsg: `timed out waiting for ${what}`,
+    timeoutMsg: `timed out waiting for: ${what}`,
   });
 }
 
@@ -66,11 +71,13 @@ async function fillProfile(side: 'Old database' | 'New database', port: string):
 /** Save a profile (stores the password in the keychain) and test it. */
 async function saveAndTest(side: 'Old database' | 'New database', index: number): Promise<void> {
   await clickProfileButton('Save', index);
-  // "Password saved in keychain" appears once per saved profile.
+  // The keychain variant requires Save to actually store the password, so the
+  // later steps can read it back. A missing "Password saved in keychain" here
+  // means the keychain did not start/unlock — the timeoutMsg says so.
   await waitForBodyText(
     (t) => (t.match(/Password saved in keychain/g) ?? []).length >= index + 1,
-    15_000,
-    `${side} password to be saved`,
+    20_000,
+    `${side} "Password saved in keychain" (is gnome-keyring unlocked?)`,
   );
 
   await clickProfileButton('Test connection', index);
@@ -78,103 +85,107 @@ async function saveAndTest(side: 'Old database' | 'New database', index: number)
   await waitForBodyText(
     (t) => (t.match(/Server version/g) ?? []).length >= index + 1,
     30_000,
-    `${side} connection to succeed`,
+    `${side} Test connection to report server info`,
   );
 }
 
 const runKeychainFlow = HAS_KEYCHAIN && E2E_USER && E2E_PASSWORD ? it : it.skip;
 
-runKeychainFlow(
-  'drives the release app through Connect -> Report against planted demo_bank and shows FAIL',
-  async function (this: { timeout(ms: number): void }) {
-    this.timeout(600_000);
+describe('Dmux real-app flow against the CI service databases', function (this: {
+  timeout(ms: number): void;
+}) {
+  // The full-values fingerprint over demo_bank takes minutes, so raise the
+  // timeout for this spec to 6 minutes. It must be set on the suite (not
+  // inside the test body): WebdriverIO reads the mocha timeout when it starts
+  // the test, before the body runs, so an in-body this.timeout() is too late.
+  this.timeout(600_000);
 
-    // Wait for the app shell to mount before touching the Connect form.
-    await $('main').waitForDisplayed({ timeout: 30_000 });
+  runKeychainFlow(
+    'drives the release app through Connect -> Report against planted demo_bank and shows FAIL',
+    async () => {
+      // Wait for the app shell to mount before touching the Connect form.
+      await $('main').waitForDisplayed({ timeout: 30_000 });
 
-    // 1. Connect: fill, save (keychain) and test both profiles.
-    await fillProfile('Old database', '5433');
-    await saveAndTest('Old database', 0);
-    await fillProfile('New database', '5434');
-    await saveAndTest('New database', 1);
+      // 1. Connect: fill, save (keychain) and test both profiles.
+      step(1, 'Connect — fill + Save + Test connection (old)');
+      await fillProfile('Old database', '5433');
+      await saveAndTest('Old database', 0);
 
-    await cta('Compare structure').click();
-    // 2. Compare structure: the side-by-side inventory shows both encodings
-    // (old LATIN1/C, new UTF-8) and the planted schema differences.
-    await waitForBodyText(
-      (t) => t.includes('Old encoding') && t.includes(DATABASE),
-      60_000,
-      'the structure diff',
-    );
+      step(2, 'Connect — fill + Save + Test connection (new)');
+      await fillProfile('New database', '5434');
+      await saveAndTest('New database', 1);
 
-    // 3. Map: the planted rename/column changes surface as "needs attention";
-    // exact matches are accepted by default, so move straight on.
-    await cta('Map tables').click();
-    await waitForBodyText(
-      (t) => /matched|needs attention|ignored/i.test(t),
-      60_000,
-      'the mapping',
-    );
+      step(3, 'Compare structure');
+      await cta('Compare structure').click();
+      await waitForBodyText(
+        (t) => t.includes('Old encoding') && t.includes(DATABASE),
+        60_000,
+        'the structure diff (Old encoding + demo_bank)',
+      );
 
-    // 4. Choose checks: the default plan (full values everywhere) is fine.
-    await cta('Choose checks').click();
-    await waitForBodyText((t) => t.includes('Estimate'), 60_000, 'the check plan');
+      step(4, 'Map (needs-attention queue)');
+      await cta('Map tables').click();
+      await waitForBodyText(
+        (t) => /matched|need attention|ignored/i.test(t),
+        60_000,
+        'the mapping summary (matched / needs attention)',
+      );
 
-    // 5. Run: the engine fingerprints every table and must finish (never hang).
-    await cta('Run').click();
-    await waitForBodyText((t) => t.includes('Finished'), 300_000, 'the run to finish');
+      step(5, 'Choose checks');
+      await cta('Choose checks').click();
+      await waitForBodyText((t) => t.includes('Estimate'), 60_000, 'the check plan (Estimate)');
 
-    // 6. Results: planted differences mean FAIL, with a coverage line — the
-    // worst bug this project can have is a false PASS, so assert the run
-    // surfaced failures, never a clean PASS. (The overall verdict badge reads
-    // "Fail"; the Results screen only renders a "Failures" section when some
-    // table did not pass, which for the planted demo_bank it always must.)
-    await cta('See results').click();
-    await waitForBodyText((t) => t.includes('tables fully checked'), 60_000, 'the results');
-    const resultsText = await $('body').getText();
-    expect(resultsText).toContain('Failures');
-    expect(resultsText).toContain('tables fully checked');
+      step(6, 'Run');
+      await cta('Run').click();
+      await waitForBodyText((t) => t.includes('Finished'), 300_000, 'the run to finish');
 
-    // 7. Report: the export controls exist. Export itself is NOT_AVAILABLE
-    // until T024, and a native save-location dialog cannot be driven by
-    // WebDriver, so assert the control rather than clicking it.
-    await cta('Report').click();
-    await waitForBodyText((t) => t.includes('Export PDF'), 30_000, 'the report screen');
-    await expect(cta('Export PDF')).toBeDisplayed();
-    await expect(cta('Export Excel')).toBeDisplayed();
-  },
-);
+      step(7, 'Results');
+      await cta('See results').click();
+      await waitForBodyText((t) => t.includes('tables fully checked'), 60_000, 'the results');
+      const resultsText = await $('body').getText();
+      // demo_bank is planted: the run must surface failures, never a clean PASS.
+      expect(resultsText).toContain('Failures');
+      expect(resultsText).toContain('tables fully checked');
 
-// TODO(T055): once a typed password is threaded through later steps without a
-// keychain, flip `it.skip` to `it`. Until then this would fail at Compare
-// structure ("no password is stored for this profile"), because the password
-// typed on Connect is dropped after Test connection and only a keychain save
-// makes it reach run_inventory / build_mapping / start_run.
-it.skip(
-  'completes the flow without a keychain (ask-per-run password)',
-  async function (this: { timeout(ms: number): void }) {
-    this.timeout(600_000);
+      step(8, 'Report');
+      await cta('Report').click();
+      await waitForBodyText((t) => t.includes('Export PDF'), 30_000, 'the report screen');
+      await expect(cta('Export PDF')).toBeDisplayed();
+      await expect(cta('Export Excel')).toBeDisplayed();
+    },
+  );
 
-    await $('main').waitForDisplayed({ timeout: 30_000 });
+  // TODO(T055): once a typed password is threaded through later steps without a
+  // keychain, flip `it.skip` to `it`. Until then this would fail at Compare
+  // structure ("no password is stored for this profile"), because the password
+  // typed on Connect is dropped after Test connection and only a keychain save
+  // makes it reach run_inventory / build_mapping / start_run.
+  it.skip(
+    'completes the flow without a keychain (ask-per-run password)',
+    async () => {
+      await $('main').waitForDisplayed({ timeout: 30_000 });
 
-    await fillProfile('Old database', '5433');
-    await clickProfileButton('Test connection', 0);
-    await waitForBodyText(
-      (t) => (t.match(/Server version/g) ?? []).length >= 1,
-      30_000,
-      'old connection to succeed',
-    );
-    await fillProfile('New database', '5434');
-    await clickProfileButton('Test connection', 1);
-    await waitForBodyText(
-      (t) => (t.match(/Server version/g) ?? []).length >= 2,
-      30_000,
-      'new connection to succeed',
-    );
+      step(1, 'Connect — fill + Test connection (old, typed password)');
+      await fillProfile('Old database', '5433');
+      await clickProfileButton('Test connection', 0);
+      await waitForBodyText(
+        (t) => (t.match(/Server version/g) ?? []).length >= 1,
+        30_000,
+        'old Test connection to report server info',
+      );
 
-    // T055: with no keychain the typed password is not remembered, so the next
-    // step must still work from the ask-per-run password, not fail here.
-    await cta('Compare structure').click();
-    await waitForBodyText((t) => t.includes('Old encoding'), 60_000, 'the structure diff');
-  },
-);
+      step(2, 'Connect — fill + Test connection (new, typed password)');
+      await fillProfile('New database', '5434');
+      await clickProfileButton('Test connection', 1);
+      await waitForBodyText(
+        (t) => (t.match(/Server version/g) ?? []).length >= 2,
+        30_000,
+        'new Test connection to report server info',
+      );
+
+      step(3, 'Compare structure (should use the ask-per-run password)');
+      await cta('Compare structure').click();
+      await waitForBodyText((t) => t.includes('Old encoding'), 60_000, 'the structure diff');
+    },
+  );
+});

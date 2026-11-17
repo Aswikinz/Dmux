@@ -530,9 +530,24 @@ jobs:
           sudo apt-get install -y gnome-keyring
           dbus-run-session -- bash -c '
             set -euo pipefail
-            gnome-keyring-daemon --components=secrets --daemonize --unlock <<< "dmux-e2e"
+            # Unlock the login keyring (creating it with this throwaway password
+            # on first run) and then start the secrets component, all on the SAME
+            # session bus the app will use, so the keyring crate can store/read.
+            echo -n "dmux-e2e" | gnome-keyring-daemon --unlock
+            gnome-keyring-daemon --start --components=secrets
             xvfb-run -a pnpm test:e2e --spec e2e/specs/real-flow.spec.ts
           '
+
+      # On a failed real-app run the afterTest hook writes a screenshot + the
+      # rendered page text to e2e/artifacts/; upload them so a timeout is
+      # debuggable (which STEP, what the screen showed), never just "Timeout".
+      - name: Upload real-flow diagnostics (on failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: real-flow-diagnostics
+          path: e2e/artifacts/
+          if-no-files-found: ignore
 
   build-windows:
     name: Build + smoke (Windows)

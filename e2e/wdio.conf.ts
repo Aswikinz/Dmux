@@ -63,4 +63,29 @@ export const config: WebdriverIO.Config = {
     timeout: 120000,
   },
   reporters: ['spec'],
+  // On a failure, capture a screenshot and the rendered page text so a hung or
+  // failed real-app run is debuggable from CI (uploaded as an artifact by
+  // ci.yml). demo_bank only — the page text is truncated and never contains the
+  // typed password (the UI clears it immediately and never renders it).
+  afterTest: async (test, _context, result) => {
+    if (!result.error) {
+      return;
+    }
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const outDir = path.resolve('e2e', 'artifacts');
+    fs.mkdirSync(outDir, { recursive: true });
+    const slug = test.title.replace(/[^a-zA-Z0-9]+/g, '_').slice(0, 80) || 'unknown';
+    try {
+      await browser.saveScreenshot(path.join(outDir, `${slug}.png`));
+    } catch {
+      // The WebDriver session may already be gone after a timeout; that is fine.
+    }
+    try {
+      const text = (await browser.execute('return document.body.innerText')) as unknown as string;
+      fs.writeFileSync(path.join(outDir, `${slug}.txt`), text.slice(0, 4096));
+    } catch {
+      // Ditto: the session may be gone, so there is nothing to dump.
+    }
+  },
 };
