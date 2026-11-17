@@ -265,6 +265,40 @@ fn oversized_input_is_refused_not_truncated() {
 }
 
 #[test]
+fn background_grandchild_does_not_block_normal_exit() {
+    if !python_available() {
+        require_python();
+        return;
+    }
+    #[cfg(not(unix))]
+    {
+        // Fork is Unix-only; on Windows this fixture cannot fork.
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let script = fixtures().join("bg_grandchild.py");
+        let mut spec = HookSpec::new(&script);
+        // A generous limit: the parent exits 0 quickly, but a grandchild that
+        // outlives it (and holds stdin/stdout) must be cleaned up by the group
+        // kill, so the run must NOT wait out the full limit.
+        spec.timeout = Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        let result = run_hook(&spec, &sample_results()).expect("run_hook returns");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a grandchild holding stdin/stdout blocked a normal exit"
+        );
+        // The parent exited 0 with no findings; a clean empty exit (BadOutput
+        // or ExitNoFindings) is acceptable, but it must be prompt.
+        let _ = result;
+    }
+}
+
+#[test]
 fn fail_finding_is_returned_with_fail_severity() {
     if !python_available() {
         require_python();

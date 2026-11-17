@@ -203,6 +203,45 @@ fn is_sensitive_key(key: &str) -> bool {
         || upper.contains("CREDENTIAL")
 }
 
+/// Compute a self-verifying SHA-256 over the *whole* written envelope
+/// (`{results, hooks}`), so a reader can detect tampering with either the
+/// results or the hook evidence (script hashes, findings).  The digest covers
+/// everything except the `envelope_sha256` field itself, so the field can be
+/// recomputed from the file without recursing.
+///
+/// The results' own `results_sha256` (computed by the engine) protects the
+/// results values; this envelope hash additionally binds the hook verdicts and
+/// script digests to those results, closing the hole where a `fail` finding
+/// could be edited away without changing `results_sha256`.
+pub fn envelope_sha256(envelope: &serde_json::Value) -> String {
+    let mut clone = envelope.clone();
+    if let Some(obj) = clone.as_object_mut() {
+        obj.remove("envelope_sha256");
+    }
+    // A canonical serialisation is stable for identical content (serde_json's
+    // default map order is BTreeMap here), so the digest is reproducible.
+    let canonical = serde_json::to_string(&clone).unwrap_or_default();
+    sha256_hex(canonical.as_bytes())
+}
+
+/// Verify an envelope's integrity: recompute the digest and compare it to the
+/// stored `envelope_sha256`.  Returns an error string describing the mismatch,
+/// or `Ok(())` when the content is unchanged.
+pub fn verify_envelope(envelope: &serde_json::Value) -> Result<(), String> {
+    let stored = envelope
+        .get("envelope_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if stored.is_empty() {
+        return Err("envelope has no envelope_sha256".to_string());
+    }
+    let actual = envelope_sha256(envelope);
+    if actual != stored {
+        return Err("envelope_sha256 mismatch: file was modified after running".to_string());
+    }
+    Ok(())
+}
+
 /// Compute the SHA-256 hex digest of the script file's bytes (PLAN 4.9).
 pub fn hash_script(path: &Path) -> Result<String, HookError> {
     let bytes = std::fs::read(path)
@@ -569,23 +608,23 @@ fn spawn_and_collect(
     let stdout_thread = spawn_reader(child.stdout.take(), MAX_OUTPUT_BYTES, stdout_tx);
     let stderr_thread = spawn_reader(child.stderr.take(), MAX_OUTPUT_BYTES, stderr_tx);
 
-    // Write stdin on its own thread so a full pipe (a script that never reads
+    // Write stdin on a detached thread so a full pipe (a script that never reads
     // its input) can never stall the parent; the time limit below still holds
-    // and kills the whole group.  A broken pipe (early exit) is ignored.
+    // and kills the whole group, which unblocks this writer with EPIPE.  We
+    // never join this thread: if a grandchild keeps stdin open, joining would
+    // hang long after the group is killed.  Dropping the handle detaches it, and
+    // dropping `stdin` here (inside the thread) closes the child's stdin.
     let stdin_payload = payload.to_vec();
-    let mut child_stdin = child.stdin.take();
-    let stdin_thread = std::thread::spawn(move || {
+    let child_stdin = child.stdin.take();
+    let _stdin_thread = std::thread::spawn(move || {
         use std::io::Write;
-        if let Some(mut stdin) = child_stdin.take() {
+        if let Some(mut stdin) = child_stdin {
             let _ = stdin.write_all(&stdin_payload);
         }
-        // Dropping `stdin` here closes the child's stdin, signalling EOF.
     });
 
     let limit_ms = spec.timeout.as_millis() as u64;
     let mut status = None;
-    let mut stdout_bytes = None;
-    let mut stderr_bytes = None;
 
     loop {
         // Reap the parent's status when it exits.
@@ -596,32 +635,21 @@ fn spawn_and_collect(
                 Err(_) => status = Some(std::process::ExitStatus::default()),
             }
         }
-        // Collect any finished reader.
-        if stdout_bytes.is_none() {
-            if let Ok(bytes) = stdout_rx.try_recv() {
-                stdout_bytes = Some(bytes);
-            }
-        }
-        if stderr_bytes.is_none() {
-            if let Ok(bytes) = stderr_rx.try_recv() {
-                stderr_bytes = Some(bytes);
-            }
-        }
 
-        // Done when the parent exited and both pipes closed.
-        if status.is_some() && stdout_bytes.is_some() && stderr_bytes.is_some() {
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            break;
-        }
+        // Time limit: kill the whole process group (children included).
+        let over = start.elapsed() >= spec.timeout;
 
-        // Time limit: kill the whole process group (children included), then
-        // drain whatever the readers have already captured.
-        if start.elapsed() >= spec.timeout {
+        if status.is_some() || over {
+            // Once the parent has exited (or the deadline hit), kill the whole
+            // process group so an escaped grandchild holding stdin/stdout cannot
+            // keep the run alive, and the readers see EOF promptly.
             kill_group(&mut child);
-            // Give the pipes a moment to close after the kill.
-            let deadline = std::time::Instant::now() + Duration::from_millis(500);
-            while std::time::Instant::now() < deadline {
+            // Give the pipes a brief moment to close after the kill, then drain
+            // whatever the readers captured.
+            let dead = std::time::Instant::now() + Duration::from_millis(500);
+            let mut stdout_bytes = None;
+            let mut stderr_bytes = None;
+            while std::time::Instant::now() < dead {
                 if stdout_bytes.is_none() {
                     if let Ok(bytes) = stdout_rx.try_recv() {
                         stdout_bytes = Some(bytes);
@@ -638,34 +666,33 @@ fn spawn_and_collect(
                 std::thread::sleep(Duration::from_millis(10));
             }
             let _ = child.wait();
-            // Don't wait on the stdin writer here: a never-reading script keeps
-            // the pipe open, and we are tearing the process group down anyway.
-            let _ = stdin_thread.join();
-            let stderr = stderr_bytes.unwrap_or_default();
-            return Collect::TimedOut {
-                limit_ms,
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            if over {
+                let stderr = stderr_bytes.unwrap_or_default();
+                return Collect::TimedOut {
+                    limit_ms,
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                };
+            }
+            let stdout_bytes = stdout_bytes.unwrap_or_default();
+            let stderr_bytes = stderr_bytes.unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+            // The group is dead; the reader threads end on their own (no join).
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return match parse_stdout(&stdout_bytes) {
+                Ok(findings) => Collect::Findings(findings),
+                Err(_) => {
+                    let code = status.and_then(|s| s.code());
+                    if code == Some(0) || code.is_none() {
+                        Collect::BadOutput(stderr)
+                    } else {
+                        Collect::ExitNoFindings { code, stderr }
+                    }
+                }
             };
         }
 
         std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let _ = stdin_thread.join();
-    let stdout_bytes = stdout_bytes.unwrap_or_default();
-    let stderr_bytes = stderr_bytes.unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-
-    match parse_stdout(&stdout_bytes) {
-        Ok(findings) => Collect::Findings(findings),
-        Err(_) => {
-            let code = status.and_then(|s| s.code());
-            if code == Some(0) || code.is_none() {
-                Collect::BadOutput(stderr)
-            } else {
-                Collect::ExitNoFindings { code, stderr }
-            }
-        }
     }
 }
 
@@ -847,6 +874,39 @@ mod tests {
             message: "evil\u{202E}payload".into(),
         };
         assert!(validate_finding(&f).is_err());
+    }
+
+    #[test]
+    fn envelope_sha256_is_self_verifying() {
+        let mut env = serde_json::json!({
+            "results": {"verdict": "PASS"},
+            "hooks": {"custom_checks": []}
+        });
+        let h = envelope_sha256(&env);
+        env["envelope_sha256"] = serde_json::Value::String(h);
+        assert!(verify_envelope(&env).is_ok());
+    }
+
+    #[test]
+    fn envelope_sha256_detects_tampering() {
+        let mut env = serde_json::json!({
+            "results": {"verdict": "PASS"},
+            "hooks": {"custom_checks": [{"id": "x", "severity": "fail"}]}
+        });
+        let h = envelope_sha256(&env);
+        env["envelope_sha256"] = serde_json::Value::String(h);
+        assert!(verify_envelope(&env).is_ok());
+
+        // Editing a hook finding breaks verification.
+        let mut tampered = env.clone();
+        tampered["hooks"]["custom_checks"][0]["severity"] =
+            serde_json::Value::String("info".to_string());
+        assert!(verify_envelope(&tampered).is_err());
+
+        // Editing the verdict breaks verification.
+        let mut tampered2 = env.clone();
+        tampered2["results"]["verdict"] = serde_json::Value::String("FAIL".to_string());
+        assert!(verify_envelope(&tampered2).is_err());
     }
 
     #[test]

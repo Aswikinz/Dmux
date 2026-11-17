@@ -13,7 +13,7 @@ use dmux_engine::db::{probe_server, ConnProfile, DbError, ReadOnlySession, TlsMo
 use dmux_engine::fingerprint_file::FingerprintFile;
 use dmux_engine::inventory::collect_inventory;
 use dmux_engine::mapping::{from_json as mapping_from_json, Mapping};
-use dmux_engine::results::CheckLevel;
+use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
 use dmux_hooks::{Finding, HookSpec, Severity};
@@ -599,14 +599,21 @@ fn envelope_results(
         }
     }
 
-    serde_json::json!({
+    let mut envelope = serde_json::json!({
         "results": results,
         "hooks": {
             "custom_checks": custom_checks,
             "scripts": scripts,
             "warnings": warnings,
         }
-    })
+    });
+
+    // A self-verifying SHA-256 over the whole envelope, so a reader can detect
+    // tampering with either the results or the hook evidence (script hashes,
+    // findings).  The digest covers everything except the field itself.
+    let envelope_sha256 = dmux_hooks::envelope_sha256(&envelope);
+    envelope["envelope_sha256"] = serde_json::Value::String(envelope_sha256);
+    envelope
 }
 
 fn finding_json(f: &Finding) -> serde_json::Value {
@@ -637,6 +644,22 @@ fn hook_causes_non_pass(results: &[dmux_hooks::HookResult]) -> bool {
     results
         .iter()
         .any(|r| r.findings.iter().any(|f| f.severity == Severity::Fail))
+}
+
+/// Compute the exit code a hook-enabled run should return.
+///
+/// A custom-check `fail` finding ⇒ FAIL (exit 1), taking precedence over any
+/// hook warning.  A hook timeout / crash / invalid output is a warning that
+/// lifts a clean PASS to exit 2, but never overrides an existing non-PASS
+/// verdict from the comparison itself.
+fn hook_exit_code(has_fail: bool, has_warning: bool, base: u8) -> u8 {
+    if has_fail {
+        EXIT_FAIL
+    } else if has_warning && base == EXIT_PASS {
+        EXIT_WARN
+    } else {
+        base
+    }
 }
 
 async fn run_run(args: RunArgs) -> ExitCode {
@@ -675,7 +698,7 @@ async fn run_run(args: RunArgs) -> ExitCode {
             }
         }
 
-        let mut results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
+        let results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
         let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
             Ok(r) => r,
             Err(e) => {
@@ -685,20 +708,25 @@ async fn run_run(args: RunArgs) -> ExitCode {
         };
 
         // A custom-check `fail` must change the *written* verdict, never only
-        // the exit code (false PASS).  Timeouts / crashes / invalid output are
-        // warnings and must lift a clean PASS exit to 2.
+        // the exit code (false PASS).  A fail finding ⇒ FAIL (exit 1).  A hook
+        // timeout / crash / invalid output is a warning (exit 2), but only when
+        // there is no fail finding.
         let has_fail = hook_causes_non_pass(&hook_results);
         let has_warning = hook_results.iter().any(|r| !r.warnings.is_empty());
+        exit_code = hook_exit_code(has_fail, has_warning, exit_code);
 
+        // Mutate a typed copy of the results (so results_sha256 is recomputed
+        // over exactly what is written) and re-serialise.
+        let mut typed = outcome.results.clone();
         if has_fail {
-            apply_custom_fail(&mut results_value, &hook_results);
-            if exit_code == EXIT_PASS {
-                exit_code = EXIT_FAIL;
-            }
-        } else if has_warning && exit_code == EXIT_PASS {
-            exit_code = EXIT_WARN;
+            apply_custom_fail(&mut typed, &hook_results);
         }
 
+        // Recompute the results-level self-hash over the mutated content, then
+        // wrap everything in the envelope with its own SHA-256 so the hook
+        // evidence (script hashes, findings) is tamper-covered too.
+        typed.results_sha256 = dmux_engine::results::sha256_of(&typed);
+        let results_value = serde_json::to_value(&typed).unwrap_or_default();
         let envelope = envelope_results(&results_value, &specs, &hook_results);
         emit_json_value(args.out.as_deref(), &envelope);
     } else {
@@ -708,12 +736,12 @@ async fn run_run(args: RunArgs) -> ExitCode {
     ExitCode::from(exit_code)
 }
 
-/// Fold a custom-check `fail` finding into the results' verdict.  The written
-/// results must carry the FINAL verdict: a `fail` finding turns a PASS into
-/// FAIL with reason "custom check <id> failed".  It never lowers a FAIL back to
-/// PASS and never raises a non-PASS run, so a run that already FAILED stays
-/// FAILED with its own reasons intact.
-fn apply_custom_fail(results: &mut serde_json::Value, hook_results: &[dmux_hooks::HookResult]) {
+/// Fold a custom-check `fail` finding into the typed results.  A `fail` finding
+/// turns a PASS verdict into FAIL with reason "custom check <id> failed" pushed
+/// into `warnings`.  It never lowers an already non-PASS verdict back to PASS,
+/// and never raises a FAILED run: any existing non-PASS verdict is left as-is
+/// (it is at least as grave as FAIL).
+fn apply_custom_fail(results: &mut RunResults, hook_results: &[dmux_hooks::HookResult]) {
     let fail_ids: Vec<String> = hook_results
         .iter()
         .flat_map(|r| r.findings.iter())
@@ -724,34 +752,13 @@ fn apply_custom_fail(results: &mut serde_json::Value, hook_results: &[dmux_hooks
         return;
     }
 
-    // The verdict vocabulary the engine serialises: PASS, FAIL, WIDELY_DIFFERENT,
-    // NEEDS_REVIEW, CHANGED_DURING_CHECK, TOOL_FAULT, WARNING.
-    let current = results.get("verdict").and_then(|v| v.as_str());
-    // A failure finding must never downgrade an already non-PASS verdict into
-    // PASS, and it must force PASS to FAIL.
-    let new_verdict = match current {
-        Some("PASS") => Some("FAIL".to_string()),
-        // Keep the existing (already non-PASS) verdict; it is at least as grave.
-        Some(other) => Some(other.to_string()),
-        None => Some("FAIL".to_string()),
-    };
-    if let Some(v) = new_verdict {
-        results["verdict"] = serde_json::Value::String(v);
+    // Only a clean PASS is demoted; any non-PASS verdict already reflects a
+    // data or tool problem and must never be masked by a hook.
+    if results.verdict == Verdict::Pass {
+        results.verdict = Verdict::Fail;
     }
-
-    // Record the reason next to the other verdict notes.  RunResults uses a
-    // top-level "warnings" array; append so the report explains the FAIL.
-    let mut reasons: Vec<String> = fail_ids
-        .iter()
-        .map(|id| format!("custom check {id} failed"))
-        .collect();
-    if let Some(arr) = results.get_mut("warnings").and_then(|v| v.as_array_mut()) {
-        for r in &reasons {
-            arr.push(serde_json::Value::String(r.clone()));
-        }
-    } else {
-        results["warnings"] =
-            serde_json::Value::Array(reasons.drain(..).map(serde_json::Value::String).collect());
+    for id in &fail_ids {
+        results.warnings.push(format!("custom check {id} failed"));
     }
 }
 
@@ -888,15 +895,40 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     })
 }
 
+/// Minimal `RunResults` for the `apply_custom_fail` tests (the engine type, but
+/// built by hand so no live run is needed).
+#[cfg(test)]
+fn minimal_run_results(verdict: Verdict) -> RunResults {
+    RunResults {
+        results_version: 1,
+        run_id: "run".into(),
+        tool_version: "0.0.1".into(),
+        mapping_hash: "m".into(),
+        verdict,
+        coverage_line: String::new(),
+        fully_checked: 0,
+        counts_only: 0,
+        ignored: 0,
+        tables: BTreeMap::new(),
+        ignored_items: vec![],
+        changed_during_check: vec![],
+        warnings: vec![],
+        wal_start_lsn: None,
+        wal_end_lsn: None,
+        results_sha256: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_superuser_requires_reason, apply_custom_fail, hook_causes_non_pass, parse_level,
-        parse_tls_mode, Cli, Command, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        allow_superuser_requires_reason, apply_custom_fail, hook_causes_non_pass, hook_exit_code,
+        minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs, Severity,
+        EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
-    use dmux_engine::results::CheckLevel;
+    use dmux_engine::results::{CheckLevel, Verdict};
 
     #[test]
     fn exit_codes_match_the_plan() {
@@ -1085,33 +1117,32 @@ mod tests {
         };
 
         // A PASS verdict must flip to FAIL with the reason recorded.
-        let mut pass_results = serde_json::json!({ "verdict": "PASS", "warnings": [] });
+        let mut pass_results = minimal_run_results(Verdict::Pass);
         apply_custom_fail(&mut pass_results, std::slice::from_ref(&fail));
-        assert_eq!(pass_results["verdict"], "FAIL");
+        assert_eq!(pass_results.verdict, Verdict::Fail);
         assert!(
-            pass_results["warnings"]
-                .as_array()
-                .unwrap()
+            pass_results
+                .warnings
                 .iter()
-                .any(|w| w.as_str() == Some("custom check custom.total failed")),
+                .any(|w| w == "custom check custom.total failed"),
             "reason not recorded: {:?}",
-            pass_results["warnings"]
+            pass_results.warnings
         );
 
         // An already-FAIL verdict must never be raised back to PASS.
-        let mut fail_results = serde_json::json!({ "verdict": "FAIL", "warnings": [] });
+        let mut fail_results = minimal_run_results(Verdict::Fail);
         apply_custom_fail(&mut fail_results, std::slice::from_ref(&fail));
-        assert_eq!(fail_results["verdict"], "FAIL");
+        assert_eq!(fail_results.verdict, Verdict::Fail);
 
         // A non-PASS, non-FAIL verdict stays as-is (never lowered to PASS).
-        let mut tf = serde_json::json!({ "verdict": "TOOL_FAULT", "warnings": [] });
+        let mut tf = minimal_run_results(Verdict::ToolFault);
         apply_custom_fail(&mut tf, std::slice::from_ref(&fail));
-        assert_eq!(tf["verdict"], "TOOL_FAULT");
+        assert_eq!(tf.verdict, Verdict::ToolFault);
     }
 
     #[test]
     fn custom_fail_with_no_fail_findings_is_a_noop() {
-        let mut results = serde_json::json!({ "verdict": "PASS", "warnings": [] });
+        let mut results = minimal_run_results(Verdict::Pass);
         let info = dmux_hooks::HookResult {
             script_hash: "h".into(),
             findings: vec![dmux_hooks::Finding {
@@ -1123,6 +1154,56 @@ mod tests {
             warnings: vec![],
         };
         apply_custom_fail(&mut results, &[info]);
-        assert_eq!(results["verdict"], "PASS");
+        assert_eq!(results.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn warning_plus_fail_is_fail_not_warning() {
+        // A fail finding must yield FAIL (1), even when warnings are present:
+        // fail takes precedence over warning.
+        assert_eq!(hook_exit_code(true, true, EXIT_PASS), EXIT_FAIL);
+        // Fail alone ⇒ FAIL.
+        assert_eq!(hook_exit_code(true, false, EXIT_PASS), EXIT_FAIL);
+        // Warning alone on a clean PASS ⇒ WARN (2).
+        assert_eq!(hook_exit_code(false, true, EXIT_PASS), EXIT_WARN);
+        // No hook signal leaves the base code untouched.
+        assert_eq!(hook_exit_code(false, false, EXIT_PASS), EXIT_PASS);
+        assert_eq!(hook_exit_code(false, false, EXIT_FAIL), EXIT_FAIL);
+        // A warning never overrides an existing non-PASS verdict.
+        assert_eq!(hook_exit_code(false, true, EXIT_FAIL), EXIT_FAIL);
+    }
+
+    #[test]
+    fn custom_fail_recomputes_the_results_hash() {
+        // The mutated results must carry a results_sha256 that matches the
+        // actual (mutated) content — the whole point of fix 1.
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec![],
+        };
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_custom_fail(&mut results, std::slice::from_ref(&fail));
+        // Recompute exactly as run_run does before writing.
+        results.results_sha256 = dmux_engine::results::sha256_of(&results);
+
+        // A FAIL→PASS edit must fail verification.
+        let mut edited = results.clone();
+        edited.verdict = Verdict::Pass;
+        assert_ne!(
+            dmux_engine::results::sha256_of(&edited),
+            results.results_sha256,
+            "editing FAIL back to PASS must change the digest"
+        );
+        // The untouched content still matches.
+        assert_eq!(
+            dmux_engine::results::sha256_of(&results),
+            results.results_sha256
+        );
     }
 }
