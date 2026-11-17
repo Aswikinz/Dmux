@@ -325,6 +325,11 @@ pub(crate) async fn list_sequences<T: GenericClient>(
 
     // PostgreSQL 10+: pg_sequence has seqrelid for the privilege check and
     // pg_sequence_last_value for the current value (NULL when never called).
+    //
+    // The last-value read is wrapped in CASE WHEN has_sequence_privilege(...)
+    // so a low-privilege login gets an unreadable (Warning) sequence rather
+    // than an aborted inventory (T022 item 9).  Both privilege checks use the
+    // same 'SELECT,USAGE' rights the read needs.
     let rows = client
         .query(
             "SELECT n.nspname AS schema_name, c.relname AS sequence_name, \
@@ -332,8 +337,10 @@ pub(crate) async fn list_sequences<T: GenericClient>(
                     s.seqstart AS start_value, s.seqmin AS min_value, \
                     s.seqmax AS max_value, s.seqincrement AS increment, \
                     s.seqcycle AS cycle, \
-                    pg_catalog.pg_sequence_last_value(s.seqrelid) AS last_value, \
-                    pg_catalog.has_sequence_privilege(s.seqrelid, 'SELECT') AS readable \
+                    CASE WHEN pg_catalog.has_sequence_privilege(s.seqrelid, 'SELECT,USAGE') \
+                         THEN pg_catalog.pg_sequence_last_value(s.seqrelid) \
+                         ELSE NULL END AS last_value, \
+                    pg_catalog.has_sequence_privilege(s.seqrelid, 'SELECT,USAGE') AS readable \
              FROM pg_catalog.pg_sequence s \
              JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
