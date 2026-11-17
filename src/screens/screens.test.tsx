@@ -136,6 +136,40 @@ describe('ConnectScreen', () => {
     expect(next.disabled).toBe(false);
   });
 
+  it('shows the in-memory password notice when there is no keychain, and only then', async () => {
+    const base = createMockEngine();
+    const engine: Engine = {
+      ...base,
+      testConnection: async (profile, password) => {
+        const r = await base.testConnection(profile, password);
+        return r.info
+          ? { ...r, info: { ...r.info, sessionPassword: profile.id === defaultOldProfile().id } }
+          : r;
+      },
+    };
+    wrap(
+      <ConnectScreen
+        engine={engine}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    const testButtons = screen.getAllByRole('button', { name: 'Test connection' });
+    fireEvent.click(testButtons[0]);
+    expect(
+      await screen.findByText(
+        'No system keychain: Dmux will keep this password in memory until you close the app.',
+      ),
+    ).toBeDefined();
+    fireEvent.click(testButtons[1]);
+    await waitFor(() => expect(screen.getAllByText('Server version:').length).toBe(2));
+    // The new side has a keychain: one notice only.
+    expect(screen.getAllByTestId('session-password-notice').length).toBe(1);
+  });
+
   it('shows a superuser warning', async () => {
     const engine = createMockEngine();
     const profile: ConnectionProfile = { ...defaultOldProfile(), user: 'superuser' };

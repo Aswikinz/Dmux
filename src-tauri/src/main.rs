@@ -56,8 +56,16 @@ fn main() {
             app.manage(app_state);
             Ok(())
         })
-        .run(context)
-        .expect("error while running the Dmux app");
+        .build(context)
+        .expect("error while building the Dmux app")
+        .run(|app, event| {
+            // Session-only passwords (no keychain, T055) never outlive the app.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<state::AppState>() {
+                    state.clear_session_passwords();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

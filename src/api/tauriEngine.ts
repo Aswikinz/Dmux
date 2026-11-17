@@ -95,6 +95,8 @@ interface RawServerInfo {
   md5_available: boolean;
   sql_ascii: boolean;
   tls: RawTlsState;
+  /** The password is kept in memory for this session (no keychain). */
+  session_password?: boolean;
 }
 
 /** Engine `schema_diff::DiffStatus`. */
@@ -608,6 +610,7 @@ function toServerInfo(raw: RawServerInfo): ServerInfo {
     poolerSuspected: raw.pooler_suspected,
     md5Available: raw.md5_available,
     tls: toTlsState(raw.tls),
+    sessionPassword: raw.session_password === true,
   };
 }
 

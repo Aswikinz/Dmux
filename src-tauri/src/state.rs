@@ -5,13 +5,17 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::CommandError;
 use crate::run_manager::RunManager;
-use crate::secrets::{Keychain, PasswordStore};
+use crate::secrets::{Keychain, PasswordStore, SessionPasswords};
 use crate::store::Store;
 
 /// App-wide state, managed once at startup.
 pub struct AppState {
     /// The password store guarding secrets (the OS keychain in production).
     pub keychain: Mutex<Box<dyn PasswordStore>>,
+    /// Passwords kept in memory for this app session only, when the machine
+    /// has no usable keychain (T055).  Never persisted or logged; cleared on
+    /// exit.
+    pub session_passwords: Mutex<SessionPasswords>,
     /// The SQLite profile store, opened at startup.
     pub store: Mutex<Store>,
     /// The registry of in-progress runs (the data half).
@@ -40,6 +44,7 @@ impl AppState {
         let store = Store::open(&data_dir.join("dmux.db"))?;
         Ok(Self {
             keychain: Mutex::new(keychain),
+            session_passwords: Mutex::new(SessionPasswords::default()),
             store: Mutex::new(store),
             runs: Arc::new(RunManager::default()),
             data_dir,
@@ -51,6 +56,24 @@ impl AppState {
         self.store
             .lock()
             .map_err(|_| CommandError::internal("store lock poisoned"))
+    }
+
+    /// A guard over the session-only password cache.
+    pub fn session_passwords(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, SessionPasswords>, CommandError> {
+        self.session_passwords
+            .lock()
+            .map_err(|_| CommandError::internal("session password lock poisoned"))
+    }
+
+    /// Drop every session password (called when the app exits).  A poisoned
+    /// lock is recovered so the secrets are still zeroed.
+    pub fn clear_session_passwords(&self) {
+        match self.session_passwords.lock() {
+            Ok(mut g) => g.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
     }
 
     /// A guard over the password store.

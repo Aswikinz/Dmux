@@ -31,6 +31,11 @@ keyring = "4.2.0"
 # Native save dialog for report export (T059).  Opened from Rust only: the
 # webview gets no dialog or filesystem permission, and never names the path.
 tauri-plugin-dialog = "2.8.4"
+# Session-only password cache when no keychain exists (T055): the secret is
+# zeroed on drop, and entries are keyed by a SHA-256 of the connection fields.
+zeroize = "1.9.1"
+sha2 = "0.11.1"
+hex = "0.4.3"
 
 [dev-dependencies]
 # Test-only: build a temp profile store and probe against the mock databases.
