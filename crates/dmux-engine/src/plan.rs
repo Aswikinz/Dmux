@@ -23,7 +23,8 @@ use thiserror::Error;
 use crate::core::fingerprint::bucket_digits_for;
 use crate::core::normalise::{plan_column, resolve_type, ColumnMapping, ColumnOptions, PgType};
 use crate::core::CoreError;
-use crate::mapping::{apply_rule, Mapping, RuleKind};
+use crate::inventory::DatabaseInventory;
+use crate::mapping::{IgnoredItem, Mapping};
 use crate::results::CheckLevel;
 use tokio_postgres::Transaction;
 
@@ -256,16 +257,11 @@ pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -
     let new_by_name: BTreeMap<_, _> = new.columns.iter().map(|c| (c.name.clone(), c)).collect();
     let old_pk_set: BTreeSet<_> = old.primary_key.iter().cloned().collect();
 
-    let table_rules: Vec<_> = mapping
-        .rules
-        .iter()
-        .filter(|r| !matches!(r.kind, RuleKind::SchemaRename))
-        .cloned()
-        .collect();
     let renames = column_renames(mapping, &old.schema, &old.name);
 
+    // Rename rules apply to table names only (decision 23 / M2): a column is
+    // renamed only by an explicit per-column rename, then matched by exact name.
     let new_name_for = |old_col: &str| -> Option<String> {
-        // Explicit mapping first, then exact name, then prefix/suffix rules.
         if let Some(target) = renames.get(old_col) {
             if new_by_name.contains_key(target) {
                 return Some(target.clone());
@@ -273,13 +269,6 @@ pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -
         }
         if new_by_name.contains_key(old_col) {
             return Some(old_col.to_string());
-        }
-        for rule in &table_rules {
-            if let Some(renamed) = apply_rule(rule, old_col) {
-                if new_by_name.contains_key(&renamed) {
-                    return Some(renamed);
-                }
-            }
         }
         None
     };
@@ -371,6 +360,48 @@ pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -
     }
 }
 
+/// Two old columns mapping to the same new column: the mapping is ambiguous and
+/// the table cannot be compared (M2).  The table must be a Fault, never a PASS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousColumnTarget {
+    pub old: Vec<String>,
+    pub new: String,
+}
+
+impl std::fmt::Display for AmbiguousColumnTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} old columns ({}) map to new column {}",
+            if self.old.len() == 2 {
+                "two"
+            } else {
+                "multiple"
+            },
+            self.old.join(", "),
+            self.new
+        )
+    }
+}
+
+/// The first duplicate new-column target in a built spec, if any: two old
+/// columns pairing with the same new column.  `None` when every new column is
+/// claimed by at most one old column.
+pub fn duplicate_column_target(spec: &TableSpec) -> Option<AmbiguousColumnTarget> {
+    let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+    for c in &spec.columns {
+        if let Some(first) = owner.insert(c.new_name.as_str(), c.old_name.as_str()) {
+            let mut old = vec![first.to_string(), c.old_name.clone()];
+            old.sort();
+            return Some(AmbiguousColumnTarget {
+                old,
+                new: c.new_name.clone(),
+            });
+        }
+    }
+    None
+}
+
 /// Read the `pg_stat_user_tables.n_live_tup` estimate for a table (9.4-safe).
 pub async fn row_estimate(
     txn: &Transaction<'_>,
@@ -390,6 +421,107 @@ pub async fn row_estimate(
         .and_then(|r| r.try_get::<_, Option<i64>>(0).ok().flatten())
         .map(|n| n.max(0) as u64)
         .unwrap_or(0))
+}
+
+/// The `schema.table` paths of every foreign table (relkind `f`) in the current
+/// database, excluding system and temporary schemas.  Read-only, 9.4-safe.
+///
+/// Foreign tables have no `pg_stat_user_tables` counters (their data lives on
+/// another server), so change detection cannot vouch for them (M3).
+pub async fn foreign_tables(txn: &Transaction<'_>) -> Result<BTreeSet<String>, PlanError> {
+    let rows = txn
+        .query(
+            "SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'f' \
+               AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$'",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let schema: String = r.get(0);
+            let table: String = r.get(1);
+            format!("{schema}.{table}")
+        })
+        .collect())
+}
+
+/// The set of `schema.table` paths and `schema.table.column` paths in an
+/// inventory (one side's real objects).
+pub fn inventory_paths(inv: &DatabaseInventory) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut tables = BTreeSet::new();
+    let mut columns = BTreeSet::new();
+    for s in &inv.schemas {
+        for t in &s.tables {
+            let table = format!("{}.{}", s.name, t.name);
+            tables.insert(table.clone());
+            for c in &t.columns {
+                columns.insert(format!("{table}.{}", c.name));
+            }
+        }
+    }
+    (tables, columns)
+}
+
+/// Unknown paths in a run definition and mapping (L4): a level key that is no
+/// old table, a column-option key that is no old column, or an ignored path
+/// that is no table or column on either side.  These are configuration errors,
+/// never silent no-ops.  The result is sorted and de-duplicated.
+pub fn unknown_paths(
+    old: &DatabaseInventory,
+    new: &DatabaseInventory,
+    levels: &BTreeMap<String, CheckLevel>,
+    column_options: &BTreeMap<String, ColumnOptions>,
+    ignored: &[IgnoredItem],
+) -> Vec<String> {
+    let (old_tables, old_columns) = inventory_paths(old);
+    let (new_tables, new_columns) = inventory_paths(new);
+    unknown_keys(
+        levels,
+        column_options,
+        ignored,
+        &old_tables,
+        &old_columns,
+        &new_tables,
+        &new_columns,
+    )
+}
+
+/// Unknown keys given the raw known paths of each side.  A level key must name
+/// an old table, a column-option key an old column, and an ignored path any
+/// table or column on either side.
+pub fn unknown_keys(
+    levels: &BTreeMap<String, CheckLevel>,
+    column_options: &BTreeMap<String, ColumnOptions>,
+    ignored: &[IgnoredItem],
+    old_tables: &BTreeSet<String>,
+    old_columns: &BTreeSet<String>,
+    new_tables: &BTreeSet<String>,
+    new_columns: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut unknown = BTreeSet::new();
+    for path in levels.keys() {
+        if !old_tables.contains(path) {
+            unknown.insert(path.clone());
+        }
+    }
+    for path in column_options.keys() {
+        if !old_columns.contains(path) {
+            unknown.insert(path.clone());
+        }
+    }
+    for item in ignored {
+        if !old_tables.contains(&item.path)
+            && !old_columns.contains(&item.path)
+            && !new_tables.contains(&item.path)
+            && !new_columns.contains(&item.path)
+        {
+            unknown.insert(item.path.clone());
+        }
+    }
+    unknown.into_iter().collect()
 }
 
 /// Serializable description of one planned table (used by the definition file).
@@ -429,6 +561,9 @@ impl From<&TableSpec> for PlannedTable {
 pub(crate) mod tests {
     use super::*;
     use crate::mapping::IgnoredItem;
+    use crate::mapping::{
+        ColumnMapping as MapColumn, MappingStatus, Rule, RuleKind, SchemaMapping, TableMapping,
+    };
 
     pub(crate) fn col(name: &str, ty: &str) -> LiveColumn {
         LiveColumn {
@@ -545,5 +680,85 @@ pub(crate) mod tests {
         );
         let p = core_table_plan(&s).unwrap();
         assert!(p.columns()[1].old_expr.starts_with("rtrim("));
+    }
+
+    #[test]
+    fn table_rules_are_not_applied_to_columns() {
+        let old = live("t", vec![col("old_x", "text")], &[]);
+        let new = live("t", vec![col("new_x", "text")], &[]);
+        let mut m = Mapping::new();
+        m.rules.push(Rule {
+            kind: RuleKind::PrefixReplace,
+            pattern: "old_".into(),
+            target: "new_".into(),
+        });
+        let s = spec(&old, &new, &m);
+        // The prefix rule renames tables only; the column old_x is not renamed
+        // to new_x, so it is dropped (unpaired) rather than silently re-paired.
+        assert!(s.columns.is_empty());
+        assert_eq!(s.dropped, vec!["s.t.old_x"]);
+        assert_eq!(s.added, vec!["s.t.new_x"]);
+    }
+
+    #[test]
+    fn two_old_columns_mapping_to_one_new_column_are_refused() {
+        let old = live("t", vec![col("x", "text"), col("y", "text")], &["x"]);
+        let new = live("t", vec![col("y", "text")], &["y"]);
+        // An explicit rename x -> y while old y also pairs with new y by name:
+        // both old columns target the same new column.
+        let mut m = Mapping::new();
+        let mut sm = SchemaMapping {
+            target_schema: "s".into(),
+            table_mappings: BTreeMap::new(),
+        };
+        let mut tm = TableMapping::default();
+        tm.column_mappings.insert(
+            "x".into(),
+            MapColumn {
+                target_column: "y".into(),
+                status: MappingStatus::Exact,
+            },
+        );
+        sm.table_mappings.insert("t".into(), tm);
+        m.schema_mappings.insert("s".into(), sm);
+
+        let s = spec(&old, &new, &m);
+        let dup = duplicate_column_target(&s).expect("the duplicate target must be found");
+        assert_eq!(
+            dup.to_string(),
+            "two old columns (x, y) map to new column y"
+        );
+    }
+
+    #[test]
+    fn unknown_definition_and_mapping_paths_are_reported() {
+        let tables: BTreeSet<String> = ["s.t".to_string()].into();
+        let columns: BTreeSet<String> = ["s.t.c".to_string()].into();
+        let empty = BTreeSet::new();
+        let mut levels = BTreeMap::new();
+        levels.insert("s.t".to_string(), CheckLevel::FullValues);
+        levels.insert("s.typo".to_string(), CheckLevel::FullValues);
+        let mut opts = BTreeMap::new();
+        opts.insert("s.t.c".to_string(), ColumnOptions::default());
+        opts.insert("s.t.nope".to_string(), ColumnOptions::default());
+        let ignored = vec![
+            IgnoredItem {
+                path: "s.t".into(),
+                reason: "r".into(),
+            },
+            IgnoredItem {
+                path: "s.ghost".into(),
+                reason: "r".into(),
+            },
+        ];
+        let unknown = unknown_keys(&levels, &opts, &ignored, &tables, &columns, &empty, &empty);
+        assert_eq!(
+            unknown,
+            vec![
+                "s.ghost".to_string(),
+                "s.t.nope".to_string(),
+                "s.typo".to_string()
+            ]
+        );
     }
 }
