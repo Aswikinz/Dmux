@@ -30,6 +30,15 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (queue.length === 0) return;
+      // While the user types in a field (the ignore reason), only Enter and
+      // Escape act on the queue; Backspace, Delete and arrows edit the text.
+      const target = e.target as HTMLElement | null;
+      const typing =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable === true;
+      if (typing && e.key !== 'Enter' && e.key !== 'Escape') return;
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -93,15 +102,18 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
     <div className={cn('flex flex-col gap-3', className)}>
       <div className="flex items-center justify-between">
         <span className="text-sm text-slate-600 dark:text-slate-300">
-          {queue.length} item{queue.length === 1 ? '' : 's'} need attention
+          {queue.length === 1 ? '1 item needs attention' : `${queue.length} items need attention`}
         </span>
-        <span className="text-xs text-slate-500">Use ↑ ↓ Enter to approve, Delete to ignore</span>
+        <span className="text-xs text-slate-600 dark:text-slate-400">
+          Click an item, then choose Approve or Ignore. With the keyboard: the arrow keys move,
+          Enter approves, Delete ignores.
+        </span>
       </div>
       <div
         ref={listRef}
-        className="max-h-[50vh] overflow-auto rounded-lg border border-slate-200 dark:border-slate-700"
+        className="max-h-[50vh] overflow-auto rounded-xl border border-black/[0.06] dark:border-white/[0.08]"
         tabIndex={0}
-        role="listbox"
+        role="list"
         aria-label="Mapping queue"
       >
         {queue.map((item, index) => {
@@ -111,12 +123,19 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
             <div
               key={item.id}
               data-index={index}
-              role="option"
-              aria-selected={isSelected}
+              role="listitem"
+              aria-current={isSelected ? 'true' : undefined}
+              onClick={() => {
+                if (!isSelected) {
+                  setSelectedIndex(index);
+                  setIgnoringId(null);
+                  setIgnoreReason('');
+                }
+              }}
               className={cn(
-                'border-b border-slate-100 p-3 last:border-0 dark:border-slate-800',
+                'cursor-pointer border-b border-black/[0.05] p-3 transition-colors duration-150 last:border-0 dark:border-white/[0.06]',
                 isSelected
-                  ? 'bg-blue-50 dark:bg-blue-900/20'
+                  ? 'bg-accent-50/80 dark:bg-accent-500/10'
                   : 'bg-white dark:bg-slate-900',
               )}
             >
@@ -141,7 +160,7 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
                         onChange={(e) => setIgnoreReason(e.target.value)}
                         placeholder="Reason for ignoring (required)"
                         aria-label="Reason for ignoring"
-                        className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+                        className="h-8 flex-1 rounded-lg border border-black/[0.1] bg-white px-3 text-sm focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/20 dark:border-white/10 dark:bg-white/[0.06] dark:text-slate-100"
                       />
                       <Button
                         size="sm"

@@ -4,8 +4,8 @@
  * Structure half (Connect / Compare structure / Map) calls the backend commands
  * and maps their serde (snake_case) JSON onto the frontend contract.  The data
  * half (checks / run / results) also calls the backend; each method maps the
- * engine's serde output strictly.  Report export is still a typed `EngineError`
- * (NOT_AVAILABLE) until T024.  A false PASS is the worst bug this project can
+ * engine's serde output strictly.  Report export asks the backend to render
+ * its own copy of the run's results behind a native save dialog.  A false PASS is the worst bug this project can
  * have, so nothing here ever invents one.
  *
  * Every mapping is strict: an unknown status or verdict is treated as a
@@ -27,6 +27,7 @@ import type {
   MappingMatch,
   IgnoreItem,
   MatchConfidence,
+  ReportRequest,
   ReportResult,
   Results,
   RunDefinition,
@@ -34,6 +35,7 @@ import type {
   SaveProfileResult,
   SchemaDiffNode,
   ServerInfo,
+  SuperuserOverride,
   TableCheck,
   TableProgress,
   TableResult,
@@ -68,12 +70,6 @@ export class RunFailedError extends Error {
   }
 }
 
-const NOT_AVAILABLE_MESSAGE =
-  'Running checks and exporting reports is not available in this version of Dmux yet.';
-
-function notAvailable(): Promise<never> {
-  return Promise.reject(new EngineError('NOT_AVAILABLE', NOT_AVAILABLE_MESSAGE));
-}
 
 // ---------------------------------------------------------------------------
 // Engine-native (snake_case) shapes, matching the Rust commands' serde output.
@@ -100,6 +96,8 @@ interface RawServerInfo {
   md5_available: boolean;
   sql_ascii: boolean;
   tls: RawTlsState;
+  /** The password is kept in memory for this session (no keychain). */
+  session_password?: boolean;
 }
 
 /** Engine `schema_diff::DiffStatus`. */
@@ -213,6 +211,9 @@ interface BackendProfile {
 }
 
 /** Shape `save_profile` returns: the stored profile plus an optional warning. */
+/** Shape `export_report` returns (`commands::report::ExportReportResult`). */
+type RawExportReport = { status: 'saved'; path: string } | { status: 'cancelled' };
+
 interface RawSaveProfileResult {
   profile: BackendProfile;
   warning: string | null;
@@ -455,7 +456,6 @@ function isAutoApproved(status: string): boolean {
 /** Project the engine `Mapping` + attention queue onto the contract `Mapping`. */
 function translateMapping(
   build: RawMappingBuild,
-  inventory: Inventory,
 ): Mapping {
   const matches: MappingMatch[] = [];
   const needsAttention: MappingMatch[] = [];
@@ -523,18 +523,9 @@ function translateMapping(
     (rule) => `${rule.kind}: ${rule.pattern} -> ${rule.target}`,
   );
 
-  // Surface the encoding/collation differences as review items, matching the
-  // mock's behaviour so the Map screen always surfaces them.
-  if (inventory.oldEncoding !== inventory.newEncoding) {
-    needsAttention.push({
-      id: 'encoding',
-      oldName: `encoding ${inventory.oldEncoding}`,
-      newName: `encoding ${inventory.newEncoding}`,
-      confidence: 'fuzzy',
-      approved: false,
-    });
-  }
-
+  // An encoding difference is not a mapping decision: Dmux converts every
+  // value to UTF-8 before comparing.  It is shown as information on Compare
+  // structure, never as a blocking "needs attention" item.
   return { rules, matches, needsAttention, ignored };
 }
 
@@ -610,6 +601,7 @@ function toServerInfo(raw: RawServerInfo): ServerInfo {
     poolerSuspected: raw.pooler_suspected,
     md5Available: raw.md5_available,
     tls: toTlsState(raw.tls),
+    sessionPassword: raw.session_password === true,
   };
 }
 
@@ -845,8 +837,18 @@ export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
   let lastNewProfile: ConnectionProfile | null = null;
   let lastRawMapping: RawMapping | null = null;
+  let superuserOverride: SuperuserOverride | null = null;
+  /** The backend's `SuperuserOverride { allow, reason }`, or null (refuse). */
+  const allowSuperuser = () =>
+    superuserOverride && superuserOverride.reason.trim()
+      ? { allow: true, reason: superuserOverride.reason.trim() }
+      : null;
 
   return {
+    setSuperuserOverride(override: SuperuserOverride | null): void {
+      superuserOverride = override && override.reason.trim() ? { reason: override.reason } : null;
+    },
+
     async testConnection(
       profile: ConnectionProfile,
       password?: string,
@@ -854,6 +856,7 @@ export function createTauriEngine(): Engine {
       try {
         const info = await invoke<RawServerInfo>('probe_connection', {
           input: toConnectInput(profile, password),
+          allowSuperuser: allowSuperuser(),
         });
         const serverInfo = toServerInfo(info);
         if (serverInfo.isSuperuser) {
@@ -862,7 +865,15 @@ export function createTauriEngine(): Engine {
         }
         return { ok: true, info: serverInfo };
       } catch (error) {
-        return { ok: false, error: describeError(error) };
+        const refused =
+          typeof error === 'object' &&
+          error !== null &&
+          (error as { kind?: unknown }).kind === 'superuser_refused';
+        return {
+          ok: false,
+          error: describeError(error),
+          ...(refused ? { superuserRefused: true } : {}),
+        };
       }
     },
 
@@ -891,15 +902,14 @@ export function createTauriEngine(): Engine {
       lastOldProfile = oldProfile;
       lastNewProfile = newProfile;
 
-      const oldInventory = await invoke<Record<string, unknown>>('run_inventory', {
-        input: toConnectInput(oldProfile),
-      });
-      const newInventory = await invoke<Record<string, unknown>>('run_inventory', {
-        input: toConnectInput(newProfile),
-      });
-      const diff = await invoke<RawSchemaDiff>('schema_diff', {
-        old: oldInventory,
-        new: newInventory,
+      // One call: the engine collects and compares both inventories itself.
+      // The raw inventories hold 64-bit values (sequence bounds up to
+      // i64::MAX) that a JS number cannot carry, so they must not round-trip
+      // through the webview.
+      const diff = await invoke<RawSchemaDiff>('compare_structure', {
+        old: toConnectInput(oldProfile),
+        new: toConnectInput(newProfile),
+        allowSuperuser: allowSuperuser(),
       });
 
       return {
@@ -911,16 +921,18 @@ export function createTauriEngine(): Engine {
       };
     },
 
-    async buildMapping(inventory: Inventory): Promise<Mapping> {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the backend builds the mapping from the live databases
+    async buildMapping(_inventory: Inventory): Promise<Mapping> {
       if (!lastOldProfile || !lastNewProfile) {
         throw new Error('compareStructure must run before buildMapping');
       }
       const build = await invoke<RawMappingBuild>('build_mapping', {
         old: toConnectInput(lastOldProfile),
         new: toConnectInput(lastNewProfile),
+        allowSuperuser: allowSuperuser(),
       });
       lastRawMapping = build.mapping;
-      return translateMapping(build, inventory);
+      return translateMapping(build);
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the projected mapping is rebuilt from the backend `lastRawMapping`
@@ -947,6 +959,7 @@ export function createTauriEngine(): Engine {
         old: toConnectInput(lastOldProfile),
         new: toConnectInput(lastNewProfile),
         mapping: lastRawMapping,
+        allowSuperuser: allowSuperuser(),
       });
       return translateCheckPlan(raw);
     },
@@ -967,6 +980,7 @@ export function createTauriEngine(): Engine {
           levels,
           default_level: 'full_values',
           control_total_columns: controlTotalColumns,
+          allow_superuser: allowSuperuser(),
         },
       });
       return { runId: started.run_id, overallState: 'running', tables: [] };
@@ -992,10 +1006,24 @@ export function createTauriEngine(): Engine {
       return translateResults(raw);
     },
 
-    exportReport(): Promise<ReportResult> {
-      // Report export lands with T024; until then it is a typed NOT_AVAILABLE,
-      // never a fabricated report or verdict.
-      return notAvailable();
+    async exportReport(request: ReportRequest): Promise<ReportResult> {
+      // The backend renders from its own copy of the run's results and opens
+      // the native save dialog itself: no results and no path cross the IPC.
+      try {
+        const raw = await invoke<RawExportReport>('export_report', {
+          input: {
+            run_id: request.runId,
+            format: request.format,
+            include_keys: request.includeKeys,
+          },
+        });
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, filePath: raw.path };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
     },
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');

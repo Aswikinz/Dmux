@@ -11,6 +11,7 @@ import type {
   RunProgress,
   SaveProfileResult,
   ServerInfo,
+  SuperuserOverride,
 } from './contract';
 
 /**
@@ -34,6 +35,13 @@ export interface Engine {
    * the app asks for the password on each run.
    */
   saveProfile(profile: ConnectionProfile, password?: string): Promise<SaveProfileResult>;
+
+  /**
+   * Allow (or, with `null`, stop allowing) a superuser login for every later
+   * connection: test, structure, mapping, plan and run.  The reason is required
+   * and is recorded in the results.  Superusers are refused by default.
+   */
+  setSuperuserOverride(override: SuperuserOverride | null): void;
 
   /** Whether a keychain password is stored for a profile (never returns it). */
   profileHasPassword(id: string): Promise<boolean>;

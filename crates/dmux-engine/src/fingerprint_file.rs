@@ -15,6 +15,13 @@
 //! range, the bucket row counts adding up to the declared row count, and
 //! columns, types, options, key and control-total lists consistent.  The
 //! mapping hash and plan equality are checked again at compare time.
+//!
+//! Two further checks close audit H3.  The file's `normalise_rules_version`
+//! must equal [`NORMALISE_RULES_VERSION`]: a capture made under other rules
+//! hashed its values differently and is refused (a missing version is refused
+//! too).  And each full-values table's `needs_review` is recomputed from its
+//! own `column_types` and `options` with the core planner: a file that claims
+//! `false` where the planner says `true` has been edited and is refused.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +30,9 @@ use std::io::Read;
 use thiserror::Error;
 
 use crate::core::fingerprint::{BucketSummary, Decimal, MAX_BUCKET_DIGITS};
-use crate::core::normalise::{ColumnOptions, PgType};
+use crate::core::normalise::{
+    plan_column, ColumnMapping, ColumnOptions, PgType, NORMALISE_RULES_VERSION,
+};
 use crate::inventory::DatabaseInventory;
 use crate::results::CheckLevel;
 
@@ -33,14 +42,16 @@ use crate::results::CheckLevel;
 /// `options` and `control_columns` to every table.
 pub const FINGERPRINT_VERSION: u32 = 3;
 
-/// Maximum accepted fingerprint file size (uncompressed), in bytes.
-pub const MAX_FINGERPRINT_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum accepted fingerprint file size (uncompressed), in bytes (audit L2).
+/// A capture holds only bucket summaries and the inventory, so even thousands
+/// of large tables stay well below this.
+pub const MAX_FINGERPRINT_BYTES: usize = 64 * 1024 * 1024;
 
 /// One 32-bit slice of an md5, the most a single row adds to a bucket sum.
 const SLICE_MAX: u128 = 0xffff_ffff;
 
 /// Errors when reading or writing a fingerprint file.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum FingerprintFileError {
     #[error("file too large: {0} bytes")]
     TooLarge(usize),
@@ -62,6 +73,24 @@ pub enum FingerprintFileError {
     /// consistent fingerprint (duplicates, sums that do not add up, ...).
     #[error("invalid fingerprint file: {0}")]
     Invalid(String),
+    /// The file carries no normalisation-rules version (made before it was
+    /// recorded), so what its hashes mean is unknown.
+    #[error(
+        "the capture does not record its normalisation rules version; capture it again with this version of Dmux (rules version {current})"
+    )]
+    RulesVersionMissing { current: u32 },
+    /// The file was captured under other normalisation rules: its hashes are
+    /// not comparable with what this version computes.
+    #[error(
+        "the capture was made with normalisation rules version {found}, but this version of Dmux uses {current}; capture it again with this version"
+    )]
+    RulesVersionMismatch { found: u32, current: u32 },
+    /// A table says it needs no review, but its own column types and options
+    /// say it does: the file was edited.
+    #[error(
+        "{table}: the file says the table needs no review, but its column types or options require review; the file has been edited"
+    )]
+    NeedsReviewCleared { table: String },
 }
 
 /// Server information carried in the fingerprint file header.
@@ -97,10 +126,54 @@ pub struct CapturedTable {
     pub rows: u64,
     pub buckets: Vec<BucketSummary>,
     pub control_totals: Vec<Decimal>,
+    /// As stored.  Never trusted alone: see [`CapturedTable::effective_needs_review`].
     pub needs_review: bool,
 }
 
 impl CapturedTable {
+    /// Whether the planner flags any column of this table for review, from the
+    /// table's own `column_types` and `options` (both sides of a capture use
+    /// the same type).  Only full-values tables hash values, so a counts-only
+    /// table never needs review on these grounds.  A column the planner
+    /// refuses is an error.
+    fn recomputed_needs_review(&self) -> Result<bool, FingerprintFileError> {
+        if self.level != CheckLevel::FullValues {
+            return Ok(false);
+        }
+        let mut any = false;
+        for ((name, ty), options) in self
+            .columns
+            .iter()
+            .zip(self.column_types.iter())
+            .zip(self.options.iter())
+        {
+            let m = ColumnMapping {
+                old_name: name.clone(),
+                new_name: name.clone(),
+                old_type: ty.clone(),
+                new_type: ty.clone(),
+                options: options.clone(),
+                control_total: self.control_columns.contains(name),
+            };
+            let plan = plan_column(&m).map_err(|e| {
+                FingerprintFileError::Invalid(format!(
+                    "{}: column {name} cannot be planned: {e}",
+                    self.old_qualified
+                ))
+            })?;
+            any |= plan.needs_review();
+        }
+        Ok(any)
+    }
+
+    /// The stored flag OR the recomputed one: what a comparison must use.
+    /// [`FingerprintFile::validate`] has already refused a file where the two
+    /// disagree in the unsafe direction; this keeps the rule even for a file
+    /// that skipped it.
+    pub fn effective_needs_review(&self) -> bool {
+        self.needs_review || self.recomputed_needs_review().unwrap_or(true)
+    }
+
     /// The bucket count implied by `bucket_digits` (2^(4*digits)).
     pub fn expected_bucket_count(&self) -> u64 {
         1u64 << (4 * u32::from(self.bucket_digits.min(MAX_BUCKET_DIGITS)))
@@ -157,6 +230,11 @@ impl CapturedTable {
                 self.control_columns.len(),
                 self.control_totals.len()
             ));
+        }
+        if self.recomputed_needs_review()? && !self.needs_review {
+            return Err(FingerprintFileError::NeedsReviewCleared {
+                table: self.old_qualified.clone(),
+            });
         }
         match self.level {
             CheckLevel::Structure => {
@@ -223,6 +301,10 @@ impl CapturedTable {
 pub struct FingerprintFile {
     pub format_version: u32,
     pub tool_version: String,
+    /// The [`NORMALISE_RULES_VERSION`] the hashes were computed under.  Absent
+    /// in files written before it was recorded; such files are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalise_rules_version: Option<u32>,
     pub mapping_hash: String,
     pub server: CapturedServer,
     pub tables: Vec<CapturedTable>,
@@ -240,6 +322,8 @@ pub struct FingerprintFile {
 struct Hashable<'a> {
     format_version: u32,
     tool_version: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalise_rules_version: Option<u32>,
     mapping_hash: &'a str,
     server: &'a CapturedServer,
     tables: &'a [CapturedTable],
@@ -251,6 +335,7 @@ impl<'a> From<&'a FingerprintFile> for Hashable<'a> {
         Hashable {
             format_version: f.format_version,
             tool_version: &f.tool_version,
+            normalise_rules_version: f.normalise_rules_version,
             mapping_hash: &f.mapping_hash,
             server: &f.server,
             tables: &f.tables,
@@ -275,6 +360,7 @@ impl FingerprintFile {
                 self.format_version,
             ));
         }
+        self.check_rules_version()?;
         let computed = compute_sha256(self);
         if computed != self.sha256 {
             return Err(FingerprintFileError::HashMismatch {
@@ -293,6 +379,7 @@ impl FingerprintFile {
                 self.format_version,
             ));
         }
+        self.check_rules_version()?;
         let mut names = BTreeSet::new();
         for t in &self.tables {
             if !names.insert(t.old_qualified.as_str()) {
@@ -307,6 +394,36 @@ impl FingerprintFile {
             validate_inventory(inv, &self.tables)?;
         }
         Ok(())
+    }
+
+    /// Refuse a file captured under other normalisation rules, or one that
+    /// does not say which rules it used (decision 23).
+    pub fn check_rules_version(&self) -> Result<(), FingerprintFileError> {
+        match self.normalise_rules_version {
+            None => Err(FingerprintFileError::RulesVersionMissing {
+                current: NORMALISE_RULES_VERSION,
+            }),
+            Some(v) if v != NORMALISE_RULES_VERSION => {
+                Err(FingerprintFileError::RulesVersionMismatch {
+                    found: v,
+                    current: NORMALISE_RULES_VERSION,
+                })
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// A run warning when the file was written by another Dmux version whose
+    /// normalisation rules match this one (decision 23): the hashes compare,
+    /// but the signer should know.  `side` is "old" or "new".
+    pub fn tool_version_warning(&self, side: &str) -> Option<String> {
+        let running = crate::version();
+        (self.tool_version != running).then(|| {
+            format!(
+                "the {side} capture was made by Dmux {}, and this run uses Dmux {running}; both use normalisation rules version {NORMALISE_RULES_VERSION}",
+                sanitize_version(&self.tool_version)
+            )
+        })
     }
 
     /// Serialise to canonical JSON with a fresh hash.
@@ -331,30 +448,35 @@ impl FingerprintFile {
 
     /// Load from raw bytes, rejecting untrusted input (see the module docs).
     /// Gzip is detected by its magic bytes, not the extension.
+    ///
+    /// The JSON text is parsed once, into a `serde_json::Value`; the typed
+    /// file is built from that value, and the unknown-field check compares it
+    /// piece by piece (header, each table, inventory) with the typed value's
+    /// canonical form, so no second full copy of the file is held (audit L2).
     pub fn from_bytes(bytes: &[u8]) -> Result<FingerprintFile, FingerprintFileError> {
+        use serde_json::Value;
         if bytes.len() > MAX_FINGERPRINT_BYTES {
             return Err(FingerprintFileError::TooLarge(bytes.len()));
         }
-        let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let raw: Value = if bytes.starts_with(&[0x1f, 0x8b]) {
             let mut out = Vec::new();
             // Bound the inflated size too: never inflate beyond the limit.
             flate2::read::GzDecoder::new(bytes)
                 .take((MAX_FINGERPRINT_BYTES as u64) + 1)
                 .read_to_end(&mut out)
                 .map_err(|e| FingerprintFileError::Io(e.to_string()))?;
-            out
+            if out.len() > MAX_FINGERPRINT_BYTES {
+                return Err(FingerprintFileError::TooLarge(out.len()));
+            }
+            serde_json::from_slice(&out)
         } else {
-            bytes.to_vec()
-        };
-        if bytes.len() > MAX_FINGERPRINT_BYTES {
-            return Err(FingerprintFileError::TooLarge(bytes.len()));
+            serde_json::from_slice(bytes)
         }
+        .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
 
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
         let version = raw
             .get("format_version")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(Value::as_u64)
             .ok_or_else(|| FingerprintFileError::Json("missing format_version".into()))?;
         if version != u64::from(FINGERPRINT_VERSION) {
             return Err(FingerprintFileError::UnsupportedVersion(
@@ -362,16 +484,40 @@ impl FingerprintFile {
             ));
         }
 
-        let file: FingerprintFile = serde_json::from_slice(&bytes)
+        let file = FingerprintFile::deserialize(&raw)
             .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
 
         // Unknown fields at any depth: every key of the input must survive a
-        // round trip through the typed value.
-        let canonical: serde_json::Value = serde_json::to_vec(&file)
-            .and_then(|v| serde_json::from_slice(&v))
-            .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
+        // round trip through the typed value.  Checked in pieces.
+        let json = |e: serde_json::Error| FingerprintFileError::Json(e.to_string());
         let mut unknown = Vec::new();
-        unknown_keys(&raw, &canonical, "", &mut unknown);
+        let header = FingerprintFile {
+            format_version: file.format_version,
+            tool_version: String::new(),
+            normalise_rules_version: file.normalise_rules_version,
+            mapping_hash: String::new(),
+            server: file.server.clone(),
+            tables: Vec::new(),
+            inventory: None,
+            sha256: String::new(),
+        };
+        unknown_keys(
+            &raw,
+            &serde_json::to_value(&header).map_err(json)?,
+            "",
+            &mut unknown,
+        );
+        if let Some(Value::Array(raw_tables)) = raw.get("tables") {
+            for (i, (rt, t)) in raw_tables.iter().zip(file.tables.iter()).enumerate() {
+                let canon = serde_json::to_value(t).map_err(json)?;
+                unknown_keys(rt, &canon, &format!("tables[{i}]"), &mut unknown);
+            }
+        }
+        if let (Some(ri), Some(inv)) = (raw.get("inventory"), &file.inventory) {
+            let canon = serde_json::to_value(inv).map_err(json)?;
+            unknown_keys(ri, &canon, "inventory", &mut unknown);
+        }
+        drop(raw);
         if !unknown.is_empty() {
             return Err(FingerprintFileError::UnknownFields(unknown));
         }
@@ -427,6 +573,21 @@ fn validate_inventory(
         }
     }
     Ok(())
+}
+
+/// A tool version read from an untrusted file, made safe to print in a warning:
+/// only version characters, at most 40 of them.
+fn sanitize_version(v: &str) -> String {
+    let kept: String = v
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        .take(40)
+        .collect();
+    if kept.is_empty() {
+        "(unknown version)".into()
+    } else {
+        kept
+    }
 }
 
 /// Collect every object key present in `raw` but absent at the same place in
@@ -576,6 +737,7 @@ mod tests {
         FingerprintFile {
             format_version: FINGERPRINT_VERSION,
             tool_version: "test".to_string(),
+            normalise_rules_version: Some(NORMALISE_RULES_VERSION),
             mapping_hash: "mhash".to_string(),
             server: CapturedServer {
                 version_num: 170000,
@@ -693,6 +855,217 @@ mod tests {
             FingerprintFile::from_bytes(&big),
             Err(FingerprintFileError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn the_size_limit_is_64_mib() {
+        assert_eq!(MAX_FINGERPRINT_BYTES, 64 * 1024 * 1024);
+        // Exactly at the limit is not refused for size (it fails as JSON).
+        let at = vec![b' '; MAX_FINGERPRINT_BYTES];
+        assert!(matches!(
+            FingerprintFile::from_bytes(&at),
+            Err(FingerprintFileError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_gzip_that_inflates_past_the_limit() {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut enc, &vec![b' '; MAX_FINGERPRINT_BYTES + 1]).unwrap();
+        let gz = enc.finish().unwrap();
+        assert!(gz.len() < MAX_FINGERPRINT_BYTES);
+        assert_eq!(
+            FingerprintFile::from_bytes(&gz),
+            Err(FingerprintFileError::TooLarge(MAX_FINGERPRINT_BYTES + 1))
+        );
+        // Inflating to exactly the limit is not refused for size.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut enc, &vec![b' '; MAX_FINGERPRINT_BYTES]).unwrap();
+        assert!(matches!(
+            FingerprintFile::from_bytes(&enc.finish().unwrap()),
+            Err(FingerprintFileError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_oversized_file_on_disk() {
+        let dir = std::env::temp_dir().join(format!("dmux-fp-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_FINGERPRINT_BYTES as u64 + 1).unwrap();
+        let r = FingerprintFile::read_from(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            r,
+            Err(FingerprintFileError::TooLarge(MAX_FINGERPRINT_BYTES + 1))
+        );
+    }
+
+    #[test]
+    fn a_capture_from_other_normalisation_rules_is_refused() {
+        for other in [0, NORMALISE_RULES_VERSION + 1, u32::MAX] {
+            let mut f = sample();
+            f.normalise_rules_version = Some(other);
+            // The hash is recomputed, as an editor would: still refused.
+            assert_eq!(
+                round(f.clone()),
+                Err(FingerprintFileError::RulesVersionMismatch {
+                    found: other,
+                    current: NORMALISE_RULES_VERSION
+                })
+            );
+            assert_eq!(
+                f.validate(),
+                Err(FingerprintFileError::RulesVersionMismatch {
+                    found: other,
+                    current: NORMALISE_RULES_VERSION
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_capture_without_a_rules_version_is_refused() {
+        let mut f = sample();
+        f.normalise_rules_version = None;
+        let json = f.clone().to_json().unwrap();
+        // Written as an older Dmux would: no key at all.
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(v.get("normalise_rules_version").is_none());
+        let missing = FingerprintFileError::RulesVersionMissing {
+            current: NORMALISE_RULES_VERSION,
+        };
+        assert_eq!(FingerprintFile::from_bytes(&json), Err(missing.clone()));
+        assert_eq!(f.validate(), Err(missing));
+        // An explicit null is not a version either.
+        let mut v = v;
+        v["normalise_rules_version"] = serde_json::Value::Null;
+        assert!(FingerprintFile::from_bytes(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_rules_version_is_written_and_hashed() {
+        let json = sample().to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            v["normalise_rules_version"],
+            serde_json::json!(NORMALISE_RULES_VERSION)
+        );
+        // Changing it with the old hash kept is a hash mismatch, not accepted.
+        let mut v = v;
+        v["normalise_rules_version"] = serde_json::json!(NORMALISE_RULES_VERSION);
+        v["tool_version"] = serde_json::json!("edited");
+        assert!(matches!(
+            FingerprintFile::from_bytes(&serde_json::to_vec(&v).unwrap()),
+            Err(FingerprintFileError::HashMismatch { .. })
+        ));
+    }
+
+    /// A table whose types need review, with the flag forged to `false`.
+    fn forged(ty: PgType) -> FingerprintFile {
+        let mut f = sample();
+        f.tables[0].columns = vec!["account_id".into(), "shape".into()];
+        f.tables[0].column_types = vec![PgType::Int8, ty];
+        f.tables[0].control_columns.clear();
+        f.tables[0].control_totals.clear();
+        f.tables[0].needs_review = false;
+        f
+    }
+
+    fn review_types() -> Vec<PgType> {
+        vec![
+            PgType::Unknown("public.geometry".into()),
+            PgType::Composite {
+                name: "public.pt".into(),
+                fields: vec![PgType::Float8, PgType::Int4],
+            },
+            PgType::Range {
+                name: "public.georange".into(),
+                sub: Box::new(PgType::Unknown("public.geometry".into())),
+            },
+            PgType::Array(Box::new(PgType::Unknown("public.geometry".into()))),
+            PgType::Domain {
+                name: "public.d".into(),
+                base: Box::new(PgType::Unknown("x".into())),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_forged_needs_review_false_is_refused() {
+        for ty in review_types() {
+            let f = forged(ty.clone());
+            let cleared = FingerprintFileError::NeedsReviewCleared {
+                table: "demo_bank.accounts".into(),
+            };
+            // Hash recomputed by the forger: the planner still catches it.
+            assert_eq!(round(f.clone()), Err(cleared.clone()), "{ty:?}");
+            assert_eq!(f.validate(), Err(cleared), "{ty:?}");
+            assert!(f.tables[0].effective_needs_review(), "{ty:?}");
+            // Stored honestly, the same file is accepted and needs review.
+            let mut ok = f;
+            ok.tables[0].needs_review = true;
+            let back = round(ok).unwrap();
+            assert!(back.tables[0].effective_needs_review());
+        }
+    }
+
+    #[test]
+    fn needs_review_is_recomputed_only_for_full_values() {
+        // A counts-only table hashes no values, so its types do not matter.
+        let mut f = forged(PgType::Unknown("x".into()));
+        f.tables[0].level = CheckLevel::CountsAndTotals;
+        f.tables[0].buckets.clear();
+        f.tables[0].bucket_digits = 3;
+        f.tables[0].rows = 3;
+        assert!(round(f.clone()).is_ok());
+        assert!(!f.tables[0].effective_needs_review());
+    }
+
+    #[test]
+    fn stored_needs_review_true_is_kept_even_when_types_are_exact() {
+        let mut f = sample();
+        f.tables[0].needs_review = true;
+        let back = round(f).unwrap();
+        assert!(back.tables[0].effective_needs_review());
+        // And a plain exact table stays clean.
+        assert!(!sample().tables[0].effective_needs_review());
+    }
+
+    #[test]
+    fn a_column_the_planner_refuses_is_invalid() {
+        // A control total on a text column cannot be planned.
+        let mut f = sample();
+        f.tables[0].column_types[1] = PgType::Text;
+        invalid(f.clone(), "column balance cannot be planned");
+        // effective_needs_review fails closed when the plan cannot be built.
+        assert!(f.tables[0].effective_needs_review());
+    }
+
+    #[test]
+    fn tool_version_warning_only_when_versions_differ() {
+        let mut f = sample();
+        f.tool_version = crate::version().into();
+        assert_eq!(f.tool_version_warning("old"), None);
+        f.tool_version = "0.0.1".into();
+        let w = f.tool_version_warning("old").unwrap();
+        assert!(w.contains("old capture was made by Dmux 0.0.1"), "{w}");
+        assert!(w.contains(crate::version()), "{w}");
+        assert!(
+            w.contains(&format!("rules version {NORMALISE_RULES_VERSION}")),
+            "{w}"
+        );
+        // An untrusted version string never carries control or markup text.
+        f.tool_version = "1.0\n<script>\u{202e}".into();
+        let w = f.tool_version_warning("new").unwrap();
+        assert!(w.contains("Dmux 1.0script, and"), "{w}");
+        f.tool_version = "\u{0}".into();
+        assert!(f
+            .tool_version_warning("new")
+            .unwrap()
+            .contains("(unknown version)"));
+        assert_eq!(sanitize_version(&"9".repeat(100)).len(), 40);
     }
 
     #[test]

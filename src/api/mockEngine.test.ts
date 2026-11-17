@@ -32,12 +32,17 @@ describe('mockEngine', () => {
     expect(res.error).toBeDefined();
   });
 
-  it('flags superuser logins', async () => {
-    const res = await mockEngine.testConnection(profile({ user: 'superuser' }));
+  it('refuses superuser logins until the user allows them with a reason', async () => {
+    const engine = createMockEngine();
+    const refused = await engine.testConnection(profile({ user: 'superuser' }));
+    expect(refused.ok).toBe(false);
+    expect(refused.superuserRefused).toBe(true);
+    engine.setSuperuserOverride({ reason: 'rehearsal copy' });
+    const res = await engine.testConnection(profile({ user: 'superuser' }));
     expect(res.ok).toBe(true);
     expect(res.info?.isSuperuser).toBe(true);
     expect(res.info?.canWrite).toBe(true);
-    expect(res.info?.warning).toBeDefined();
+    expect(res.info?.warning).toContain('rehearsal copy');
   });
 
   it('warns on plaintext connections', async () => {
@@ -117,11 +122,11 @@ describe('mockEngine', () => {
 
   it('exports PDF and Excel reports', async () => {
     await expect(
-      mockEngine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' }),
-    ).resolves.toMatchObject({ ok: true, filePath: '/tmp/x/report.pdf' });
+      mockEngine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false }),
+    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.pdf' });
     await expect(
-      mockEngine.exportReport({ format: 'excel', includeKeys: true, filePath: '/tmp/x' }),
-    ).resolves.toMatchObject({ ok: true, filePath: '/tmp/x/report.xlsx' });
+      mockEngine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true }),
+    ).resolves.toMatchObject({ ok: true, filePath: 'chosen-location/dmux-run-1.xlsx' });
   });
 
   it('returns its version string', async () => {

@@ -1,6 +1,17 @@
-import { CheckCircle, AlertCircle, AlertTriangle, XCircle, Info } from 'lucide-react';
+import { CheckCircle, AlertCircle, AlertTriangle, XCircle, Info, Flag } from 'lucide-react';
 import { cn } from './cn';
 import type { Verdict } from '../api/contract';
+
+/** The one spelling of every verdict, used on every screen (never colour alone). */
+export const VERDICT_WORDS: Record<Verdict, string> = {
+  PASS: 'PASS',
+  FAIL: 'FAIL',
+  WARNING: 'WARNING',
+  NEEDS_REVIEW: 'NEEDS REVIEW',
+  CHANGED_DURING_CHECK: 'CHANGED DURING CHECK',
+  TOOL_FAULT: 'TOOL FAULT',
+  WIDELY_DIFFERENT: 'WIDELY DIFFERENT',
+};
 
 interface StatusBadgeProps {
   status:
@@ -30,21 +41,22 @@ const config: Record<
   StatusBadgeProps['status'] | 'unknown',
   { icon: typeof CheckCircle; label: string; classes: string }
 > = {
-  PASS: { icon: CheckCircle, label: 'Pass', classes: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' },
-  FAIL: { icon: XCircle, label: 'Fail', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
-  WIDELY_DIFFERENT: { icon: AlertTriangle, label: 'Widely different', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
-  NEEDS_REVIEW: { icon: AlertTriangle, label: 'Needs review', classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
-  CHANGED_DURING_CHECK: { icon: AlertCircle, label: 'Changed during check', classes: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300' },
-  TOOL_FAULT: { icon: AlertCircle, label: 'Tool fault', classes: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300' },
-  WARNING: { icon: AlertTriangle, label: 'Warning', classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  PASS: { icon: CheckCircle, label: 'PASS', classes: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' },
+  FAIL: { icon: XCircle, label: 'FAIL', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+  WIDELY_DIFFERENT: { icon: AlertTriangle, label: 'WIDELY DIFFERENT', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+  NEEDS_REVIEW: { icon: AlertTriangle, label: 'NEEDS REVIEW', classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  CHANGED_DURING_CHECK: { icon: AlertCircle, label: 'CHANGED DURING CHECK', classes: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300' },
+  TOOL_FAULT: { icon: AlertCircle, label: 'TOOL FAULT', classes: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300' },
+  WARNING: { icon: AlertTriangle, label: 'WARNING', classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
   idle: { icon: Info, label: 'Idle', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
-  running: { icon: Info, label: 'Running', classes: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300' },
+  running: { icon: Info, label: 'Running', classes: 'bg-accent-50 text-accent-700 dark:bg-accent-500/15 dark:text-accent-300' },
   paused: { icon: Info, label: 'Paused', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   cancelled: { icon: AlertCircle, label: 'Cancelled', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   queued: { icon: Info, label: 'Queued', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
-  done: { icon: CheckCircle, label: 'Done', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
-  failed: { icon: XCircle, label: 'Failed', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
-  'changed-during-check': { icon: AlertCircle, label: 'Changed during check', classes: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300' },
+  // A finished scan is not a verdict: a neutral flag, never a success tick.
+  done: { icon: Flag, label: 'Scan finished', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
+  failed: { icon: XCircle, label: 'Scan failed', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
+  'changed-during-check': { icon: AlertCircle, label: 'CHANGED DURING CHECK', classes: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300' },
   same: { icon: CheckCircle, label: 'Same', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   missing: { icon: XCircle, label: 'Missing', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
   added: { icon: CheckCircle, label: 'Added', classes: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' },
@@ -63,12 +75,12 @@ export function StatusBadge({ status, label, className }: StatusBadgeProps) {
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-sm font-medium',
+        'inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold tracking-[0.01em] ring-1 ring-inset ring-current/15',
         classes,
         className,
       )}
     >
-      <Icon className="h-4 w-4" aria-hidden="true" />
+      <Icon className="h-3.5 w-3.5" strokeWidth={2.5} aria-hidden="true" />
       {label ?? configEntry.label}
     </span>
   );

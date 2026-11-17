@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createTauriEngine,
-  EngineError,
   mapDiffStatus,
   mapLevel,
   mapOverallState,
@@ -36,8 +35,6 @@ const rawServerInfo = {
   sql_ascii: false,
   tls: { state: 'encrypted', verified: true },
 };
-
-const emptyInventory: Record<string, unknown> = {};
 
 function rawDiff(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -138,10 +135,21 @@ describe('createTauriEngine', () => {
 
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: null }),
+      allowSuperuser: null,
     });
     expect(result.ok).toBe(true);
     expect(result.info?.version).toBe('17.0');
     expect(result.info?.tls).toEqual({ state: 'encrypted', verified: true });
+  });
+
+  it('testConnection reports a session-only password, and never a password value', async () => {
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, session_password: true });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.info?.sessionPassword).toBe(true);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    const plain = await engine.testConnection(profile());
+    expect(plain.info?.sessionPassword).toBe(false);
   });
 
   it('testConnection reflects a pinned certificate fingerprint', async () => {
@@ -240,10 +248,7 @@ describe('createTauriEngine', () => {
 
   it('compareStructure collects both inventories and translates the diff', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(
           rawDiff({
             entries: [
@@ -282,6 +287,28 @@ describe('createTauriEngine', () => {
     expect(missing?.status).toBe('missing');
   });
 
+  it('compareStructure sends only connection details, never an inventory', async () => {
+    // Inventories hold 64-bit sequence bounds (up to i64::MAX) that a JS
+    // number rounds to 9223372036854776000; they must stay in the engine.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+
+    const engine = createTauriEngine();
+    await engine.compareStructure(profile({ port: 5433 }), profile({ port: 5434 }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const [cmd, args] = invoke.mock.calls[0] as [string, Record<string, unknown>];
+    expect(cmd).toBe('compare_structure');
+    expect(Object.keys(args).sort()).toEqual(['allowSuperuser', 'new', 'old']);
+    expect(args.allowSuperuser).toBeNull();
+    const oldArg = args.old as { profile: { port: number } };
+    const newArg = args.new as { profile: { port: number } };
+    expect(oldArg.profile.port).toBe(5433);
+    expect(newArg.profile.port).toBe(5434);
+  });
+
   it('buildMapping requires compareStructure first', async () => {
     const engine = createTauriEngine();
     await expect(engine.buildMapping(inventory())).rejects.toThrow();
@@ -289,10 +316,7 @@ describe('createTauriEngine', () => {
 
   it('buildMapping only auto-approves exact and case_insensitive matches', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(rawDiff());
       }
       if (cmd === 'build_mapping') {
@@ -329,10 +353,7 @@ describe('createTauriEngine', () => {
 
   it('saveMapping exports the backend-built mapping', async () => {
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') {
-        return Promise.resolve(emptyInventory);
-      }
-      if (cmd === 'schema_diff') {
+      if (cmd === 'compare_structure') {
         return Promise.resolve(rawDiff());
       }
       if (cmd === 'build_mapping') {
@@ -424,7 +445,59 @@ describe('profile commands', () => {
     await engine.testConnection(profile(), 'hunter2');
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: 'hunter2' }),
+      allowSuperuser: null,
     });
+  });
+
+  it('a superuser is refused until the user allows it with a reason, which every call then carries', async () => {
+    const engine = createTauriEngine();
+    invoke.mockRejectedValueOnce({ kind: 'superuser_refused' });
+    const refused = await engine.testConnection(profile());
+    expect(refused.ok).toBe(false);
+    expect(refused.superuserRefused).toBe(true);
+
+    // A blank reason is not an override.
+    engine.setSuperuserOverride({ reason: '   ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
+
+    engine.setSuperuserOverride({ reason: ' migration rehearsal on a copy ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    const ok = await engine.testConnection(profile());
+    expect(ok.ok).toBe(true);
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Structure and the run carry it too.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      return Promise.resolve({});
+    });
+    await engine.compareStructure(profile(), profile());
+    expect(invoke).toHaveBeenCalledWith(
+      'compare_structure',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Revoking it goes back to refusing.
+    engine.setSuperuserOverride(null);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
   });
 
   it('testConnection surfaces the ask-for-password prompt on password_missing', async () => {
@@ -499,19 +572,42 @@ describe('a failed run', () => {
 });
 
 describe('data half is wired to the backend', () => {
-  it('exportReport is still NOT_AVAILABLE (T024)', async () => {
+  it('exportReport sends only the run id, format and key choice, and maps a saved path', async () => {
+    invoke.mockResolvedValueOnce({ status: 'saved', path: '/home/u/dmux-run-1.pdf' });
     const engine = createTauriEngine();
-    const call = engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
-    await expect(call).rejects.toBeInstanceOf(EngineError);
-    await expect(call).rejects.toMatchObject({ code: 'NOT_AVAILABLE' });
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'pdf', include_keys: false },
+    });
+    expect(res).toEqual({ ok: true, filePath: '/home/u/dmux-run-1.pdf' });
+  });
+
+  it('exportReport reports a dismissed dialog as cancelled', async () => {
+    invoke.mockResolvedValueOnce({ status: 'cancelled' });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'excel', include_keys: true },
+    });
+    expect(res).toEqual({ ok: false, cancelled: true });
+  });
+
+  it('exportReport turns a typed backend error into plain text', async () => {
+    invoke.mockRejectedValueOnce({
+      kind: 'results_not_available',
+      message: 'results are not available: the run has not finished',
+    });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('has not finished');
   });
 
   it('buildCheckPlan invokes build_check_plan and maps the plan', async () => {
     const engine = createTauriEngine();
     // Satisfy the compare/buildMapping prerequisites.
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
-      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
       if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
       if (cmd === 'build_check_plan') {
         return Promise.resolve({
@@ -546,8 +642,7 @@ describe('data half is wired to the backend', () => {
   it('startRun sends the resolved levels and control totals', async () => {
     const engine = createTauriEngine();
     invoke.mockImplementation((cmd: string) => {
-      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
-      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
       if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
       if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-abc' });
       return Promise.reject(new Error(`unexpected command ${cmd}`));

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local app window only: core defaults plus the app's own custom commands. No shell, filesystem, http or other plugin permissions (PLAN 6.9 rules 8/9; CSP stays default-src 'self').",
+  "description": "Local app window only: core defaults plus the app's own custom commands. No shell, filesystem, http, dialog or other plugin permissions: the report save dialog is opened from Rust (PLAN 6.9 rules 8/9; CSP stays default-src 'self').",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -10,8 +10,7 @@
     "allow-delete-profile",
     "allow-profile-has-password",
     "allow-probe-connection",
-    "allow-run-inventory",
-    "allow-schema-diff",
+    "allow-compare-structure",
     "allow-build-mapping",
     "allow-update-mapping",
     "allow-export-mapping",
@@ -22,6 +21,7 @@
     "allow-poll-run",
     "allow-set-run-paused",
     "allow-cancel-run",
-    "allow-get-results"
+    "allow-get-results",
+    "allow-export-report"
   ]
 }

@@ -339,14 +339,23 @@ pub fn map_table(mapping: &Mapping, schema: &str, table: &str) -> (String, Strin
 pub fn definition_hash(config: &RunConfig) -> String {
     use sha2::Digest;
     let input = |i: &Input| match i {
-        Input::Live(p) => serde_json::json!({
-            "host": p.host, "port": p.port, "db": p.dbname, "user": p.user,
-            "tls": match &p.tls_mode {
-                crate::db::TlsMode::VerifyFull => "verify".to_string(),
-                crate::db::TlsMode::TrustFingerprint(f) => format!("fingerprint:{f}"),
-                crate::db::TlsMode::Disable(_) => "disable".to_string(),
-            },
-        }),
+        Input::Live(p) => {
+            let mut v = serde_json::json!({
+                "host": p.host, "port": p.port, "db": p.dbname, "user": p.user,
+                "tls": match &p.tls_mode {
+                    crate::db::TlsMode::VerifyFull => "verify".to_string(),
+                    crate::db::TlsMode::TrustFingerprint(f) => format!("fingerprint:{f}"),
+                    crate::db::TlsMode::Disable(_) => "disable".to_string(),
+                },
+            });
+            // Which certificates the run trusts is part of its definition, so a
+            // resumed run cannot silently swap the CA bundle.  Added only when
+            // set, so runs without one keep their earlier hash.
+            if let Some(ca) = &p.ca_file {
+                v["ca_file"] = serde_json::Value::String(ca.clone());
+            }
+            v
+        }
         Input::File(f) => serde_json::json!({ "file_sha256": f.sha256 }),
     };
     let canonical = serde_json::json!({
@@ -1768,6 +1777,31 @@ mod tests {
         assert_ne!(definition_hash(&base), definition_hash(&db));
     }
 
+    #[test]
+    fn the_definition_hash_covers_the_ca_file() {
+        let base = mock_config();
+        let with_ca = |side_old: bool, path: &str| {
+            let mut c = base.clone();
+            let side = if side_old { &mut c.old } else { &mut c.new };
+            if let Input::Live(p) = side {
+                *p = p.clone().with_ca_file(path);
+            }
+            c
+        };
+        let a = with_ca(true, "/etc/bank/ca-a.pem");
+        let b = with_ca(true, "/etc/bank/ca-b.pem");
+        let n = with_ca(false, "/etc/bank/ca-a.pem");
+        // Adding, changing or moving the CA file changes the hash.
+        assert_ne!(definition_hash(&base), definition_hash(&a));
+        assert_ne!(definition_hash(&a), definition_hash(&b));
+        assert_ne!(definition_hash(&a), definition_hash(&n));
+        // The same CA file gives the same hash.
+        assert_eq!(
+            definition_hash(&a),
+            definition_hash(&with_ca(true, "/etc/bank/ca-a.pem"))
+        );
+    }
+
     #[tokio::test]
     async fn parallel_limits_below_one_are_rejected() {
         let c = RunConfig {
@@ -1891,6 +1925,7 @@ mod tests {
         let file = crate::fingerprint_file::FingerprintFile {
             format_version: crate::fingerprint_file::FINGERPRINT_VERSION,
             tool_version: String::new(),
+            normalise_rules_version: Some(crate::core::normalise::NORMALISE_RULES_VERSION),
             mapping_hash: c.mapping.mapping_hash.clone(),
             server: crate::fingerprint_file::CapturedServer {
                 version_num: 170000,

@@ -15,7 +15,8 @@ use dmux_engine::inventory::{collect_inventory, DatabaseInventory};
 use dmux_engine::mapping::{self, Mapping};
 use dmux_engine::schema_diff::{compare_inventories, SchemaDiff};
 
-use crate::error::{from_db_error, CommandError};
+use crate::error::{from_db_error, CommandError, PasswordMissing};
+use crate::secrets::{input_fields_hash, stored_fields_hash};
 use crate::state::AppState;
 use crate::store::StoredProfile;
 use crate::types::{build_profile, parse_tls_mode, ConnectInput, ProfileInput};
@@ -75,22 +76,74 @@ fn build_profile_from_stored(
 }
 
 /// Resolve a [`ConnectInput`] into an engine profile plus its password.
+///
+/// With no typed password, the password comes from, in order:
+/// 1. the keychain, sent only to the saved profile's fields;
+/// 2. the session cache (T055, no keychain), for exactly the fields the UI
+///    sends now, when a password was typed for those very fields earlier in
+///    this session;
+/// 3. the session cache for the saved profile's fields.
+///
+/// A cached password is bound to the hash of the fields it was typed for, so
+/// it can never travel to a changed destination (PLAN 6.5).
 pub(crate) fn resolve(
     input: &ConnectInput,
     state: &AppState,
 ) -> Result<dmux_engine::db::ConnProfile, CommandError> {
-    match profile_source(input, state)? {
-        ProfileSource::Ui(profile) => {
-            let tls = parse_tls_mode(&profile)?;
-            // `profile_source` returned `Ui` only when a password was typed.
-            let password = input.password.clone().unwrap_or_default();
-            Ok(build_profile(&profile, password, tls))
+    if input.password.is_some() {
+        return match profile_source(input, state)? {
+            ProfileSource::Ui(profile) => {
+                let tls = parse_tls_mode(&profile)?;
+                let password = input.password.clone().unwrap_or_default();
+                Ok(build_profile(&profile, password, tls))
+            }
+            ProfileSource::Stored(stored) => {
+                let password = state.keychain()?.get(&stored.id)?;
+                build_profile_from_stored(&stored, password)
+            }
+        };
+    }
+    let id = &input.profile.id;
+    let stored = state.store()?.get(id)?;
+    // 1. The keychain, for the saved fields only.
+    let keychain_err = match &stored {
+        Some(stored) => {
+            let got = state.keychain()?.get(&stored.id);
+            match got {
+                Ok(password) => return build_profile_from_stored(stored, password),
+                Err(e @ CommandError::PasswordMissing { .. }) => Some(e),
+                Err(e) => return Err(e),
+            }
         }
-        ProfileSource::Stored(stored) => {
-            let password = state.keychain()?.get(&stored.id)?;
-            build_profile_from_stored(&stored, password)
+        None => None,
+    };
+    // 2. A session password typed for exactly these UI fields.
+    let session = state.session_passwords()?;
+    if let Some(password) = session.get(id, &input_fields_hash(&input.profile)) {
+        drop(session);
+        let tls = parse_tls_mode(&input.profile)?;
+        return Ok(build_profile(&input.profile, password, tls));
+    }
+    // 3. A session password kept for the saved fields.
+    if let Some(stored) = &stored {
+        if let Some(password) = session.get(id, &stored_fields_hash(stored)) {
+            drop(session);
+            return build_profile_from_stored(stored, password);
         }
     }
+    Err(keychain_err.unwrap_or_else(|| CommandError::ProfileNotFound { key: id.clone() }))
+}
+
+/// Whether the password for `input` is (or, after a typed password, will be)
+/// a session-only one: the keychain cannot hold it on this machine.
+fn keychain_unavailable_for(id: &str, state: &AppState) -> Result<bool, CommandError> {
+    Ok(matches!(
+        state.keychain()?.get(id),
+        Err(CommandError::PasswordMissing {
+            reason: PasswordMissing::NoKeychain,
+            ..
+        })
+    ))
 }
 
 /// The actual TLS state of the connection, serialised for the UI.  It is derived
@@ -141,6 +194,9 @@ pub struct ProbeResult {
     pub md5_available: bool,
     pub sql_ascii: bool,
     pub tls: TlsStateDto,
+    /// The password is kept in memory for this session only, because there is
+    /// no usable keychain (T055).  The UI shows a plain notice.
+    pub session_password: bool,
 }
 
 impl From<(dmux_engine::db::ServerInfo, TlsStateDto)> for ProbeResult {
@@ -158,6 +214,7 @@ impl From<(dmux_engine::db::ServerInfo, TlsStateDto)> for ProbeResult {
             md5_available: info.md5_available,
             sql_ascii: info.sql_ascii,
             tls,
+            session_password: false,
         }
     }
 }
@@ -213,13 +270,26 @@ impl SuperuserOverride {
 
 /// Test a connection and report server metadata (PLAN 4.1).  On an untrusted
 /// certificate the fingerprint is surfaced for a one-time trust.
+///
+/// With no usable keychain, a typed password that connected is kept for this
+/// session, bound to exactly the fields it was tested with, so Compare
+/// structure, Map, Choose checks and Run can use it (PLAN 4.1, T055).
 #[tauri::command]
 pub async fn probe_connection(
     input: ConnectInput,
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
 ) -> Result<ProbeResult, CommandError> {
-    let profile = resolve(&input, &state)?;
+    probe_connection_with(input, allow_superuser, &state).await
+}
+
+/// [`probe_connection`] over a plain `&AppState` (testable).
+pub(crate) async fn probe_connection_with(
+    input: ConnectInput,
+    allow_superuser: Option<SuperuserOverride>,
+    state: &AppState,
+) -> Result<ProbeResult, CommandError> {
+    let profile = resolve(&input, state)?;
     let tls = tls_state_from(&profile.tls_mode);
     let allow = allow_superuser
         .as_ref()
@@ -227,7 +297,23 @@ pub async fn probe_connection(
     let info =
         drive(move || async move { probe_server(&profile, allow).await.map_err(from_db_error) })
             .await?;
-    Ok(ProbeResult::from((info, tls)))
+    let mut result = ProbeResult::from((info, tls));
+    let id = &input.profile.id;
+    let fields = input_fields_hash(&input.profile);
+    if let Some(password) = &input.password {
+        // Only a password that really connected is kept, and only when the
+        // keychain cannot hold it.
+        if keychain_unavailable_for(id, state)? {
+            state.session_passwords()?.put(id, fields, password);
+            result.session_password = true;
+        }
+    } else {
+        let stored_hash = state.store()?.get(id)?.map(|s| stored_fields_hash(&s));
+        let sessions = state.session_passwords()?;
+        result.session_password = sessions.contains(id, &fields)
+            || stored_hash.is_some_and(|h| sessions.contains(id, &h));
+    }
+    Ok(result)
 }
 
 /// Collect one database's structural inventory (engine-native, no network glue
@@ -258,34 +344,42 @@ pub(crate) async fn collect(
     .await
 }
 
-/// Collect one database's structural inventory.
+/// Collect both databases' structural inventories and compare them (PLAN 4.2).
+///
+/// The inventories never leave Rust.  They used to round-trip through the
+/// webview (`run_inventory` then `schema_diff`), which broke on any 64-bit
+/// value above 2^53: a sequence's default `max_value` (`i64::MAX`) became
+/// `9223372036854776000` in JavaScript and no longer fit an `i64` on the way
+/// back.  Only the [`SchemaDiff`] crosses IPC, and it carries no integers.
+///
+/// **Display-only** (audit L7): nothing a verdict, coverage line, result or
+/// report depends on may consume this output.  Verdicts and results come from
+/// the engine's live run (`crates::commands::data`), which collects its own
+/// inventories; this diff only renders the "structure compare" screen.
 #[tauri::command]
-pub async fn run_inventory(
-    input: ConnectInput,
+pub async fn compare_structure(
+    old: ConnectInput,
+    new: ConnectInput,
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
-) -> Result<DatabaseInventory, CommandError> {
+) -> Result<SchemaDiff, CommandError> {
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    collect(&input, allow, &state).await
+    structure_diff(&old, &new, allow, &state).await
 }
 
-/// Compare two already-collected inventories (PLAN 4.2).
-///
-/// **Display-only, and the inventories are webview-supplied** (audit L7): the
-/// UI collects them via [`run_inventory`], round-trips them through the webview
-/// and hands them back here.  Nothing a verdict, coverage line, result or
-/// report depends on may consume this output — a false PASS must never rest on
-/// data that crossed the IPC boundary.  Verdicts and results are produced by
-/// the engine's live run (`crates::commands::data`), which re-collects its own
-/// inventories; this diff only renders the "structure compare" screen.
-#[tauri::command]
-pub fn schema_diff(
-    old: DatabaseInventory,
-    new: DatabaseInventory,
+/// The body of [`compare_structure`], callable from tests without a Tauri
+/// `State`.
+pub(crate) async fn structure_diff(
+    old: &ConnectInput,
+    new: &ConnectInput,
+    allow: bool,
+    state: &AppState,
 ) -> Result<SchemaDiff, CommandError> {
-    Ok(compare_inventories(&old, &new))
+    let old_inv = collect(old, allow, state).await?;
+    let new_inv = collect(new, allow, state).await?;
+    Ok(compare_inventories(&old_inv, &new_inv))
 }
 
 /// The UI-facing result of building a mapping: the engine `Mapping` (for save /
@@ -330,11 +424,21 @@ pub async fn build_mapping(
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
 ) -> Result<MappingBuild, CommandError> {
+    build_mapping_with(old, new, allow_superuser, &state).await
+}
+
+/// [`build_mapping`] over a plain `&AppState` (testable).
+pub(crate) async fn build_mapping_with(
+    old: ConnectInput,
+    new: ConnectInput,
+    allow_superuser: Option<SuperuserOverride>,
+    state: &AppState,
+) -> Result<MappingBuild, CommandError> {
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    let old_inv = collect(&old, allow, &state).await?;
-    let new_inv = collect(&new, allow, &state).await?;
+    let old_inv = collect(&old, allow, state).await?;
+    let new_inv = collect(&new, allow, state).await?;
     let (mapping, needs_attention, suggestions) = build_from_inventories(&old_inv, &new_inv);
     Ok(MappingBuild {
         mapping,
@@ -617,6 +721,58 @@ mod tests {
         }
     }
 
+    fn sequence(name: &str, last_value: i64) -> dmux_engine::inventory::Sequence {
+        dmux_engine::inventory::Sequence {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            start_value: Some(1),
+            min_value: Some(1),
+            max_value: Some(i64::MAX),
+            increment: Some(1),
+            last_value: Some(last_value),
+            cycle: Some(false),
+            is_called: true,
+            unreadable: false,
+        }
+    }
+
+    /// Every JSON number in `v` must be exactly representable as a JS number.
+    fn assert_js_safe(v: &serde_json::Value) {
+        const MAX_SAFE: u64 = (1 << 53) - 1;
+        match v {
+            serde_json::Value::Number(n) => {
+                let ok = n.as_u64().is_some_and(|u| u <= MAX_SAFE)
+                    || n.as_i64().is_some_and(|i| i.unsigned_abs() <= MAX_SAFE);
+                assert!(ok, "JSON number {n} would lose precision in JavaScript");
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(assert_js_safe),
+            serde_json::Value::Object(o) => o.values().for_each(assert_js_safe),
+            _ => {}
+        }
+    }
+
+    /// The structure diff is the only thing `compare_structure` sends to the
+    /// webview.  Sequences at `i64::MAX` (the Postgres default bound) must not
+    /// put any number into it that JavaScript would round, and two values that
+    /// round to the same f64 must still be told apart.
+    #[test]
+    fn structure_diff_of_i64_max_sequences_is_js_safe_and_exact() {
+        let mut old_schema = schema("public", Vec::new());
+        old_schema.sequences = vec![sequence("seq_note", i64::MAX)];
+        let mut new_schema = schema("public", Vec::new());
+        new_schema.sequences = vec![sequence("seq_note", i64::MAX - 1)];
+
+        let diff = compare_inventories(&inventory(vec![old_schema]), &inventory(vec![new_schema]));
+        let json = serde_json::to_value(&diff).expect("serialise diff");
+        assert_js_safe(&json);
+
+        let text = json.to_string();
+        assert!(
+            text.contains("9223372036854775807 -> 9223372036854775806"),
+            "regression between adjacent i64 values must be reported exactly: {text}"
+        );
+    }
+
     #[test]
     fn exact_names_map_without_attention() {
         let old = inventory(vec![schema(
@@ -889,6 +1045,47 @@ mod tests {
         assert!(info.version_num >= 100000);
     }
 
+    /// Regression: on demo_bank every sequence has the default `max_value`
+    /// (`i64::MAX`).  The structure compare used to round-trip both
+    /// inventories through the webview and failed with "invalid value:
+    /// integer `9223372036854776000`, expected i64".  It now runs end to end
+    /// in Rust, and what it returns is safe to hand to JavaScript.
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_diff_runs_on_demo_bank_with_i64_max_sequences() {
+        let (Some(old_url), Some(new_url)) = (
+            env_url("DMUX_TEST_DEMO_OLD_URL"),
+            env_url("DMUX_TEST_DEMO_NEW_URL"),
+        ) else {
+            return;
+        };
+        let state = test_state();
+        let input = |url: &str| {
+            let (profile, password) = profile_input_from_url(url);
+            crate::types::ConnectInput {
+                profile,
+                password: Some(password),
+            }
+        };
+        let (old, new) = (input(&old_url), input(&new_url));
+
+        // The fixture really does carry the value that used to break.  It is the
+        // new (10+) side: on 9.x the inventory leaves sequence bounds empty.
+        let new_inv = collect(&new, true, &state).await.expect("new inventory");
+        assert!(
+            new_inv
+                .schemas
+                .iter()
+                .flat_map(|s| &s.sequences)
+                .any(|s| s.max_value == Some(i64::MAX)),
+            "demo_bank should have a sequence at i64::MAX"
+        );
+
+        let diff = structure_diff(&old, &new, true, &state)
+            .await
+            .expect("structure diff");
+        assert_js_safe(&serde_json::to_value(&diff).expect("serialise diff"));
+    }
+
     // --- Anti-password-theft tests (PLAN 6.5) ---
 
     fn stored_profile(id: &str, host: &str, encryption: &str) -> crate::store::StoredProfile {
@@ -1070,5 +1267,281 @@ mod tests {
             Ok(_) => panic!("must not reuse the old password against the changed host"),
             Err(e) => panic!("expected a missing-password error, got {e:?}"),
         }
+    }
+
+    // --- T055: session passwords when there is no keychain ---
+
+    fn no_keychain_state() -> crate::state::AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        crate::state::AppState::with_password_store(
+            path,
+            Box::new(crate::secrets::InMemoryPasswordStore::unavailable()),
+        )
+        .expect("state")
+    }
+
+    fn ui_profile(id: &str, host: &str) -> ProfileInput {
+        ProfileInput {
+            id: id.to_string(),
+            label: "l".to_string(),
+            host: host.to_string(),
+            port: 5433,
+            database: "bank".to_string(),
+            user: "reader".to_string(),
+            encryption: "allow-plaintext".to_string(),
+            tls_fingerprint: None,
+            plaintext_reason: Some("lab".to_string()),
+            ca_file: None,
+        }
+    }
+
+    fn no_password(profile: ProfileInput) -> ConnectInput {
+        ConnectInput {
+            profile,
+            password: None,
+        }
+    }
+
+    #[test]
+    fn an_unsaved_profile_resolves_from_a_session_password_for_the_same_fields_only() {
+        let state = no_keychain_state();
+        let secret = test_secret();
+        let p = ui_profile("u1", "db.bank");
+        state.session_passwords().unwrap().put(
+            "u1",
+            crate::secrets::input_fields_hash(&p),
+            &secret,
+        );
+        let got = resolve(&no_password(p.clone()), &state).expect("cached password");
+        assert_eq!(got.host, "db.bank");
+        assert_eq!(got.password, secret);
+        // Any changed connection field misses: the password never follows it.
+        let mut moved = p.clone();
+        moved.host = "evil.example.com".to_string();
+        let err = resolve(&no_password(moved), &state).unwrap_err();
+        assert!(
+            matches!(err, CommandError::ProfileNotFound { .. }),
+            "{err:?}"
+        );
+        let mut other_user = p;
+        other_user.user = "admin".to_string();
+        assert!(resolve(&no_password(other_user), &state).is_err());
+    }
+
+    #[test]
+    fn a_saved_profile_without_a_keychain_resolves_from_the_session_password() {
+        let state = no_keychain_state();
+        let secret = test_secret();
+        let res = crate::commands::profiles::do_save_profile(
+            ui_profile("s1", "db.bank"),
+            Some(secret.clone()),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            res.warning.as_deref(),
+            Some(crate::secrets::SESSION_PASSWORD_MESSAGE)
+        );
+        // The UI sends the saved fields: the session password is used for them.
+        let got = resolve(&no_password(ui_profile("s1", "db.bank")), &state).unwrap();
+        assert_eq!(
+            (got.host.as_str(), got.password.as_str()),
+            ("db.bank", secret.as_str())
+        );
+        // A UI that sends another host still only reaches the saved host.
+        let got = resolve(&no_password(ui_profile("s1", "evil.example.com")), &state).unwrap();
+        assert_eq!(got.host, "db.bank");
+    }
+
+    #[test]
+    fn changing_the_host_or_deleting_the_profile_clears_the_session_password() {
+        let state = no_keychain_state();
+        let secret = test_secret();
+        crate::commands::profiles::do_save_profile(
+            ui_profile("c1", "db.bank"),
+            Some(secret.clone()),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(state.session_passwords().unwrap().len(), 1);
+        // Host change without a new password: the cached password is gone.
+        let res = crate::commands::profiles::do_save_profile(
+            ui_profile("c1", "other.bank"),
+            None,
+            &state,
+        )
+        .unwrap();
+        assert!(state.session_passwords().unwrap().is_empty());
+        assert!(res.warning.is_some());
+        let err = resolve(&no_password(ui_profile("c1", "other.bank")), &state).unwrap_err();
+        assert!(
+            matches!(err, CommandError::PasswordMissing { .. }),
+            "{err:?}"
+        );
+        assert!(!format!("{err} {err:?}").contains(&secret));
+        // Delete forgets it too.
+        crate::commands::profiles::do_save_profile(
+            ui_profile("c1", "other.bank"),
+            Some(secret.clone()),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(state.session_passwords().unwrap().len(), 1);
+        crate::commands::profiles::do_delete_profile("c1", &state).unwrap();
+        assert!(state.session_passwords().unwrap().is_empty());
+        // And the app exit clears everything.
+        state
+            .session_passwords()
+            .unwrap()
+            .put("x", "h".into(), &secret);
+        state.clear_session_passwords();
+        assert!(state.session_passwords().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_label_only_change_keeps_the_session_password() {
+        let state = no_keychain_state();
+        crate::commands::profiles::do_save_profile(
+            ui_profile("k1", "db.bank"),
+            Some(test_secret()),
+            &state,
+        )
+        .unwrap();
+        let mut relabelled = ui_profile("k1", "db.bank");
+        relabelled.label = "Renamed".to_string();
+        crate::commands::profiles::do_save_profile(relabelled, None, &state).unwrap();
+        assert_eq!(state.session_passwords().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_working_keychain_never_uses_the_session_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::state::AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .expect("state");
+        let res = crate::commands::profiles::do_save_profile(
+            ui_profile("w1", "db.bank"),
+            Some(test_secret()),
+            &state,
+        )
+        .unwrap();
+        assert!(res.warning.is_none());
+        assert!(state.session_passwords().unwrap().is_empty());
+        assert!(!keychain_unavailable_for("w1", &state).unwrap());
+    }
+
+    /// The live flow on a machine with no keychain: save, probe, build the
+    /// mapping and start a run, all from the one typed password.  Then the
+    /// unsaved variant: type the password, Test connection, Compare structure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_keychain_save_probe_map_and_run_use_the_session_password() {
+        let (Some(old_url), Some(new_url)) = (
+            env_url("DMUX_TEST_DEMO_OLD_URL"),
+            env_url("DMUX_TEST_DEMO_NEW_URL"),
+        ) else {
+            return;
+        };
+        let state = no_keychain_state();
+        let (mut old, old_pw) = profile_input_from_url(&old_url);
+        let (mut new, new_pw) = profile_input_from_url(&new_url);
+        old.id = "old".to_string();
+        new.id = "new".to_string();
+        let su = || {
+            Some(SuperuserOverride {
+                allow: true,
+                reason: "local test database".to_string(),
+            })
+        };
+
+        // Save with the typed password: kept for the session, with the notice.
+        for (p, pw) in [(&old, &old_pw), (&new, &new_pw)] {
+            let res =
+                crate::commands::profiles::do_save_profile(p.clone(), Some(pw.clone()), &state)
+                    .unwrap();
+            assert_eq!(
+                res.warning.as_deref(),
+                Some(crate::secrets::SESSION_PASSWORD_MESSAGE)
+            );
+        }
+        // Probe with no password.
+        let probed = probe_connection_with(no_password(old.clone()), su(), &state)
+            .await
+            .expect("probe uses the session password");
+        assert!(probed.session_password);
+        let json = serde_json::to_string(&probed).unwrap();
+        assert!(!json.contains(&old_pw));
+        // Build the mapping with no password.
+        let build = build_mapping_with(
+            no_password(old.clone()),
+            no_password(new.clone()),
+            su(),
+            &state,
+        )
+        .await
+        .expect("mapping uses the session password");
+        assert!(!serde_json::to_string(&build).unwrap().contains(&old_pw));
+        // Start a run with no password (structure only, one small table).
+        let mut levels = BTreeMap::new();
+        levels.insert(
+            "demo_bank.account_types".to_string(),
+            dmux_engine::results::CheckLevel::Structure,
+        );
+        let started = crate::commands::data::start_run_with(
+            crate::commands::data::StartRunInput {
+                old: no_password(old.clone()),
+                new: no_password(new.clone()),
+                mapping: build.mapping,
+                levels,
+                default_level: dmux_engine::results::CheckLevel::Structure,
+                control_total_columns: vec![],
+                old_parallelism: None,
+                new_parallelism: None,
+                export_keys: None,
+                allow_superuser: su(),
+            },
+            &state,
+        )
+        .expect("the run starts with the session password");
+        let id = started.run_id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let p = crate::commands::data::poll_run_with(id.clone(), &state).unwrap();
+            assert_ne!(p.overall_state, "failed", "{:?}", p.error);
+            if p.overall_state == "done" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // The unsaved variant: a typed password that connects is kept.
+        let mut fresh = old.clone();
+        fresh.id = "unsaved".to_string();
+        let typed = ConnectInput {
+            profile: fresh.clone(),
+            password: Some(old_pw.clone()),
+        };
+        let probed = probe_connection_with(typed, su(), &state).await.unwrap();
+        assert!(probed.session_password);
+        collect(&no_password(fresh.clone()), true, &state)
+            .await
+            .expect("compare structure uses the tested password");
+        // A wrong password that fails is never kept.
+        let mut other = fresh.clone();
+        other.id = "wrong".to_string();
+        let bad = ConnectInput {
+            profile: other.clone(),
+            password: Some(format!("{}-wrong", test_secret())),
+        };
+        let err = probe_connection_with(bad, su(), &state).await.unwrap_err();
+        assert!(!format!("{err} {err:?}").contains(&old_pw));
+        assert!(resolve(&no_password(other), &state).is_err());
     }
 }

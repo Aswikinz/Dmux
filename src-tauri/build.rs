@@ -11,8 +11,7 @@ fn main() {
             "delete_profile",
             "profile_has_password",
             "probe_connection",
-            "run_inventory",
-            "schema_diff",
+            "compare_structure",
             "build_mapping",
             "update_mapping",
             "export_mapping",
@@ -24,6 +23,7 @@ fn main() {
             "set_run_paused",
             "cancel_run",
             "get_results",
+            "export_report",
         ]),
     ))
     .expect("failed to run tauri build script");

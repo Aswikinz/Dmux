@@ -19,7 +19,7 @@ import { CompareStructureScreen } from './CompareStructureScreen';
 import { MapScreen } from './MapScreen';
 import { ChooseChecksScreen } from './ChooseChecksScreen';
 import { RunScreen } from './RunScreen';
-import { ResultsScreen } from './ResultsScreen';
+import { DRILL_DOWN_PAGE, ResultsScreen } from './ResultsScreen';
 import { ReportScreen } from './ReportScreen';
 
 function wrap(ui: ReactElement) {
@@ -136,8 +136,43 @@ describe('ConnectScreen', () => {
     expect(next.disabled).toBe(false);
   });
 
-  it('shows a superuser warning', async () => {
+  it('shows the in-memory password notice when there is no keychain, and only then', async () => {
+    const base = createMockEngine();
+    const engine: Engine = {
+      ...base,
+      testConnection: async (profile, password) => {
+        const r = await base.testConnection(profile, password);
+        return r.info
+          ? { ...r, info: { ...r.info, sessionPassword: profile.id === defaultOldProfile().id } }
+          : r;
+      },
+    };
+    wrap(
+      <ConnectScreen
+        engine={engine}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    const testButtons = screen.getAllByRole('button', { name: 'Test connection' });
+    fireEvent.click(testButtons[0]);
+    expect(
+      await screen.findByText(
+        'No system keychain: Dmux will keep this password in memory until you close the app.',
+      ),
+    ).toBeDefined();
+    fireEvent.click(testButtons[1]);
+    await waitFor(() => expect(screen.getAllByText('Server version:').length).toBe(2));
+    // The new side has a keychain: one notice only.
+    expect(screen.getAllByTestId('session-password-notice').length).toBe(1);
+  });
+
+  it('refuses a superuser until the user types a reason, then records it', async () => {
     const engine = createMockEngine();
+    const setOverride = vi.spyOn(engine, 'setSuperuserOverride');
     const profile: ConnectionProfile = { ...defaultOldProfile(), user: 'superuser' };
     wrap(
       <ConnectScreen
@@ -150,7 +185,66 @@ describe('ConnectScreen', () => {
       />,
     );
     fireEvent.click(screen.getAllByRole('button', { name: 'Test connection' })[0]);
+    expect(await screen.findByText('This login is a superuser')).toBeDefined();
+    expect(screen.getByText('Connection failed')).toBeDefined();
+    const allow = screen.getByRole('button', {
+      name: 'Allow superuser and test again',
+    }) as HTMLButtonElement;
+    // No reason, no override.
+    expect(allow.disabled).toBe(true);
+    fireEvent.change(screen.getByTestId('superuser-reason'), { target: { value: '   ' } });
+    expect(allow.disabled).toBe(true);
+    fireEvent.change(screen.getByTestId('superuser-reason'), {
+      target: { value: 'rehearsal on a copy' },
+    });
+    fireEvent.click(allow);
+    expect(setOverride).toHaveBeenCalledWith({ reason: 'rehearsal on a copy' });
+    expect(await screen.findByText('Superuser login allowed.')).toBeDefined();
     expect(await screen.findByText('Superuser login')).toBeDefined();
+    expect(screen.getByText(/Your reason is recorded in the results and the report/).textContent).toContain(
+      'rehearsal on a copy',
+    );
+    // Revoking it goes back to refusing.
+    fireEvent.click(screen.getByRole('button', { name: 'Stop allowing superuser' }));
+    expect(setOverride).toHaveBeenLastCalledWith(null);
+  });
+
+  it('says Connected, what it checked, and what to do next', async () => {
+    wrap(
+      <ConnectScreen
+        engine={createMockEngine()}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    expect(screen.getByText('Test both connections to continue.')).toBeDefined();
+    const buttons = screen.getAllByRole('button', { name: 'Test connection' });
+    fireEvent.click(buttons[0]);
+    expect(await screen.findByText('Connected')).toBeDefined();
+    expect(screen.getByText(/checked the server version, the text encoding, the encryption/)).toBeDefined();
+    expect(screen.getByText('Read-only login:')).toBeDefined();
+    fireEvent.click(buttons[1]);
+    expect(
+      await screen.findByText('Both databases are connected. Next, compare their structure.'),
+    ).toBeDefined();
+  });
+
+  it('explains the unencrypted-connection reason without internal references', () => {
+    wrap(
+      <ConnectScreen
+        engine={createMockEngine()}
+        oldProfile={{ ...defaultOldProfile(), encryption: 'allow-plaintext' }}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    expect(screen.getByText(/written\s+into the report/)).toBeDefined();
+    expect(document.body.textContent).not.toMatch(/PLAN|section \d/);
   });
 
   it('shows and edits the private-CA file field for verify encryption', () => {
@@ -295,6 +389,30 @@ describe('CompareStructureScreen', () => {
     wrap(<StructureHarness engine={engine} />);
     expect(await screen.findByText('Could not compare structure')).toBeDefined();
   });
+
+  it('shows an encoding difference as information, with a plain explanation', async () => {
+    const base = createMockEngine();
+    const engine: Engine = {
+      ...base,
+      compareStructure: (o, n) => base.compareStructure({ ...o, database: 'diff' }, n),
+    };
+    wrap(<StructureHarness engine={engine} />);
+    const note = await screen.findByTestId('encoding-note');
+    expect(note.getAttribute('role')).toBe('note');
+    expect(note.textContent).toContain('LATIN1');
+    expect(note.textContent).toContain('You do not need to do anything');
+  });
+
+  it('shows a column type change as before and after', async () => {
+    const base = createMockEngine();
+    const engine: Engine = {
+      ...base,
+      compareStructure: (o, n) => base.compareStructure({ ...o, database: 'diff' }, n),
+    };
+    wrap(<StructureHarness engine={engine} />);
+    const change = (await screen.findAllByTestId('diff-before-after'))[0];
+    expect(change.textContent).toMatch(/numeric\(18,2\).*→.*numeric\(19,2\)/);
+  });
 });
 
 describe('MapScreen', () => {
@@ -308,6 +426,17 @@ describe('MapScreen', () => {
   it('builds a mapping and shows the queue', async () => {
     wrap(<MapHarness engine={createMockEngine()} />);
     expect(await screen.findByText('No items need attention.')).toBeDefined();
+  });
+
+  it('never puts an encoding difference in the needs-attention queue', async () => {
+    const engine = createMockEngine();
+    const diffInventory = await engine.compareStructure(
+      { ...defaultOldProfile(), database: 'diff' },
+      defaultNewProfile(),
+    );
+    expect(diffInventory.oldEncoding).not.toBe(diffInventory.newEncoding);
+    const mapping = await engine.buildMapping(diffInventory);
+    expect(mapping.needsAttention.some((m) => /encoding/i.test(m.oldName))).toBe(false);
   });
 
   it('approves and ignores items, then lists the ignored one', async () => {
@@ -413,7 +542,7 @@ describe('MapScreen', () => {
 describe('ChooseChecksScreen', () => {
   it('builds a plan and shows totals', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    expect(await screen.findByText('Estimate:')).toBeDefined();
+    expect(await screen.findByText('Estimated time:')).toBeDefined();
   });
 
   it('changes a table check level through the select', async () => {
@@ -432,7 +561,7 @@ describe('ChooseChecksScreen', () => {
       );
     }
     wrap(<ChecksWithState engine={createMockEngine()} />);
-    await screen.findByText('Estimate:');
+    await screen.findByText('Estimated time:');
     // The level selector is rendered for the first row.
     const selects = screen.getAllByRole('combobox');
     const preset = selects[0]; // the preset select
@@ -442,17 +571,52 @@ describe('ChooseChecksScreen', () => {
     expect(levelSelect).toBeDefined();
   });
 
-  it('selects a preset', async () => {
+  it('a preset really reassigns every table level, and Suggested restores them', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimate:');
-    const preset = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.change(preset, { target: { value: preset.options[1]?.value ?? '' } });
-    expect(preset.value).toBeDefined();
+    await screen.findByText('Estimated time:');
+    const levels = () =>
+      screen
+        .getAllByRole('combobox')
+        .filter((s) => s.getAttribute('aria-label')?.startsWith('Check level for'))
+        .map((s) => (s as HTMLSelectElement).value);
+    const suggested = levels();
+    expect(new Set(suggested).size).toBeGreaterThan(1);
+    const preset = screen.getByTestId('preset-select') as HTMLSelectElement;
+    expect(preset.value).toBe('suggested');
+
+    fireEvent.change(preset, { target: { value: 'full' } });
+    await waitFor(() => expect(levels().every((l) => l === 'full-values')).toBe(true));
+    expect(screen.getByText(/Applied "Full values for every table"/)).toBeDefined();
+
+    fireEvent.change(preset, { target: { value: 'counts' } });
+    await waitFor(() => expect(levels().every((l) => l === 'counts')).toBe(true));
+    expect(screen.getByText(/Now set Full values on the tables you want/)).toBeDefined();
+
+    fireEvent.change(preset, { target: { value: 'structure' } });
+    await waitFor(() => expect(levels().every((l) => l === 'structure')).toBe(true));
+
+    fireEvent.change(preset, { target: { value: 'suggested' } });
+    await waitFor(() => expect(levels()).toEqual(suggested));
+
+    // Changing one table by hand marks the plan as custom.
+    const first = screen
+      .getAllByRole('combobox')
+      .find((s) => s.getAttribute('aria-label')?.startsWith('Check level for')) as HTMLSelectElement;
+    fireEvent.change(first, { target: { value: first.value === 'counts' ? 'structure' : 'counts' } });
+    await waitFor(() => expect(preset.value).toBe('custom'));
+  });
+
+  it('shows the estimate in plain words and explains control totals', async () => {
+    wrap(<ChecksHarness engine={createMockEngine()} />);
+    await screen.findByText('Estimated time:');
+    expect(screen.getByText(/about .*(seconds?|minutes?)/)).toBeDefined();
+    expect(screen.getByText(/Corrected as each table finishes/)).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Control totals' })).toBeDefined();
   });
 
   it('updates a table level when a row select changes', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimate:');
+    await screen.findByText('Estimated time:');
     // Find a level select whose current value is one of the check levels.
     const levelSelects = screen
       .getAllByRole('combobox')
@@ -495,7 +659,17 @@ describe('ChooseChecksScreen', () => {
 describe('RunScreen', () => {
   it('starts a run and reaches a finished state', async () => {
     wrap(<RunHarness engine={createMockEngine({ forcedFixture: 'pass' })} />);
-    expect(await screen.findByText('Finished')).toBeDefined();
+    expect(await screen.findByText('The run has finished.')).toBeDefined();
+    expect((await screen.findByTestId('verdict-word')).textContent).toBe('PASS');
+  });
+
+  it('shows FAIL as soon as a failing run ends, never "Done" or a success badge', async () => {
+    wrap(<RunHarness engine={createMockEngine({ forcedFixture: 'fail' })} />);
+    expect(await screen.findByText('The run has finished.')).toBeDefined();
+    expect((await screen.findByTestId('verdict-word')).textContent).toBe('FAIL');
+    expect(screen.getByText(/do not match/)).toBeDefined();
+    expect(screen.queryByText('Done')).toBeNull();
+    expect(screen.queryByText('PASS')).toBeNull();
   });
 
   it('can pause, resume and cancel a running run', async () => {
@@ -517,6 +691,7 @@ describe('RunScreen', () => {
     };
     let state: RunProgress = { ...runningProgress };
     const engine: Engine = {
+      setSuperuserOverride: () => {},
       testConnection: async () => ({ ok: true }),
       saveProfile: async (profile) => ({ profile }),
       profileHasPassword: async () => false,
@@ -642,12 +817,23 @@ describe('ResultsScreen', () => {
   it('shows the verdict and coverage line on a passing run', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'pass' })} runId="run-pass" />);
     expect(await screen.findByText(/tables fully checked/)).toBeDefined();
-    expect(screen.getAllByText('Pass').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('PASS').length).toBeGreaterThan(0);
   });
 
   it('lists failures for a failing run', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'fail' })} runId="run-fail" />);
     expect(await screen.findByText('Failures')).toBeDefined();
+  });
+
+  it('states the verdict prominently in words, with plain level names', async () => {
+    wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'fail' })} runId="run-fail" />);
+    const banner = await screen.findByTestId('verdict-banner');
+    expect(banner.getAttribute('role')).toBe('status');
+    expect(screen.getByTestId('verdict-word').textContent).toBe('FAIL');
+    expect(banner.textContent).toContain('Result: FAIL');
+    expect(banner.textContent).toContain('do not match');
+    expect(banner.querySelector('svg')).toBeTruthy();
+    expect(screen.queryAllByText('full-values')).toHaveLength(0);
   });
 
   it('shows the changed-during-check verdict', async () => {
@@ -658,7 +844,7 @@ describe('ResultsScreen', () => {
       />,
     );
     expect(await screen.findByText(/tables fully checked/)).toBeDefined();
-    expect(screen.getAllByText('Changed during check').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('CHANGED DURING CHECK').length).toBeGreaterThan(0);
   });
 
   it('expands a failure to show drill-down rows', async () => {
@@ -668,6 +854,48 @@ describe('ResultsScreen', () => {
     fireEvent.click(showRows);
     // A changed row advertises its differing columns.
     expect(await screen.findByText('Changed columns: amount')).toBeDefined();
+  });
+
+  it('pages a very large drill-down instead of rendering every row', async () => {
+    // A partitioned-on-new table can report every old row as missing (15,000
+    // in demo_bank); rendering them all at once froze the webview.
+    const engine = createMockEngine({ forcedFixture: 'fail' });
+    const base = await engine.getResults('run-fail');
+    const card = base.failures[0];
+    const big: Results = {
+      ...base,
+      tableResults: base.tableResults.map((t) =>
+        t.tableId === card.tableId
+          ? {
+              ...t,
+              drillDown: Array.from({ length: 15000 }, (_, i) => ({
+                key: `row-${i}`,
+                kind: 'missing' as const,
+              })),
+            }
+          : t,
+      ),
+    };
+    wrap(
+      <ResultsScreen
+        engine={engine}
+        runId="run-fail"
+        results={big}
+        onResultsChange={() => {}}
+        onNext={() => {}}
+        onBack={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Show rows' })[0]);
+    expect(screen.getByText(`Showing ${DRILL_DOWN_PAGE} of 15,000 rows`)).toBeDefined();
+    expect(screen.getAllByText('Missing in new')).toHaveLength(DRILL_DOWN_PAGE);
+    expect(screen.queryByText(`row-${DRILL_DOWN_PAGE}`)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Show 50 more/ }));
+    expect(screen.getByText(`Showing ${DRILL_DOWN_PAGE * 2} of 15,000 rows`)).toBeDefined();
+    expect(screen.getByText(`row-${DRILL_DOWN_PAGE}`)).toBeDefined();
+    expect(screen.getByText(/14,900 not shown/)).toBeDefined();
   });
 
   it('labels changed-value rows "Changed values", never "Changed during check"', async () => {
@@ -683,7 +911,7 @@ describe('ResultsScreen', () => {
 
     // A changed-value row is a data difference, not a concurrent modification,
     // so it must never carry the "Changed during check" label.
-    expect(screen.queryByText('Changed during check')).toBeNull();
+    expect(screen.queryByText('CHANGED DURING CHECK')).toBeNull();
   });
 
   it('lists ignored tables with their required reasons next to the coverage line', async () => {
@@ -698,7 +926,7 @@ describe('ResultsScreen', () => {
   it('shows the needs-review verdict in its own words', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'needsReview' })} runId="run-needs-review" />);
     await screen.findByText('Failures');
-    expect(screen.getAllByText('Needs review').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('NEEDS REVIEW').length).toBeGreaterThan(0);
     expect(screen.getByText(/manual review/)).toBeDefined();
   });
 
@@ -753,8 +981,8 @@ describe('ResultsScreen', () => {
       await screen.findByText('PASS (options not recorded — older results file)'),
     ).toBeDefined();
     expect(screen.getByText('options not recorded (older results file)')).toBeDefined();
-    // The verdict badge must be the single qualified label, never a bare "Pass".
-    expect(screen.queryByText('Pass')).toBeNull();
+    // The verdict must be the single qualified label, never a bare PASS.
+    expect(screen.queryByText('PASS')).toBeNull();
   });
 
   it('lists run warnings (can-write / superuser / row-level security)', async () => {
@@ -824,5 +1052,55 @@ describe('ReportScreen', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
     expect(await screen.findByText('Export failed')).toBeDefined();
+    expect(screen.getByText('disk full')).toBeDefined();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('shows the exact saved path and asks for this run', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/home/u/dmux-run-pass.pdf' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
+    expect(
+      await screen.findByText('PDF report saved to /home/u/dmux-run-pass.pdf'),
+    ).toBeDefined();
+    expect(exportReport).toHaveBeenCalledWith({
+      runId: 'run-pass',
+      format: 'pdf',
+      includeKeys: false,
+    });
+  });
+
+  it('says cancelled, not saved or failed, when the dialog is dismissed', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      exportReport: async () => ({ ok: false, cancelled: true }),
+    };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    expect(await screen.findByText('Excel export cancelled. Nothing was saved.')).toBeDefined();
+    expect(screen.queryByText('Export failed')).toBeNull();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('sends the key choice only when the user ticks it', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.xlsx' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await screen.findByText(/report saved/);
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(2));
+    expect(exportReport.mock.calls.map((c) => (c as unknown[])[0])).toEqual([
+      { runId: 'run-pass', format: 'excel', includeKeys: false },
+      { runId: 'run-pass', format: 'excel', includeKeys: true },
+    ]);
   });
 });

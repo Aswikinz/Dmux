@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { Input } from '../design/Input';
 import { Select } from '../design/Select';
@@ -8,7 +9,11 @@ import { StatusBadge } from '../design/StatusBadge';
 import { Tooltip } from '../design/Tooltip';
 import type { Engine } from '../api/engine';
 import type { ConnectionProfile, EncryptionMode, ServerInfo } from '../api/contract';
-import { Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { CheckCircle, Database, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
+
+/** Shown when the backend keeps the password for this session only (no keychain). */
+export const SESSION_PASSWORD_NOTICE =
+  'No system keychain: Dmux will keep this password in memory until you close the app.';
 
 interface ConnectScreenProps {
   engine: Engine;
@@ -55,9 +60,19 @@ function ProfileEditor({
 }) {
   return (
     <div className="space-y-3">
-      <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-        {title}
-      </h3>
+      <div className="flex items-center gap-3 pb-1">
+        <span className="flex h-9 w-9 items-center justify-center rounded-[10px] bg-gradient-to-b from-accent-500 to-accent-700 text-white shadow-[0_2px_6px_rgba(42,36,135,0.3)]">
+          <Database className="h-[18px] w-[18px]" aria-hidden="true" />
+        </span>
+        <div>
+          <h3 className="text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">
+            {title}
+          </h3>
+          <p className="text-xs text-ink-secondary dark:text-slate-400">
+            {title === 'Old database' ? 'Before the migration' : 'After the migration'}
+          </p>
+        </div>
+      </div>
       <Input
         label="Label"
         value={profile.label}
@@ -144,7 +159,8 @@ function ProfileEditor({
             data-testid={`${title}-plaintext-reason`}
           />
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Required. This choice is recorded in the report (PLAN 6.7).
+            Required. Your choice to connect without encryption, and this reason, are written
+            into the report.
           </p>
         </div>
       )}
@@ -174,28 +190,45 @@ function ServerInfoCard({ info }: { info: ServerInfo }) {
     );
 
   return (
-    <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-3 text-sm dark:border-slate-700 dark:bg-slate-900">
+    <div className="animate-scale-in space-y-2 rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-3.5 text-sm dark:border-emerald-500/25 dark:bg-emerald-500/[0.07]">
+      <div
+        role="status"
+        className="flex items-center gap-2 text-base font-semibold text-emerald-800 dark:text-emerald-300"
+      >
+        <CheckCircle className="h-5 w-5 animate-pop" aria-hidden="true" />
+        Connected
+      </div>
+      <p className="text-xs text-slate-600 dark:text-slate-400">
+        Dmux checked the server version, the text encoding, the encryption, and whether this login
+        is read-only.
+      </p>
       <div className="flex items-center gap-2">
-        <span className="font-medium">Server version:</span> {info.version}
+        <span className="w-32 shrink-0 text-ink-secondary dark:text-slate-400">Server version:</span> {info.version}
       </div>
       <div className="flex items-center gap-2">
-        <span className="font-medium">Encoding:</span> {info.encoding}
+        <span className="w-32 shrink-0 text-ink-secondary dark:text-slate-400">Encoding:</span> {info.encoding}
       </div>
       <div className="flex items-center gap-2">
-        <span className="font-medium">Collation:</span> {info.collation}
+        <span className="w-32 shrink-0 text-ink-secondary dark:text-slate-400">Collation:</span> {info.collation}
       </div>
       <div className="flex items-center gap-2">
-        <span className="font-medium">Encryption:</span> {encryption}
+        <span className="w-32 shrink-0 text-ink-secondary dark:text-slate-400">Encryption:</span> {encryption}
       </div>
+      {!info.canWrite && !info.isSuperuser && (
+        <div className="flex items-center gap-2">
+          <span className="w-32 shrink-0 text-ink-secondary dark:text-slate-400">Read-only login:</span> yes
+        </div>
+      )}
       {info.isSuperuser && (
         <div className="flex items-center gap-2">
-          <StatusBadge status="FAIL" />
+          <StatusBadge status="WARNING" />
           <Tooltip
             label="Superuser"
             explanation="A superuser login can run any command, even inside a read-only transaction. Dmux refuses superuser logins by default."
           >
             Superuser login
           </Tooltip>
+          (allowed by you)
         </div>
       )}
       {info.canWrite && (
@@ -217,7 +250,74 @@ function ServerInfoCard({ info }: { info: ServerInfo }) {
         </div>
       )}
       {info.warning && <p className="text-amber-800 dark:text-amber-200">{info.warning}</p>}
+      {info.sessionPassword && (
+        <p className="text-slate-700 dark:text-slate-300" data-testid="session-password-notice">
+          {SESSION_PASSWORD_NOTICE}
+        </p>
+      )}
     </div>
+  );
+}
+
+/**
+ * The only way to use a superuser login: the user types why, and the reason is
+ * recorded in the results (PLAN 6.2).  Without a reason nothing is allowed.
+ */
+function SuperuserOverridePanel({
+  allowedReason,
+  onAllow,
+  onRevoke,
+}: {
+  allowedReason: string | null;
+  onAllow: (reason: string) => void;
+  onRevoke: () => void;
+}) {
+  const [reason, setReason] = useState('');
+  if (allowedReason) {
+    return (
+      <Panel>
+        <div className="space-y-2 text-sm" data-testid="superuser-override">
+          <div className="flex items-center gap-2">
+            <StatusBadge status="WARNING" />
+            <span className="font-medium">Superuser login allowed.</span>
+          </div>
+          <p className="text-slate-700 dark:text-slate-300">
+            Your reason is recorded in the results and the report: “{allowedReason}”
+          </p>
+          <Button variant="secondary" size="sm" onClick={onRevoke}>
+            Stop allowing superuser
+          </Button>
+        </div>
+      </Panel>
+    );
+  }
+  return (
+    <Panel>
+      <div className="space-y-3 text-sm" data-testid="superuser-override">
+        <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+          This login is a superuser
+        </h3>
+        <p className="text-slate-700 dark:text-slate-300">
+          A superuser can change or delete anything, even while Dmux only reads. Ask your database
+          administrator for a read-only login. If you must use this one, type why. The reason is
+          written into the results and the report.
+        </p>
+        <Input
+          label="Reason for using a superuser login (required)"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          data-testid="superuser-reason"
+        />
+        <Button
+          variant="danger"
+          size="sm"
+          disabled={!reason.trim()}
+          onClick={() => onAllow(reason.trim())}
+        >
+          Allow superuser and test again
+        </Button>
+      </div>
+    </Panel>
   );
 }
 
@@ -251,6 +351,34 @@ export function ConnectScreen({
   const [newSaveError, setNewSaveError] = useState<string | null>(null);
 
   const bothOk = oldResult?.ok && newResult?.ok;
+  const [superuserReason, setSuperuserReason] = useState<string | null>(null);
+  const superuserSeen =
+    Boolean(oldResult?.superuserRefused || newResult?.superuserRefused) ||
+    Boolean(oldResult?.info?.isSuperuser || newResult?.info?.isSuperuser);
+
+  async function retestAfterOverride() {
+    // Re-test the sides the refusal hit; the backend reads the saved password.
+    if (oldResult?.superuserRefused) {
+      setOldResult(await engine.testConnection(oldProfile));
+    }
+    if (newResult?.superuserRefused) {
+      setNewResult(await engine.testConnection(newProfile));
+    }
+  }
+
+  async function allowSuperuser(reason: string) {
+    engine.setSuperuserOverride({ reason });
+    setSuperuserReason(reason);
+    await retestAfterOverride();
+  }
+
+  function revokeSuperuser() {
+    engine.setSuperuserOverride(null);
+    setSuperuserReason(null);
+    // A superuser result is no longer valid without the override.
+    if (oldResult?.info?.isSuperuser) setOldResult(null);
+    if (newResult?.info?.isSuperuser) setNewResult(null);
+  }
 
   function describeThrown(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -314,7 +442,7 @@ export function ConnectScreen({
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Connect</h2>
+      <ScreenHeader title="Connect" subtitle="Enter the old and new databases. Dmux only ever reads them." />
       <div className="grid gap-6 lg:grid-cols-2">
         <Panel>
           <ProfileEditor
@@ -413,7 +541,19 @@ export function ConnectScreen({
           </div>
         </Panel>
       </div>
-      <div className="flex justify-end">
+      {superuserSeen && (
+        <SuperuserOverridePanel
+          allowedReason={superuserReason}
+          onAllow={(reason) => void allowSuperuser(reason)}
+          onRevoke={revokeSuperuser}
+        />
+      )}
+      <div className="flex flex-wrap items-center justify-end gap-4">
+        <p className="text-sm text-slate-700 dark:text-slate-300" role="status">
+          {bothOk
+            ? 'Both databases are connected. Next, compare their structure.'
+            : 'Test both connections to continue.'}
+        </p>
         <Button onClick={onNext} disabled={!bothOk} variant="primary" size="lg">
           Compare structure
         </Button>

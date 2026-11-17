@@ -64,11 +64,11 @@ export async function completeRun(page: Page, fixture: string): Promise<void> {
 
   // Map -> Choose checks
   await cta(page, 'Choose checks').click();
-  await expect(page.getByText('Estimate:')).toBeVisible();
+  await expect(page.getByText('Estimated time:')).toBeVisible();
 
   // Choose checks -> Run
   await cta(page, 'Run').click();
-  await expect(page.getByText('Finished')).toBeVisible();
+  await expect(page.getByText('The run has finished.')).toBeVisible();
 
   // Run -> Results
   await cta(page, 'See results').click();

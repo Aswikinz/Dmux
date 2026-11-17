@@ -104,6 +104,9 @@ pub fn compare_two_files_with(
     // report (audit M1).  A file built in memory has no hash, so record None.
     b.results.capture_sha256_old = (!old.sha256.is_empty()).then(|| old.sha256.clone());
     b.results.capture_sha256_new = (!new.sha256.is_empty()).then(|| new.sha256.clone());
+    // Same rules version (checked by validate), other tool version: a warning.
+    b.results.warnings.extend(old.tool_version_warning("old"));
+    b.results.warnings.extend(new.tool_version_warning("new"));
     if old.server.sql_ascii {
         b.results
             .warnings
@@ -186,7 +189,9 @@ fn captured_fp(t: &CapturedTable, mapping_hash: &str) -> Fingerprint {
         buckets: t.buckets.clone(),
         control_totals: t.control_totals.clone(),
         truncated: false,
-        needs_review: t.needs_review,
+        // Never the stored flag alone: a file is untrusted input, so the
+        // flag is recomputed from its own types and options (audit H3).
+        needs_review: t.effective_needs_review(),
     }
 }
 
@@ -298,6 +303,13 @@ pub async fn compare_file_to_live(
     if file_side == Side::New && !file.sha256.is_empty() {
         b.results.capture_sha256_new = Some(file.sha256.clone());
     }
+    let file_side_name = match file_side {
+        Side::Old => "old",
+        Side::New => "new",
+    };
+    b.results
+        .warnings
+        .extend(file.tool_version_warning(file_side_name));
     let live_conn = connection_info(
         live_profile,
         &info,
@@ -790,7 +802,8 @@ mod tests {
     fn file(tables: Vec<CapturedTable>) -> FingerprintFile {
         FingerprintFile {
             format_version: FINGERPRINT_VERSION,
-            tool_version: "t".into(),
+            tool_version: crate::version().into(),
+            normalise_rules_version: Some(crate::core::normalise::NORMALISE_RULES_VERSION),
             mapping_hash: crate::mapping::Mapping::new().mapping_hash,
             server: CapturedServer {
                 version_num: 170000,
@@ -959,6 +972,94 @@ mod tests {
             .structure_findings
             .iter()
             .any(|f| f.object == "database.large_objects"));
+    }
+
+    /// Audit H3: a table with an `Unknown` type whose `needs_review` was edited
+    /// to `false` (hash recomputed) must never PASS file-against-file.
+    #[test]
+    fn a_forged_needs_review_false_never_passes() {
+        let forged = || {
+            let mut t = table("s.a", 3);
+            t.column_types[1] = PgType::Unknown("public.geometry".into());
+            t.needs_review = false;
+            t
+        };
+        // Through the parser, as a real attack would arrive: refused.
+        let bytes = file(vec![forged()]).to_json().unwrap();
+        let parsed = FingerprintFile::from_bytes(&bytes);
+        assert!(matches!(
+            parsed,
+            Err(crate::fingerprint_file::FingerprintFileError::NeedsReviewCleared { .. })
+        ));
+        // Built in memory and handed straight to the compare: refused too.
+        let r = compare_two_files(&file(vec![forged()]), &file(vec![forged()]));
+        assert!(
+            matches!(&r, Err(RunError::Config(m)) if m.contains("needs no review")),
+            "{r:?}"
+        );
+        // Honestly flagged, the same pair is NEEDS_REVIEW, never PASS.
+        let mut honest = forged();
+        honest.needs_review = true;
+        let out = compare_two_files(&file(vec![honest.clone()]), &file(vec![honest])).unwrap();
+        assert_eq!(out.results.tables["s.a"].verdict, Verdict::NeedsReview);
+        assert_ne!(out.results.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn the_captured_fingerprint_uses_the_recomputed_flag() {
+        let mut t = table("s.a", 3);
+        t.column_types[1] = PgType::Unknown("x".into());
+        t.needs_review = false;
+        assert!(captured_fp(&t, "m").needs_review);
+        assert!(!captured_fp(&table("s.a", 3), "m").needs_review);
+    }
+
+    #[test]
+    fn captures_from_other_or_missing_rules_versions_are_refused() {
+        let mut other = file(vec![table("s.a", 3)]);
+        other.normalise_rules_version = Some(crate::core::normalise::NORMALISE_RULES_VERSION + 1);
+        for (o, n) in [
+            (other.clone(), file(vec![table("s.a", 3)])),
+            (file(vec![table("s.a", 3)]), other),
+        ] {
+            let r = compare_two_files(&o, &n);
+            assert!(
+                matches!(&r, Err(RunError::Config(m)) if m.contains("normalisation rules version")),
+                "{r:?}"
+            );
+        }
+        let mut missing = file(vec![table("s.a", 3)]);
+        missing.normalise_rules_version = None;
+        let r = compare_two_files(&missing, &file(vec![table("s.a", 3)]));
+        assert!(
+            matches!(&r, Err(RunError::Config(m)) if m.contains("does not record its normalisation rules version")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_different_tool_version_is_a_run_warning() {
+        let mut old = file(vec![table("s.a", 3)]);
+        old.tool_version = "0.0.1".into();
+        let out = compare_two_files(&old, &file(vec![table("s.a", 3)])).unwrap();
+        let w: Vec<&String> = out
+            .results
+            .warnings
+            .iter()
+            .filter(|w| w.contains("capture was made by Dmux"))
+            .collect();
+        assert_eq!(w.len(), 1, "{:?}", out.results.warnings);
+        assert!(w[0].contains("old capture was made by Dmux 0.0.1"));
+        // The rules match, so the data still compares (decision 23: a
+        // different tool version alone is recorded, not refused).
+        assert_eq!(out.results.tables["s.a"].verdict, Verdict::Pass);
+        // The same tool version gives no such warning.
+        let same = run(vec![table("s.a", 3)], vec![table("s.a", 3)]);
+        assert!(!same
+            .results
+            .warnings
+            .iter()
+            .any(|w| w.contains("capture was made by Dmux")));
     }
 
     #[test]
