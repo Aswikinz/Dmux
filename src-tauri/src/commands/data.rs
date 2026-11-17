@@ -479,6 +479,7 @@ pub(crate) fn start_run_with(
 
     let run_id = RunManager::fresh_id();
     let resume_store = crate::state::resume_store_path(state, &run_id)?;
+    state.note_run_start(&run_id, &input.old.profile.label, &input.new.profile.label);
 
     let config = RunConfig {
         mapping,
@@ -735,6 +736,11 @@ pub async fn get_results(
 }
 
 pub(crate) fn get_results_with(run_id: &str, state: &AppState) -> Result<ResultsDto, CommandError> {
+    if state.runs.phase(run_id).is_none() {
+        if let Some(opened) = state.opened_results(run_id)? {
+            return Ok(map_opened(run_id, &opened));
+        }
+    }
     let results = state.runs.results(run_id)?;
     // Custom checks, when they ran: the folded results, the verdict that
     // includes any custom failure, and the findings themselves.
@@ -747,6 +753,30 @@ pub(crate) fn get_results_with(run_id: &str, state: &AppState) -> Result<Results
             Ok(dto)
         }
     }
+}
+
+/// Map verified results that were opened from history or a file.  For a hook
+/// envelope the overall verdict is the worse of the results verdict and every
+/// custom-check finding, and each finding is listed as a warning, so a failed
+/// custom check can never show as PASS.
+pub(crate) fn map_opened(run_id: &str, opened: &crate::history::Opened) -> ResultsDto {
+    let mut dto = map_results(run_id, &opened.results);
+    if let Some(hooks) = &opened.hooks {
+        dto.verdict = verdict_string(opened.displayed_verdict());
+        for f in &hooks.custom_checks {
+            dto.warnings.push(format!(
+                "Custom check ({}): {}{}",
+                f.severity,
+                f.message,
+                f.table
+                    .as_deref()
+                    .map(|t| format!(" [{t}]"))
+                    .unwrap_or_default()
+            ));
+        }
+        dto.warnings.extend(hooks.warnings.iter().cloned());
+    }
+    dto
 }
 
 // ---------------------------------------------------------------------------

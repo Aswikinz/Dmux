@@ -4,6 +4,8 @@ import type {
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
+  HistoryEntry,
+  OpenResultsResult,
   Inventory,
   Mapping,
   ReportRequest,
@@ -44,6 +46,12 @@ export interface Engine {
    * and is recorded in the results.  Superusers are refused by default.
    */
   setSuperuserOverride(override: SuperuserOverride | null): void;
+
+  /** Every saved connection profile (never a password). */
+  listProfiles(): Promise<ConnectionProfile[]>;
+
+  /** Delete a saved profile together with its saved password. */
+  deleteProfile(id: string): Promise<boolean>;
 
   /** Whether a keychain password is stored for a profile (never returns it). */
   profileHasPassword(id: string): Promise<boolean>;
@@ -102,6 +110,26 @@ export interface Engine {
 
   /** Back to the bundled or automatically found Python. */
   clearPython(): Promise<AppSettings>;
+  /** The local run history, newest first (metadata only). */
+  listHistory(): Promise<HistoryEntry[]>;
+
+  /** Load a history entry's results.  The backend verifies the stored file
+   *  first and refuses one that was changed; only verified results come back. */
+  openHistoryEntry(id: string): Promise<Results>;
+
+  /** Choose a results file in a native dialog, verify it, and return it.  The
+   *  returned `runId` works with `exportReport`. */
+  openResultsFile(): Promise<OpenResultsResult>;
+
+  /** A history entry's run log as readable text. */
+  getHistoryLog(id: string): Promise<string>;
+
+  /** Save a history entry's run log through a native save dialog. */
+  saveHistoryLog(id: string): Promise<ReportResult>;
+
+  /** Delete every stored results file and history row (profiles are kept).
+   *  Resolves to how many runs were removed. */
+  purgeHistory(): Promise<number>;
 
   /** Get the engine version string for the run log. */
   getVersion(): Promise<string>;

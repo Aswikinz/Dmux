@@ -30,6 +30,12 @@ fn main() {
             "clear_hooks_folder",
             "choose_python",
             "clear_python",
+            "list_history",
+            "open_history_entry",
+            "open_results_file",
+            "get_history_log",
+            "save_history_log",
+            "purge_history",
         ]),
     ))
     .expect("failed to run tauri build script");

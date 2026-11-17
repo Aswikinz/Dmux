@@ -12,7 +12,8 @@ export type Step =
 
 interface StepSidebarProps {
   steps: { id: Step; label: string }[];
-  current: Step;
+  /** The current step, or null while another section (such as History) is shown. */
+  current: Step | null;
   completed: Set<Step>;
   onSelect: (step: Step) => void;
   /** True while another screen (Settings) is showing: no step is current. */

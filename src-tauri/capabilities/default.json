@@ -28,6 +28,12 @@
     "allow-choose-hooks-folder",
     "allow-clear-hooks-folder",
     "allow-choose-python",
-    "allow-clear-python"
+    "allow-clear-python",
+    "allow-list-history",
+    "allow-open-history-entry",
+    "allow-open-results-file",
+    "allow-get-history-log",
+    "allow-save-history-log",
+    "allow-purge-history"
   ]
 }

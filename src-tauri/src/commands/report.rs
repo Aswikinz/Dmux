@@ -66,14 +66,18 @@ pub enum ExportReportResult {
     Cancelled,
 }
 
-/// The verified layout and digest for a finished run, from app state only.
-/// A run that is unknown, still running, stopped or failed is refused with
-/// the run manager's typed error.
-pub(crate) fn verified_layout(
+/// The verified results of a run id: a live run's own results (re-verified), or
+/// results the app verified when opening a history entry or a results file
+/// (registered under a fresh id).  Never anything the webview sent.
+pub(crate) fn verification_for(
     run_id: &str,
-    include_keys: bool,
     state: &AppState,
-) -> Result<(Layout, String), CommandError> {
+) -> Result<dmux_report::Verification, CommandError> {
+    if state.runs.phase(run_id).is_none() {
+        if let Some(opened) = state.opened_results(run_id)? {
+            return Ok(opened.to_verification());
+        }
+    }
     let results = state.runs.results(run_id)?;
     // When custom checks ran, render from their envelope (the results plus the
     // findings and the script hashes), verified like `dmux report` verifies a
@@ -82,9 +86,20 @@ pub(crate) fn verified_layout(
         Some(hooks) => dmux_report::verify::verify_value(&hooks.envelope),
         None => dmux_report::verify::verify_results(&results),
     };
-    let verification = verified.map_err(|e| CommandError::Report {
+    verified.map_err(|e| CommandError::Report {
         message: format!("the run's results cannot be reported: {e}"),
-    })?;
+    })
+}
+
+/// The verified layout and digest for a finished run, from app state only.
+/// A run that is unknown, still running, stopped or failed is refused with
+/// the run manager's typed error.
+pub(crate) fn verified_layout(
+    run_id: &str,
+    include_keys: bool,
+    state: &AppState,
+) -> Result<(Layout, String), CommandError> {
+    let verification = verification_for(run_id, state)?;
     let layout = dmux_report::build_layout(&verification, &ReportOptions { include_keys });
     Ok((layout, verification.sha256))
 }

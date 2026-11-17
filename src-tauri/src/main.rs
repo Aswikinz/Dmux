@@ -3,6 +3,7 @@
 
 mod commands;
 mod error;
+mod history;
 mod hooks;
 mod prefs;
 mod run_manager;
@@ -56,6 +57,12 @@ fn main() {
             commands::settings::clear_hooks_folder,
             commands::settings::choose_python,
             commands::settings::clear_python,
+            commands::history::list_history,
+            commands::history::open_history_entry,
+            commands::history::open_results_file,
+            commands::history::get_history_log,
+            commands::history::save_history_log,
+            commands::history::purge_history,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());

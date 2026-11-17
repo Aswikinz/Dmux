@@ -11,6 +11,7 @@ import { RunScreen } from './screens/RunScreen';
 import { ResultsScreen } from './screens/ResultsScreen';
 import { ReportScreen } from './screens/ReportScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
+import { HistoryScreen } from './screens/HistoryScreen';
 import type { Engine } from './api/engine';
 import { resolveEngine } from './api/engineSelection';
 import type {
@@ -22,7 +23,7 @@ import type {
   RunProgress,
   Results,
 } from './api/contract';
-import { Moon, Sun, Zap, ZapOff, Menu, Settings } from 'lucide-react';
+import { Moon, Sun, Zap, ZapOff, Menu, History, Settings } from 'lucide-react';
 
 const stepOrder: Step[] = [
   'connect',
@@ -54,7 +55,8 @@ function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [engine] = useState<Engine>(() => resolveEngine());
   const [step, setStep] = useState<Step>('connect');
-  const [showSettings, setShowSettings] = useState(false);
+  // History and Settings are separate sections below the steps, not steps.
+  const [view, setView] = useState<'steps' | 'history' | 'settings'>('steps');
   const [completed, setCompleted] = useState<Set<Step>>(new Set());
 
   const [oldProfile, setOldProfile] = useState<ConnectionProfile>(defaultOldProfile());
@@ -64,6 +66,8 @@ function AppShell() {
   const [plan, setPlan] = useState<CheckPlan | null>(null);
   const [progress, setProgress] = useState<RunProgress | null>(null);
   const [results, setResults] = useState<Results | null>(null);
+  // True while the Results screen shows results opened from History or a file.
+  const [resultsOpened, setResultsOpened] = useState(false);
 
   const definition = useMemo<RunDefinition | null>(
     () =>
@@ -77,12 +81,22 @@ function AppShell() {
     (next: Step) => {
       const currentIndex = stepOrder.indexOf(step);
       const nextIndex = stepOrder.indexOf(next);
-      if (nextIndex <= currentIndex + 1) {
+      if (view === 'history' || nextIndex <= currentIndex + 1) {
         setStep(next);
       }
+      setView('steps');
     },
-    [step],
+    [step, view],
   );
+
+  // Verified results opened from the History screen (or a results file) are
+  // shown on the Results screen; the Report screen can export them too.
+  const showOpenedResults = useCallback((opened: Results) => {
+    setResults(opened);
+    setResultsOpened(true);
+    setView('steps');
+    setStep('results');
+  }, []);
 
   const markCompleted = useCallback((s: Step) => {
     setCompleted((prev) => new Set([...prev, s]));
@@ -104,6 +118,7 @@ function AppShell() {
   }, [step]);
 
   const restart = useCallback(() => {
+    setView('steps');
     setStep('connect');
     setCompleted(new Set());
     setInventory(null);
@@ -111,6 +126,7 @@ function AppShell() {
     setPlan(null);
     setProgress(null);
     setResults(null);
+    setResultsOpened(false);
     setOldProfile(defaultOldProfile());
     setNewProfile(defaultNewProfile());
   }, []);
@@ -146,29 +162,36 @@ function AppShell() {
         </div>
         <StepSidebar
           steps={stepLabels}
-          current={step}
+          current={view === 'steps' ? step : null}
           completed={completed}
-          onSelect={(next) => {
-            setShowSettings(false);
-            goToStep(next);
-          }}
-          suspended={showSettings}
+          onSelect={goToStep}
         />
-        <div className="mt-4 border-t border-black/[0.06] pt-3 dark:border-white/[0.08]">
-          <button
-            type="button"
-            onClick={() => setShowSettings(true)}
-            aria-current={showSettings ? 'page' : undefined}
-            className={`flex h-9 w-full items-center gap-3 rounded-lg px-2.5 text-left text-[13px] font-medium transition-colors duration-150 ${
-              showSettings
-                ? 'bg-accent-600 text-white shadow-[0_1px_2px_rgba(30,27,75,0.3)] dark:bg-accent-500'
-                : 'text-slate-700 hover:bg-black/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.07]'
-            }`}
-          >
-            <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
-            <span>Settings</span>
-          </button>
+        <div className="mb-1 mt-5 px-2.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">
+          Library
         </div>
+        <nav aria-label="Library" className="space-y-0.5">
+          {(
+            [
+              ['history', 'History', History],
+              ['settings', 'Settings', Settings],
+            ] as const
+          ).map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setView(id)}
+              aria-current={view === id ? 'page' : undefined}
+              className={`flex h-9 w-full items-center gap-3 rounded-lg px-2.5 text-left text-[13px] font-medium transition-colors duration-150 ${
+                view === id
+                  ? 'bg-accent-600 text-white shadow-[0_1px_2px_rgba(30,27,75,0.3)] dark:bg-accent-500'
+                  : 'text-slate-700 hover:bg-black/[0.05] dark:text-slate-300 dark:hover:bg-white/[0.07]'
+              }`}
+            >
+              <Icon className="h-5 w-5 shrink-0" aria-hidden="true" />
+              <span className="truncate">{label}</span>
+            </button>
+          ))}
+        </nav>
         <div className="mt-auto flex items-center gap-1 px-1">
           <Button
             variant="ghost"
@@ -201,17 +224,20 @@ function AppShell() {
             <Menu className="h-5 w-5" />
           </Button>
         </div>
-        {showSettings && (
+        {view === 'settings' && (
           <div key="settings" className="mx-auto w-full max-w-6xl animate-fade-up">
             <SettingsScreen engine={engine} />
           </div>
         )}
         <div
-          key={step}
-          hidden={showSettings}
+          key={view === 'history' ? 'history' : step}
+          hidden={view === 'settings'}
           className="mx-auto w-full max-w-6xl animate-fade-up"
         >
-          {step === 'connect' && (
+          {view === 'history' && (
+            <HistoryScreen engine={engine} onOpenResults={showOpenedResults} />
+          )}
+          {view !== 'history' && step === 'connect' && (
             <ConnectScreen
               engine={engine}
               oldProfile={oldProfile}
@@ -221,7 +247,7 @@ function AppShell() {
               onNext={advance}
             />
           )}
-          {step === 'structure' && (
+          {view !== 'history' && step === 'structure' && (
             <CompareStructureScreen
               engine={engine}
               oldProfile={oldProfile}
@@ -235,7 +261,7 @@ function AppShell() {
               onBack={back}
             />
           )}
-          {step === 'map' && inventory && (
+          {view !== 'history' && step === 'map' && inventory && (
             <MapScreen
               engine={engine}
               inventory={inventory}
@@ -248,7 +274,7 @@ function AppShell() {
               onBack={back}
             />
           )}
-          {step === 'checks' && mapping && (
+          {view !== 'history' && step === 'checks' && mapping && (
             <ChooseChecksScreen
               engine={engine}
               mapping={mapping}
@@ -261,12 +287,17 @@ function AppShell() {
               onBack={back}
             />
           )}
-          {step === 'run' && definition && (
+          {view !== 'history' && step === 'run' && definition && (
             <RunScreen
               engine={engine}
               definition={definition}
               progress={progress}
               onProgressChange={(p) => {
+                // A different run replaces any results opened from History.
+                if (p.runId !== progress?.runId) {
+                  setResults(null);
+                  setResultsOpened(false);
+                }
                 setProgress(p);
                 if (p.overallState === 'done' || p.overallState === 'cancelled') {
                   markCompleted('run');
@@ -276,20 +307,20 @@ function AppShell() {
               onBack={back}
             />
           )}
-          {step === 'results' && progress && (
+          {view !== 'history' && step === 'results' && (progress || results) && (
             <ResultsScreen
               engine={engine}
-              runId={progress.runId}
+              runId={results?.runId ?? progress?.runId ?? ''}
               results={results}
               onResultsChange={(r) => {
                 setResults(r);
                 markCompleted('results');
               }}
               onNext={advance}
-              onBack={back}
+              onBack={resultsOpened ? () => setView('history') : back}
             />
           )}
-          {step === 'report' && results && (
+          {view !== 'history' && step === 'report' && results && (
             <ReportScreen engine={engine} results={results} onBack={back} onRestart={restart} />
           )}
         </div>

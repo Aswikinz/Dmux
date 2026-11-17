@@ -23,6 +23,7 @@ import type {
   ConnectionProfile,
   ConnectionTestResult,
   CoverageSummary,
+  HistoryEntry,
   DrillDownRow,
   FailureCard,
   Inventory,
@@ -30,6 +31,7 @@ import type {
   MappingMatch,
   IgnoreItem,
   MatchConfidence,
+  OpenResultsResult,
   ReportRequest,
   ReportResult,
   Results,
@@ -216,6 +218,47 @@ interface BackendProfile {
 /** Shape `save_profile` returns: the stored profile plus an optional warning. */
 /** Shape `export_report` returns (`commands::report::ExportReportResult`). */
 type RawExportReport = { status: 'saved'; path: string } | { status: 'cancelled' };
+
+/** `commands::history::OpenResultsOutcome`. */
+type RawOpenResults = { status: 'opened'; results: RawResults } | { status: 'cancelled' };
+
+/** `store::HistoryRow`. */
+interface RawHistoryRow {
+  id: string;
+  started_at: number;
+  ended_at: number;
+  verdict: string;
+  options_applied: boolean;
+  options_recorded: boolean;
+  coverage_line: string;
+  old_label: string;
+  new_label: string;
+  mapping_hash: string;
+  definition_hash: string;
+  results_sha256: string;
+}
+
+function isoFromSeconds(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function translateHistoryRow(raw: RawHistoryRow): HistoryEntry {
+  return {
+    id: raw.id,
+    startedAt: isoFromSeconds(raw.started_at),
+    endedAt: isoFromSeconds(raw.ended_at),
+    // Anything outside the engine vocabulary is a non-PASS tool fault.
+    verdict: mapVerdict(raw.verdict),
+    optionsApplied: raw.options_applied,
+    optionsRecorded: raw.options_recorded,
+    coverage: raw.coverage_line,
+    oldLabel: raw.old_label,
+    newLabel: raw.new_label,
+    mappingHash: raw.mapping_hash,
+    definitionHash: raw.definition_hash,
+    resultsSha256: raw.results_sha256,
+  };
+}
 
 interface RawSaveProfileResult {
   profile: BackendProfile;
@@ -660,6 +703,7 @@ function toConnectionProfile(raw: BackendProfile): ConnectionProfile {
     encryption: raw.encryption,
     tlsFingerprint: raw.tls_fingerprint ?? undefined,
     plaintextReason: raw.plaintext_reason ?? undefined,
+    caFile: raw.ca_file ?? undefined,
   };
 }
 
@@ -993,6 +1037,15 @@ export function createTauriEngine(): Engine {
       return invoke<boolean>('profile_has_password', { id });
     },
 
+    async listProfiles(): Promise<ConnectionProfile[]> {
+      const rows = await invoke<BackendProfile[]>('list_profiles');
+      return rows.map(toConnectionProfile);
+    },
+
+    async deleteProfile(id: string): Promise<boolean> {
+      return invoke<boolean>('delete_profile', { id });
+    },
+
     async compareStructure(
       oldProfile: ConnectionProfile,
       newProfile: ConnectionProfile,
@@ -1151,6 +1204,51 @@ export function createTauriEngine(): Engine {
     async clearPython(): Promise<AppSettings> {
       return settingsCall('clear_python');
     },
+    async listHistory(): Promise<HistoryEntry[]> {
+      const rows = await invoke<RawHistoryRow[]>('list_history');
+      return rows.map(translateHistoryRow);
+    },
+
+    async openHistoryEntry(id: string): Promise<Results> {
+      // The backend verifies the stored file before it returns anything.
+      const raw = await invoke<RawResults>('open_history_entry', { id });
+      return translateResults(raw);
+    },
+
+    async openResultsFile(): Promise<OpenResultsResult> {
+      // The native open dialog, the read and the verification all happen in
+      // the backend; no path and no file content cross the IPC.
+      try {
+        const raw = await invoke<RawOpenResults>('open_results_file');
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, results: translateResults(raw.results) };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
+    },
+
+    async getHistoryLog(id: string): Promise<string> {
+      return invoke<string>('get_history_log', { id });
+    },
+
+    async saveHistoryLog(id: string): Promise<ReportResult> {
+      try {
+        const raw = await invoke<RawExportReport>('save_history_log', { id });
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, filePath: raw.path };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
+    },
+
+    async purgeHistory(): Promise<number> {
+      return invoke<number>('purge_history');
+    },
+
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');
     },

@@ -108,10 +108,15 @@ pub struct DriveTicket {
     pub config: RunConfig,
 }
 
+/// Called once with a run's id and results when it becomes `Done` (used to
+/// persist the run history).
+pub type DoneHook = Arc<dyn Fn(&str, &RunResults) + Send + Sync>;
+
 /// The registry the Tauri commands read and update.
 #[derive(Default)]
 pub struct RunManager {
     runs: Mutex<HashMap<String, RunHandle>>,
+    on_done: Mutex<Option<DoneHook>>,
 }
 
 impl RunManager {
@@ -119,6 +124,14 @@ impl RunManager {
         self.runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Install the hook that runs when a run finishes successfully.
+    pub fn set_on_done(&self, hook: DoneHook) {
+        *self
+            .on_done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     /// A fresh app-level run id (safe as a file name).
@@ -253,10 +266,12 @@ impl RunManager {
         if h.finished_generation.is_none_or(|g| g < generation) {
             h.finished_generation = Some(generation);
         }
+        let mut done: Option<RunResults> = None;
         if h.generation == generation && h.phase == RunPhase::Running {
             match outcome {
                 Ok(results) => {
                     h.phase = RunPhase::Done;
+                    done = Some(results.clone());
                     h.outcome = Some(Ok(results));
                 }
                 Err(e) => {
@@ -268,7 +283,19 @@ impl RunManager {
                 }
             }
         }
-        Some(h.phase)
+        let phase = h.phase;
+        drop(runs);
+        if let Some(results) = done {
+            let hook = self
+                .on_done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook(id, &results);
+            }
+        }
+        Some(phase)
     }
 
     /// Whether the drive task of `generation` has returned.
