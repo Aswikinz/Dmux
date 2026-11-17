@@ -59,8 +59,8 @@ Status: todo, doing, review, done, blocked.
 | T043 | Audit H1/L1/L5/L9: RLS fail-closed (row_security=off 9.5+, check_session, 42501⇒TOOL_FAULT), probe RLS/BYPASSRLS + write-role reasons, Decimal scale on deserialise, redact_secrets offsets, DBA guide. | arjun-core | done | T026 |
 | T044 | Audit H2/M5/M1: column notes (ticked options, type-change flags) in results + report page 1; connections block (TLS state, plaintext/superuser reasons, can_write, pooler, md5, version, encoding); PDF page 1 prints all hashes; honest "detects corruption" wording. | arjun | todo | T026, T024 |
 | T045 | Audit H3/L2 (+ broaden the 42501 message: missing SELECT or RLS): recompute needs_review from captured types, normalisation-rules version (refuse mismatch), tool_version warning, smaller file limits, bounded `dmux diff`. | arjun-core | todo | T044 |
-| T046 | Audit M2/M3/L4/I4: table-only rename rules + refuse duplicate targets; change-detection-unavailable ⇒ NEEDS_REVIEW; unknown level/option/ignore paths are config errors; estimate timing without SELECT *. | arjun | todo | T026 |
-| T047 | Audit M4/M9: trust-once fingerprint recorded by the verifier (no error-text parsing); optional CA file (profile, UI). | arjun | in progress | T026 |
+| T046 | Audit M2/M3/L4/I4: table-only rename rules + refuse duplicate targets; change-detection-unavailable ⇒ NEEDS_REVIEW; unknown level/option/ignore paths are config errors; estimate timing without SELECT *. | arjun | done | T026 |
+| T047 | Audit M4/M9: trust-once fingerprint recorded by the verifier (no error-text parsing); optional CA file (profile, UI). | arjun | done | T026 |
 | T048 | Audit M6/M7/L3/L10/L2: honest hook warning + refuse writable scripts; no password in definition files; 0600 outputs; sanitised hook stderr; no key lists in hook payload; CLI --ca-file. | arjun | done | T026 |
 | T049 | Docs after the audit: M1/M6 wording, I1/I3/I5 in "How Dmux decides", BYPASSRLS + pause replay in DBA guide. | ella | todo | T043-T048 |
 | T050 | Audit L7/L8/M5 (Tauri): validated mappings from the webview, nothing verdict-bearing round-trips through it, override reason retained, CSP hardening. | arjun | done | T026 |
@@ -68,6 +68,7 @@ Status: todo, doing, review, done, blocked.
 | T052 | Fixtures: RLS database (rls_bank) and a TLS-only Postgres (profile tls, :5439). | nina | done | T026 |
 | T056 | Release v0.3.0 (desktop app wired + reports; first signed/attested release). | maya | done | T040, T024, T054 |
 | T057 | Real-app E2E (WebDriver on the release binary vs demo_bank: type profile + password → run → FAIL verdict → export), Playwright in CI, rls_bank in CI, non-SQL-user walkthrough with screenshots. Owner question. | sam + kenji | in progress | T054 |
+| T058 | TLS follow-ups: CLI `--ca-file` (ConnArgs + run definitions) → ConnProfile::with_ca_file; ca_file in definition_hash (resume keying). | arjun | todo | T044, T047 |
 | T055 | Keychain-less runs: backend holds a typed password in memory only for the app session (never persisted, cleared on profile change/exit) so Compare structure → Run works without a keychain (T054 gap). | arjun | todo | T044 |
 | T054 | Connect screen: no mock defaults (127.0.0.1/5433/demo_bank/dmux_dev) in the shipped UI; password entry sent once to the keychain via save_profile and cleared; ask-per-run when no keychain (PLAN 4.1/6.5). Owner finding. | arjun | done | T040 |
 | T053 | Live cancel test gated on DMUX_TEST_LARGE_* (CI has no demo_bank_large). | maya | done | T040 |
