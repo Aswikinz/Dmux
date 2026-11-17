@@ -216,9 +216,12 @@ impl PasswordStore for Keychain {
                 message: NOT_SAVED_MESSAGE.to_string(),
             });
         }
-        match Self::entry(profile_key)?.set_password(password) {
-            Ok(()) => Ok(()),
-            Err(_) => {
+        // An entry that cannot even be created means no usable keychain here
+        // (for example no session bus): the same as a failed store.
+        let stored = Self::entry(profile_key).map(|e| e.set_password(password));
+        match stored {
+            Ok(Ok(())) => Ok(()),
+            _ => {
                 self.available = false;
                 Err(CommandError::Keychain {
                     message: NOT_SAVED_MESSAGE.to_string(),
@@ -236,13 +239,14 @@ impl PasswordStore for Keychain {
                 profile: profile_key.to_string(),
             });
         }
-        match Self::entry(profile_key)?.get_password() {
-            Ok(password) => Ok(password),
-            Err(keyring::Error::NoEntry) => Err(CommandError::PasswordMissing {
+        let read = Self::entry(profile_key).map(|e| e.get_password());
+        match read {
+            Ok(Ok(password)) => Ok(password),
+            Ok(Err(keyring::Error::NoEntry)) => Err(CommandError::PasswordMissing {
                 reason: PasswordMissing::NotStored,
                 profile: profile_key.to_string(),
             }),
-            Err(_) => {
+            _ => {
                 // Any other keyring failure is treated as "no keychain" so the
                 // UI falls back to asking each run rather than blocking.
                 self.available = false;
@@ -423,6 +427,18 @@ mod tests {
             Err(CommandError::Keychain { .. }) => {}
             Err(other) => panic!("unexpected error kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_keyring_entry_that_cannot_be_made_reads_as_missing_not_as_an_error() {
+        // An empty key is refused by the keyring crate on some platforms; the
+        // read must still be a missing password (ask, or use the session
+        // cache), never a hard keychain error that blocks the flow.
+        let mut kc = Keychain::default();
+        assert!(matches!(
+            kc.get(""),
+            Err(CommandError::PasswordMissing { .. })
+        ));
     }
 
     #[test]

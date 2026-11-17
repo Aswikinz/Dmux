@@ -499,8 +499,7 @@ jobs:
       # binary with the UI embedded. A plain `cargo build` binary is dev-mode
       # (loads http://localhost:5173, no embedded UI) and must not be smoked.
       # Last in the job so a smoke failure still keeps the uploaded installers.
-      # This run has no keychain: the real-flow's keychain variant skips and its
-      # no-keychain variant is a TODO(T055) skip, so only the shell smoke runs.
+      # This run has no keychain and no E2E login, so only the shell smoke runs.
       - name: Smoke test (WebKitGTK under Xvfb)
         timeout-minutes: 15
         env:
@@ -510,13 +509,24 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: '1'
         run: xvfb-run -a pnpm test:e2e
 
+      # Real-app E2E (no-keychain variant, T055): no Secret Service is running,
+      # so the typed password is kept in memory for the session. Drives Connect
+      # (typed password + Test connection) through Compare structure.
+      - name: Real-app E2E (no keychain, demo_bank)
+        timeout-minutes: 15
+        env:
+          DMUX_APP_BINARY: target/release/dmux-app
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+          DMUX_E2E_USER: dmux_reader
+          DMUX_E2E_PASSWORD: dmux_reader_only
+        run: xvfb-run -a pnpm test:e2e --spec e2e/specs/real-flow.spec.ts
+
       # Real-app E2E (keychain variant): drive the release binary through the
       # full flow against demo_bank with a working Secret Service. gnome-keyring
       # is started and unlocked headless (the unlock password is arbitrary; the
       # keyring just has to be unlocked for the keyring crate to store/read).
       # dbus-run-session guarantees a session bus for Secret Service. The
-      # no-keychain variant lives in real-flow.spec.ts as a skipped test
-      # (TODO T055: a typed password is not threaded through later steps yet).
+      # no-keychain variant runs in the step above.
       - name: Real-app E2E (keychain, demo_bank)
         timeout-minutes: 20
         env:

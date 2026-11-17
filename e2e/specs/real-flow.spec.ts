@@ -14,9 +14,10 @@ import { browser, $, $$, expect } from '@wdio/globals';
 //       dbus-run-session). The password typed on Connect is stored in the
 //       keychain and read back by Compare structure / Run, so the full flow
 //       completes. Run from the build-linux job's "Real-app E2E" step.
-//   (b) no keychain — expected to fail at Compare structure today, because a
-//       password typed on Connect is not threaded through later steps (known
-//       gap T055). Skipped with a TODO so it turns on once T055 lands.
+//   (b) no keychain — no Secret Service. A password typed on Connect and
+//       proven by Test connection is kept in memory for the session (T055), so
+//       Compare structure works without a Save. Run from the "Real-app E2E (no
+//       keychain)" step.
 
 const E2E_USER = process.env.DMUX_E2E_USER;
 const E2E_PASSWORD = process.env.DMUX_E2E_PASSWORD;
@@ -137,7 +138,7 @@ describe('Dmux real-app flow against the CI service databases', function (this: 
 
       step(6, 'Run');
       await cta('Run').click();
-      await waitForBodyText((t) => t.includes('Finished'), 300_000, 'the run to finish');
+      await waitForBodyText((t) => t.includes('The run has finished'), 300_000, 'the run to finish');
 
       step(7, 'Results');
       await cta('See results').click();
@@ -155,12 +156,11 @@ describe('Dmux real-app flow against the CI service databases', function (this: 
     },
   );
 
-  // TODO(T055): once a typed password is threaded through later steps without a
-  // keychain, flip `it.skip` to `it`. Until then this would fail at Compare
-  // structure ("no password is stored for this profile"), because the password
-  // typed on Connect is dropped after Test connection and only a keychain save
-  // makes it reach run_inventory / build_mapping / start_run.
-  it.skip(
+  // Without a keychain (PLAN 4.1, T055): a password typed on Connect and
+  // proven by Test connection is kept in memory for the session, so Compare
+  // structure and the later steps can use it.
+  const runNoKeychainFlow = !HAS_KEYCHAIN && E2E_USER && E2E_PASSWORD ? it : it.skip;
+  runNoKeychainFlow(
     'completes the flow without a keychain (ask-per-run password)',
     async () => {
       await $('main').waitForDisplayed({ timeout: 30_000 });
@@ -172,6 +172,12 @@ describe('Dmux real-app flow against the CI service databases', function (this: 
         (t) => (t.match(/Server version/g) ?? []).length >= 1,
         30_000,
         'old Test connection to report server info',
+      );
+      // The user is told where the password lives this session.
+      await waitForBodyText(
+        (t) => t.includes('No system keychain'),
+        10_000,
+        'the in-memory password notice',
       );
 
       step(2, 'Connect — fill + Test connection (new, typed password)');
