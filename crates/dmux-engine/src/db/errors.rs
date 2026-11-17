@@ -8,23 +8,44 @@ use thiserror::Error;
 
 /// Redact any password value from a message string.
 ///
-/// Looks for the substring `password=` (case-insensitive), then replaces
-/// everything up to the next whitespace or end of string with `password=<redacted>`.
+/// Looks for the ASCII substring `password=` (case-insensitive) directly over
+/// the input's bytes, then replaces everything up to the next ASCII whitespace,
+/// comma or quote with `password=<redacted>`.  The search never lowercases the
+/// input first: lowercasing can change byte lengths for non-ASCII text (for
+/// example `İ`), which would make a byte offset slice land mid-character and
+/// panic or redact the wrong span.  Every slice here starts and ends on an
+/// ASCII byte, and ASCII bytes never appear as a UTF-8 continuation byte, so
+/// the result is always valid and correctly aligned.
 fn redact_secrets(message: &str) -> String {
+    const NEEDLE: &[u8] = b"password=";
+    let bytes = message.as_bytes();
     let mut result = String::with_capacity(message.len());
-    let mut input = message;
-    while let Some(pos) = input.to_lowercase().find("password=") {
-        let before = &input[..pos];
-        result.push_str(before);
-        result.push_str("password=<redacted>");
-        // Skip the `password=` prefix and the value that follows.
-        let after_prefix = &input[pos + "password=".len()..];
-        let skip_len = after_prefix
-            .find(|c: char| c.is_ascii_whitespace() || c == ',' || c == '\'' || c == '"')
-            .unwrap_or(after_prefix.len());
-        input = &after_prefix[skip_len..];
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let matched = i + NEEDLE.len() <= bytes.len()
+            && bytes[i..i + NEEDLE.len()]
+                .iter()
+                .zip(NEEDLE)
+                .all(|(b, n)| b.eq_ignore_ascii_case(n));
+        if matched {
+            result.push_str(&message[start..i]);
+            result.push_str("password=<redacted>");
+            let mut j = i + NEEDLE.len();
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b.is_ascii_whitespace() || b == b',' || b == b'\'' || b == b'"' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            start = j;
+        } else {
+            i += 1;
+        }
     }
-    result.push_str(input);
+    result.push_str(&message[start..]);
     result
 }
 
@@ -105,6 +126,46 @@ mod tests {
         assert!(!out.contains("secret123"), "redacted output: {out}");
         assert!(out.contains("password=<redacted>"));
         assert!(out.contains("host=localhost"));
+    }
+
+    #[test]
+    fn redact_is_case_insensitive_over_ascii_bytes() {
+        let out = redact_secrets("conn: PASSWORD=hunter2 user=dmux");
+        assert!(!out.contains("hunter2"), "redacted output: {out}");
+        assert!(out.contains("password=<redacted>"));
+        assert!(out.contains("user=dmux"));
+    }
+
+    #[test]
+    fn redact_does_not_panic_or_misredact_on_non_ascii_before_password() {
+        // "İ" is U+0130: two bytes in UTF-8, whose lowercase form is three bytes.
+        // A lowercased-copy offset search would slice mid-character here.
+        let out = redact_secrets("İstanbul Password=secret");
+        assert!(!out.contains("secret"), "redacted output: {out}");
+        assert!(
+            out.contains("İstanbul"),
+            "non-ASCII text must be preserved: {out}"
+        );
+        assert!(out.contains("password=<redacted>"));
+    }
+
+    #[test]
+    fn redact_stops_at_commas_and_whitespace() {
+        let out = redact_secrets("a=1,password=s3cr3t,b=2");
+        assert!(!out.contains("s3cr3t"), "redacted output: {out}");
+        assert!(out.contains("password=<redacted>"));
+        assert!(out.contains("a=1"));
+        assert!(out.contains("b=2"));
+        // A value that runs to the end of the string is fully redacted.
+        let out = redact_secrets("host=db password=trailing-secret");
+        assert!(!out.contains("trailing-secret"), "redacted output: {out}");
+        assert!(out.contains("host=db"));
+    }
+
+    #[test]
+    fn redact_without_password_is_unchanged() {
+        let input = "connection timed out after 30s";
+        assert_eq!(redact_secrets(input), input);
     }
 
     #[test]

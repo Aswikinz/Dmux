@@ -195,13 +195,40 @@ pub struct BucketSummary {
 }
 
 /// An exact decimal for control totals. Equality is by value (1.10 == 1.1).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// Deserialisation is hand-written so a crafted fingerprint file cannot set
+/// `scale` beyond [`MAX_DECIMAL_SCALE`]: a huge scale would make [`Decimal::reduced`]
+/// loop ~4·10⁹ times and [`std::fmt::Display`] allocate gigabytes.
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Decimal {
     mantissa: i128,
     scale: u32,
 }
 
 const MAX_DECIMAL_SCALE: u32 = 38;
+
+impl<'de> Deserialize<'de> for Decimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Raw {
+            mantissa: i128,
+            scale: u32,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.scale > MAX_DECIMAL_SCALE {
+            return Err(Error::custom("decimal scale exceeds the supported maximum"));
+        }
+        Ok(Decimal {
+            mantissa: raw.mantissa,
+            scale: raw.scale,
+        })
+    }
+}
 
 impl Decimal {
     pub const ZERO: Decimal = Decimal {
@@ -636,6 +663,26 @@ pub(crate) mod tests {
         assert!(tiny
             .checked_add(Decimal::parse(&"9".repeat(38)).unwrap())
             .is_none());
+    }
+
+    #[test]
+    fn decimal_deserialise_enforces_scale_limit() {
+        // A crafted file with scale = u32::MAX must be rejected fast, before
+        // any reduced() loop or Display allocation could run away.
+        let bad = r#"{"mantissa":0,"scale":4294967295}"#;
+        assert!(serde_json::from_str::<Decimal>(bad).is_err());
+        assert!(serde_json::from_str::<Decimal>(r#"{"mantissa":0,"scale":39}"#).is_err());
+        // The boundary value and a normal value still round-trip.
+        let ok: Decimal = serde_json::from_str(r#"{"mantissa":123,"scale":38}"#).unwrap();
+        assert_eq!(
+            ok,
+            Decimal {
+                mantissa: 123,
+                scale: 38
+            }
+        );
+        let ok: Decimal = serde_json::from_str(r#"{"mantissa":-1250,"scale":2}"#).unwrap();
+        assert_eq!(ok.to_string(), "-12.50");
     }
 
     #[test]

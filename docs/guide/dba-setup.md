@@ -84,6 +84,42 @@ DROP ROLE dmux_reader;
 
 The same three lines are at the foot of the script, so nobody has to look them up later.
 
+### Row-level security (RLS)
+
+If a table has row-level security enabled (`relrowsecurity` on `pg_class`,
+PostgreSQL 9.5 and later), a plain `SELECT` returns only the rows the policy
+allows — silently. Dmux refuses to read a table through a policy: it sets
+`row_security = off` for every read, and PostgreSQL then raises an error
+(SQLSTATE 42501) instead of filtering. Dmux turns that into a clear
+`TOOL_FAULT` — "row-level security would hide rows from the Dmux login" —
+never a PASS, because the rows it could not read are exactly the rows nobody
+checked.
+
+For Dmux to read an RLS-protected table, one of these must hold:
+
+- the `dmux_reader` login has `BYPASSRLS`, or
+- the table's owner has exempted the login from the policy, or
+- the table is left without RLS for the comparison window.
+
+`BYPASSRLS` lets the login read every row regardless of policy, which is what
+Dmux needs to prove the migration copied every row:
+
+```sql
+ALTER ROLE dmux_reader BYPASSRLS;
+```
+
+Granting `BYPASSRLS` to a login that is otherwise least-privilege is a real
+capability: it can then read rows a policy would hide. Give it to the
+comparison login only, for the comparison window, and revoke it afterwards:
+
+```sql
+ALTER ROLE dmux_reader NOBYPASSRLS;
+```
+
+Dmux's connection test reports whether the login has `BYPASSRLS` and lists the
+tables with RLS enabled, so this gap is visible before a run rather than
+discovered as a mid-run fault.
+
 ## 2. Why Dmux refuses a superuser
 
 A superuser can do anything, including things that look read-only and are not. A
@@ -199,6 +235,7 @@ SET LOCAL intervalstyle      = 'iso_8601';
 SET LOCAL bytea_output       = 'hex';
 SET LOCAL extra_float_digits = 0;
 SET LOCAL xmloption          = 'document';
+SET LOCAL row_security       = 'off';   -- 9.5 and later
 SET LOCAL statement_timeout  = '<run window>';
 SET LOCAL lock_timeout       = '5s';
 SET LOCAL application_name   = 'dmux';
@@ -277,6 +314,8 @@ with a reason.
 - [ ] The four `pg_roles` flags are all false, and `INSERT` is refused (section 1).
 - [ ] The script has been run for every schema Dmux will read; a default privilege rule
       covers tables created later.
+- [ ] RLS-protected tables are covered: `dmux_reader` has `BYPASSRLS`, or each such table
+      is exempted, for the comparison window (section 1, "Row-level security").
 - [ ] The certificate fingerprint has been compared with the server team's record, and
       the encryption mode is recorded for the report.
 - [ ] You know whether a pooler sits in the path; a direct connection is used if possible.
