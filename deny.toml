@@ -26,6 +26,15 @@ yanked = "deny"
 unsound = "all"
 unmaintained = "all"
 ignore = [
+    # RUSTSEC-2026-0370/0371/0372 are "unmaintained", NOT vulnerabilities: the zbus
+    # project folded zvariant, zvariant_derive and zbus_names back into zbus
+    # (z-galaxy/zbus#2043); no standalone successor exists yet. They arrive only via
+    # keyring -> secret-service -> zbus (the Linux Secret Service password store).
+    # Revisit when keyring/secret-service move to the merged zbus. Real
+    # vulnerabilities still fail the build.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive folded into zbus upstream; transitive via keyring/secret-service; no vulnerability" },
     # RUSTSEC-2024-0370 is "unmaintained", NOT a vulnerability: proc-macro-error
     # is a transitive proc-macro helper (via darling/derive_more/ref-cast in the
     # Tauri tree) with no known flaw and no successor. Removing it needs upstream
