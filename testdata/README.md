@@ -370,6 +370,10 @@ testdata/demo_bank/build.sh        # build, copy, plant
 testdata/demo_bank/check_key.sh    # 129 checks, exit 0 only when the key is true
 ```
 
+## Owner playground: `edge_bank` (T077)
+
+`edge_bank/` builds a separate database pair with many planted cases for trying Dmux by hand; the guide is `edge_bank/README.md`. It never touches the other databases or the answer key.
+
 ## Still to build (Nina, Phase 1)
 
 - `demo_bank/` `full`: the whole private schema, a few rows each — that is the
