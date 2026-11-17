@@ -31,7 +31,7 @@ jobs:
         id: rust
         with:
           toolchain: 1.100.0 # also pinned in rust-toolchain.toml
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview # llvm-tools: cargo-llvm-cov
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -55,6 +55,18 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
+      # Coverage tooling, pinned like every other action. cargo-llvm-cov needs
+      # the llvm-tools-preview component added to the toolchain above.
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # No --fail-under threshold yet: this is the Phase 0 skeleton. PLAN.md
+      # section 9's gates (85% overall, 95% for the comparison core) arrive
+      # with the real engine code and are added then, not loosened now.
+      - name: Rust coverage (LCOV)
+        run: cargo llvm-cov --workspace --lcov --output-path rust-lcov.info
+
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         # reads packageManager: pnpm@12.21.0 from package.json
 
@@ -72,11 +84,46 @@ jobs:
       - name: Typecheck the e2e suite
         run: pnpm exec tsc --noEmit -p e2e/tsconfig.json
 
-      - name: Frontend unit tests
-        run: pnpm test
+      - name: Frontend unit tests (with coverage)
+        # --coverage writes coverage/lcov.info (v8 provider, vite.config.ts).
+        # No thresholds yet: PLAN.md section 9's 80% frontend gate arrives
+        # with real UI code.
+        run: pnpm test --coverage
 
       - name: Frontend build
         run: pnpm build
+
+      # Fail-closed on purpose: a silent coverage-upload failure would let
+      # the badge and the Codecov/SonarCloud dashboards drift from reality,
+      # and coverage is a merge gate once the engine code lands (PLAN.md
+      # section 9). Better a red CI than a green lie.
+      - name: Upload Rust coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: rust-lcov.info
+          disable_search: true
+          flags: rust
+          fail_ci_if_error: true
+
+      - name: Upload frontend coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/lcov.info
+          disable_search: true
+          flags: frontend
+          fail_ci_if_error: true
+
+      # The SonarCloud job below runs separately and needs these files.
+      - name: Upload coverage reports (for SonarCloud)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-reports
+          path: |
+            rust-lcov.info
+            coverage/lcov.info
+          if-no-files-found: error
 
       - name: Phase 0 guard battery (no database, 51 cases)
         run: bash testdata/phase0/guard_test.sh
@@ -319,3 +366,61 @@ jobs:
           winget install gerardog.gsudo --version 2.6.1 --accept-source-agreements --accept-package-agreements
           icacls "$env:GITHUB_WORKSPACE" /grant "Everyone:(OI)(CI)F"
           sudo --integrity Medium pnpm test:e2e
+
+  # SonarCloud scan (project Aswikinz_Dmux, organization "aswikinz" — verified
+  # via https://sonarcloud.io/api/organizations/search?organizations=aswikinz).
+  # A dedicated job, after checks: the scanner needs the coverage reports but
+  # not the build toolchains, and keeping it out of checks keeps the gate job
+  # fast. Both jobs run on ubuntu-22.04 with the same workspace path, so the
+  # absolute SF: paths in rust-lcov.info resolve against this checkout too.
+  #
+  # Coverage properties (SonarCloud docs, "Rust" and "JavaScript/TypeScript
+  # test coverage"): Rust LCOV goes through sonar.rust.lcov.reportPaths, JS/TS
+  # LCOV through sonar.javascript.lcov.reportPaths (the old
+  # sonar.typescript.lcov.reportPaths is deprecated). The generic
+  # sonar.coverageReportPaths is only for Sonar's generic coverage format.
+  # NOTE: coverage import requires CI-based analysis — automatic analysis must
+  # be OFF in the project's Administration > Analysis Method (Maya confirms).
+  sonar:
+    name: SonarCloud scan
+    needs: checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # SCM blame and new-code detection need full history
+
+      - name: Download coverage reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-reports
+
+      # Fail closed: without the token the scan cannot run, and a skipped
+      # scan would silently stop reporting issues. Maya confirms the secret
+      # exists before this merges (owner is adding SONAR_TOKEN).
+      - name: Require SONAR_TOKEN
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::SONAR_TOKEN secret is missing. Add it in the repo settings (SonarCloud project Aswikinz_Dmux, organization aswikinz) before merging."
+            exit 1
+          fi
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >-
+            -Dsonar.projectKey=Aswikinz_Dmux
+            -Dsonar.organization=aswikinz
+            -Dsonar.sources=crates,src,src-tauri
+            -Dsonar.tests=e2e
+            -Dsonar.test.inclusions=**/*.test.ts,**/*.test.tsx
+            -Dsonar.exclusions=**/target/**,**/node_modules/**,**/dist/**,**/gen/**
+            -Dsonar.rust.lcov.reportPaths=rust-lcov.info
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.sourceEncoding=UTF-8

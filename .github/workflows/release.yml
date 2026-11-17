@@ -1,0 +1,315 @@
+name: Release
+
+# Decision 14: pushing a v* tag creates a PUBLISHED release (not a draft)
+# with both-platform installers, CLI binaries, SHA-256 checksums and an SBOM.
+# Unsigned until SignPath approval; the release body carries the SmartScreen
+# note. v0.0.1 is the Phase 0 skeleton.
+on:
+  push:
+    tags: ['v*']
+
+# Least privilege: read-only by default for the whole workflow. The build jobs
+# run pnpm install and tauri build, which execute third-party install scripts,
+# so a repo-write token must never be available to them. Only the `release` job
+# below is granted contents: write, because gh release create writes the release.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail loudly BEFORE any build if the tag and the manifest versions drift.
+  version-guard:
+    name: Version guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag must match tauri.conf.json and package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          conf=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          pkg=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+          fail=0
+          if [ "$TAG" != "$conf" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match src-tauri/tauri.conf.json version $conf"
+            fail=1
+          fi
+          if [ "$TAG" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            fail=1
+          fi
+          if [ "$fail" -eq 0 ]; then
+            echo "Version guard OK: $GITHUB_REF_NAME == $conf == $pkg"
+          fi
+          exit "$fail"
+
+  build-linux:
+    name: Build release (Ubuntu 22.04)
+    needs: version-guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same dependency list as ci.yml's checks job (verified for Tauri 2).
+      - name: Install Tauri 2 Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        id: rust
+        with:
+          toolchain: 1.100.0
+          targets: x86_64-unknown-linux-musl
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Never cache installers (see ci.yml's checks job for why).
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/release/bundle
+          key: cargo-release-linux-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-linux-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri build runs beforeBuildCommand (pnpm build) itself. deb and rpm
+      # are pure-Rust bundling; AppImage needs extract-and-run (no FUSE 2 on
+      # runners) exactly as in ci.yml.
+      - name: Bundle Linux installers (deb, rpm, AppImage)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: pnpm tauri build --bundles deb,rpm,appimage
+
+      # Static CLI for jump servers (PLAN.md section 9). dmux-cli is a
+      # zero-dependency std crate, so rustup's self-contained musl target
+      # links it statically WITHOUT musl-tools/musl-gcc (verified: the
+      # binary is "static-pie linked"). If a C dependency ever enters the
+      # CLI, apt-get install musl-tools becomes necessary here.
+      - name: Build static CLI (musl)
+        run: cargo build --release -p dmux-cli --target x86_64-unknown-linux-musl
+
+      - name: Stage and verify the static CLI
+        run: |
+          # Flat staging dir: upload-artifact keeps directory structure, and
+          # the release job checksums a flat artifacts/ directory. cp fails
+          # if any bundle type is missing (fail closed).
+          mkdir -p dist
+          cp target/release/bundle/deb/*.deb target/release/bundle/rpm/*.rpm target/release/bundle/appimage/*.AppImage dist/
+          cp target/x86_64-unknown-linux-musl/release/dmux dist/dmux-x86_64-unknown-linux-musl
+          if ! file dist/dmux-x86_64-unknown-linux-musl | grep -q 'static'; then
+            echo "::error::CLI binary is not statically linked"
+            exit 1
+          fi
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dmux-release-linux
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build release (Windows)
+    needs: version-guard
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        id: rust
+        with:
+          toolchain: 1.100.0
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Never cache installers (see ci.yml's checks job for why).
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/release/bundle
+          key: cargo-release-windows-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-windows-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # NSIS is the required gate: per-user, no admin rights (installMode
+      # "currentUser" in tauri.conf.json). Tauri downloads NSIS itself.
+      - name: Bundle NSIS installer (per-user, required gate)
+        run: pnpm tauri build --bundles nsis
+
+      # MSI is best effort with the same VBSCRIPT caveat as ci.yml: WiX
+      # light.exe needs the VBSCRIPT Windows feature, which can be disabled
+      # on the runner. A missing MSI warns but does not fail the release;
+      # the NSIS installer satisfies the Windows gate.
+      - name: Bundle MSI installer (best effort, VBSCRIPT caveat above)
+        continue-on-error: true
+        run: pnpm tauri build --bundles msi
+
+      - name: Report MSI result
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue
+          if ($msi) {
+            Write-Host "MSI built: $($msi.Name)"
+          } else {
+            Write-Host "::warning::MSI bundle missing - see the previous step's log. Known cause: the VBSCRIPT Windows feature is disabled, which WiX light.exe needs (Tauri prerequisites: VBSCRIPT for MSI installers). The per-user NSIS installer built, which satisfies the Windows gate."
+          }
+
+      - name: Build CLI (Windows)
+        run: cargo build --release -p dmux-cli
+
+      - name: Stage the installers and CLI
+        shell: pwsh
+        run: |
+          # Flat staging dir (see the Linux job). NSIS and the CLI are
+          # required; Copy-Item fails without them. MSI is best effort.
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe dist/
+          $msi = Get-ChildItem target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue
+          if ($msi) { Copy-Item $msi.FullName dist/ }
+          Copy-Item target/release/dmux.exe dist/dmux-x86_64-pc-windows-msvc.exe
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dmux-release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version-guard, build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # The only job that may write to the repository: gh release create below
+    # publishes the release. Everything before it stays read-only.
+    permissions:
+      contents: write
+    steps:
+      # gh authenticates with the GH_TOKEN env below, and nothing here pushes
+      # through git, so the checkout token is not needed in .git/config either.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dmux-release-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Check artifacts are present
+        run: |
+          ls -l artifacts
+          # Fail closed: never publish a release missing a platform's files.
+          for pat in '*.deb' '*.rpm' '*.AppImage' '*-setup.exe' 'dmux-x86_64-unknown-linux-musl' 'dmux-x86_64-pc-windows-msvc.exe'; do
+            if ! compgen -G "artifacts/$pat" > /dev/null; then
+              echo "::error::release artifact missing: $pat"
+              exit 1
+            fi
+          done
+
+      # SBOM 1/2: CycloneDX for the Rust workspace. cargo-cyclonedx emits one
+      # BOM per workspace member (virtual root has none); collect them all.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.100.0
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-cyclonedx@0.5.10
+
+      - name: Generate Rust SBOMs (CycloneDX)
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename sbom-rust
+          for f in crates/*/sbom-rust.json src-tauri/sbom-rust.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing Rust SBOM: $f"
+              exit 1
+            fi
+            cp "$f" "artifacts/sbom-rust-$(basename "$(dirname "$f")").json"
+          done
+
+      # SBOM 2/2: CycloneDX for the npm PRODUCTION dependencies, from the
+      # committed pnpm-lock.yaml. cdxgen (the CycloneDX generator with pnpm
+      # lockfile support) is used instead of @cyclonedx/cyclonedx-npm, which
+      # only reads npm lockfiles — generating one here would re-resolve
+      # transitive versions against the registry and could drift from the
+      # pinned pnpm lock. Staging ONLY package.json + pnpm-lock.yaml keeps
+      # the parse lockfile-based and dev-free even if node_modules exists.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+
+      - name: Generate npm production SBOM (CycloneDX)
+        run: |
+          mkdir -p sbom-npm-work
+          cp package.json pnpm-lock.yaml sbom-npm-work/
+          npx --yes @cdxgen/cdxgen@13.8.0 -t pnpm --required-only --fail-on-error \
+            --spec-version 1.6 -o artifacts/sbom-npm.json sbom-npm-work
+
+      - name: Write and verify SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum -- * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      # Decision 14: PUBLISHED, not draft (no --draft). The header states the
+      # Phase 0 skeleton status and the unsigned-installer SmartScreen note;
+      # GitHub's generated notes follow it.
+      - name: Create the published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          cat > header.md <<'EOF'
+          **Phase 0 skeleton.** This release ships the empty Tauri 2 app and the
+          engine/CLI stubs; the comparison method itself is proven against real
+          Postgres 9.4 to 18 servers in `testdata/phase0/`.
+
+          **Unsigned installers.** Windows SmartScreen will warn until SignPath
+          signing approval lands (PLAN.md section 9). Verify every download
+          against `SHA256SUMS` before running it.
+
+          Attached: Linux deb/rpm/AppImage installers, Windows NSIS/MSI
+          installers (MSI when the build runner allows), static Linux and
+          Windows CLI binaries, SHA-256 checksums, and CycloneDX SBOMs for the
+          Rust workspace and the npm production dependencies.
+          EOF
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body > generated.md
+          cat header.md generated.md > notes.md
+          gh release create "$TAG" --verify-tag --title "Dmux $TAG" \
+            --notes-file notes.md artifacts/*
