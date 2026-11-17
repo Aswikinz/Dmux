@@ -10,6 +10,7 @@ import { formatDurationRange } from '../components/duration';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
 import type { CheckLevel, CheckPlan, Mapping, TableCheck } from '../api/contract';
+import { RunWindowControl } from '../components/RunWindowControl';
 
 interface ChooseChecksScreenProps {
   engine: Engine;
@@ -220,6 +221,10 @@ export function ChooseChecksScreen({
               filterPlaceholder="Filter by schema or table name"
             />
           </Panel>
+          <RunWindowControl
+            value={plan.runWindow}
+            onChange={(runWindow) => onPlanChange({ ...plan, runWindow })}
+          />
           <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
               Back

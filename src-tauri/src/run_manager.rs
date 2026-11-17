@@ -281,6 +281,12 @@ impl RunManager {
         Some((h.generation, Arc::clone(&h.control)))
     }
 
+    /// The live numbers of the run's current drive attempt (estimates,
+    /// measured tables, window wait), or `None` for an unknown run.
+    pub fn control(&self, id: &str) -> Option<Arc<RunControl>> {
+        self.lock().get(id).map(|h| Arc::clone(&h.control))
+    }
+
     /// The error of a failed run.
     pub fn error(&self, id: &str) -> Option<CommandError> {
         match self.lock().get(id) {

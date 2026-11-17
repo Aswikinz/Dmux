@@ -36,6 +36,7 @@ tauri-plugin-dialog = "2.8.4"
 zeroize = "1.9.1"
 sha2 = "0.11.1"
 hex = "0.4.3"
+keepawake = "0.6.1"
 
 [dev-dependencies]
 # Test-only: build a temp profile store and probe against the mock databases.

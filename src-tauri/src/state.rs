@@ -22,6 +22,8 @@ pub struct AppState {
     pub runs: Arc<RunManager>,
     /// The app data directory (home of the profile and resume stores).
     pub data_dir: PathBuf,
+    /// Keeps the computer awake while a run works (T068).
+    pub sleep: Arc<dyn crate::sleep::SleepInhibitor>,
 }
 
 impl AppState {
@@ -29,7 +31,9 @@ impl AppState {
     /// the OS-keychain password store, creating the app data directory first so
     /// the store always has a home.
     pub fn new(data_dir: PathBuf) -> Result<Self, CommandError> {
-        Self::with_password_store(data_dir, Box::new(Keychain::default()))
+        let mut state = Self::with_password_store(data_dir, Box::new(Keychain::default()))?;
+        state.sleep = Arc::new(crate::sleep::SystemInhibitor);
+        Ok(state)
     }
 
     /// Build the state with an injected password store (used by tests to avoid
@@ -48,6 +52,8 @@ impl AppState {
             store: Mutex::new(store),
             runs: Arc::new(RunManager::default()),
             data_dir,
+            // Tests use this constructor: never touch the real power manager.
+            sleep: Arc::new(crate::sleep::NoInhibitor),
         })
     }
 

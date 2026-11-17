@@ -5,6 +5,7 @@ mod commands;
 mod error;
 mod run_manager;
 mod secrets;
+mod sleep;
 mod state;
 mod store;
 mod types;

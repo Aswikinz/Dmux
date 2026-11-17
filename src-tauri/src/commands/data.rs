@@ -27,6 +27,7 @@ use tauri::State;
 
 use dmux_engine::db::ReadOnlySession;
 use dmux_engine::estimate::{estimate_from_seconds, table_size_bytes, timed_sample, Estimate};
+use dmux_engine::eta::Remaining;
 use dmux_engine::mapping::Mapping;
 use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{run, Input, RunConfig};
@@ -67,6 +68,10 @@ pub struct StartRunInput {
     #[serde(default)]
     pub export_keys: Option<bool>,
     pub allow_superuser: Option<SuperuserOverride>,
+    /// An optional daily run window such as "22:00-05:00" (local time).  Off
+    /// when absent.
+    #[serde(default)]
+    pub run_window: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +131,11 @@ pub struct RunProgressDto {
     pub tables: Vec<TableProgressDto>,
     pub eta_seconds_min: Option<u64>,
     pub eta_seconds_max: Option<u64>,
+    /// While the run waits for its run window: the time it opens ("22:00").
+    pub waiting_for_window: Option<String>,
+    /// Plain notices for the person watching (for example, sleep could not be
+    /// blocked).
+    pub notices: Vec<String>,
     /// The typed engine error when `overall_state` is `failed`.
     pub error: Option<CommandError>,
 }
@@ -471,6 +481,16 @@ pub(crate) fn start_run_with(
         });
     }
     let export_keys = input.export_keys.unwrap_or(true);
+    let run_window = match input.run_window.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(text) => Some(
+            dmux_engine::run_window::RunWindow::parse(text).map_err(|e| {
+                CommandError::InvalidInput {
+                    message: e.to_string(),
+                }
+            })?,
+        ),
+    };
 
     let run_id = RunManager::fresh_id();
     let resume_store = crate::state::resume_store_path(state, &run_id)?;
@@ -486,6 +506,7 @@ pub(crate) fn start_run_with(
         allow_superuser_reason: allow_reason,
         export_keys,
         resume_store: Some(resume_store.clone()),
+        run_window,
         ..RunConfig::new(Input::Live(old_profile), Input::Live(new_profile))
     };
 
@@ -494,7 +515,7 @@ pub(crate) fn start_run_with(
     let ticket = manager
         .begin_first(&run_id)
         .ok_or_else(|| CommandError::internal("the new run could not be started"))?;
-    spawn_drive_task(&manager, &run_id, ticket);
+    spawn_drive_task(&manager, &run_id, ticket, Arc::clone(&state.sleep));
 
     Ok(StartRunResult { run_id })
 }
@@ -504,15 +525,45 @@ pub(crate) fn start_run_with(
 /// `spawn_blocking` + `block_on` on a dedicated OS thread.  The task reports
 /// the engine's outcome through [`RunManager::finish`], which applies it only
 /// to its own attempt and only while the run is still running.
-fn spawn_drive_task(manager: &Arc<RunManager>, run_id: &str, ticket: DriveTicket) {
+///
+/// While the engine works the computer is kept awake (`sleep`); the hold is
+/// released when the engine returns (done, failed, cancelled or paused).  If
+/// the hold cannot be taken, the run goes on and says so.
+fn spawn_drive_task(
+    manager: &Arc<RunManager>,
+    run_id: &str,
+    ticket: DriveTicket,
+    sleep: Arc<dyn crate::sleep::SleepInhibitor>,
+) {
     let generation = ticket.generation;
     let task = tauri::async_runtime::spawn_blocking({
         let manager = Arc::clone(manager);
         let rid = run_id.to_string();
         move || {
             let config = ticket.config;
-            let out =
-                tauri::async_runtime::block_on(async { run(&config).await }).map(|o| o.results);
+            let hold = sleep.acquire();
+            let blocked = hold.is_err();
+            if blocked {
+                if let Some(c) = &config.control {
+                    c.with_live(|l| l.add_notice(crate::sleep::SLEEP_WARNING));
+                }
+            }
+            let out = tauri::async_runtime::block_on(async { run(&config).await }).map(|o| {
+                let mut results = o.results;
+                if blocked
+                    && !results
+                        .warnings
+                        .iter()
+                        .any(|w| w == crate::sleep::SLEEP_WARNING)
+                {
+                    results
+                        .warnings
+                        .push(crate::sleep::SLEEP_WARNING.to_string());
+                }
+                results
+            });
+            // Release the hold before reporting: the run is no longer working.
+            drop(hold);
             manager.finish(&rid, generation, out);
         }
     });
@@ -596,17 +647,47 @@ pub(crate) fn poll_run_with(
         None => BTreeSet::new(),
     };
 
+    // Live numbers from the engine's current attempt: the plan's estimates,
+    // corrected by the tables measured so far (PLAN 4.5), the table being
+    // scanned, and whether the run waits for its window.  Nothing is shown for
+    // a run that is not working.
+    let working = phase == RunPhase::Running;
+    let (remaining, running_table, waiting_for_window, notices) =
+        match manager.control(&run_id).filter(|_| working) {
+            Some(c) => c.with_live(|l| {
+                (
+                    l.remaining(&finished, std::time::Instant::now()),
+                    l.current_table().map(str::to_string),
+                    l.window_opens_at().map(str::to_string),
+                    l.notices().to_vec(),
+                )
+            }),
+            None => (Remaining::default(), None, None, Vec::new()),
+        };
+
     let mut tables: Vec<TableProgressDto> = Vec::new();
     for path in config.levels.keys() {
         let (schema, table) = split_path(path);
         let done = finished.contains(path);
+        let state = if done {
+            "done"
+        } else if working && running_table.as_deref() == Some(path.as_str()) {
+            "running"
+        } else {
+            "queued"
+        };
         tables.push(TableProgressDto {
             table_id: path.clone(),
             schema_name: schema,
             table_name: table,
-            state: if done { "done" } else { "queued" }.to_string(),
+            state: state.to_string(),
             progress_percent: if done { 100 } else { 0 },
-            eta_seconds: None,
+            // The middle of the table's range, only for the table being scanned.
+            eta_seconds: remaining
+                .tables
+                .get(path)
+                .filter(|_| state == "running")
+                .map(|(lo, hi)| lo + (hi - lo) / 2),
         });
     }
     tables.sort_by(|a, b| a.table_id.cmp(&b.table_id));
@@ -615,8 +696,10 @@ pub(crate) fn poll_run_with(
         run_id: run_id.clone(),
         overall_state: phase_string(phase).to_string(),
         tables,
-        eta_seconds_min: None,
-        eta_seconds_max: None,
+        eta_seconds_min: remaining.total.map(|t| t.0),
+        eta_seconds_max: remaining.total.map(|t| t.1),
+        waiting_for_window,
+        notices,
         error: manager.error(&run_id),
     })
 }
@@ -673,7 +756,7 @@ pub(crate) async fn set_run_paused_with(
             let _ = task.await;
         }
         if manager.end_resume(&run_id, ticket.generation) {
-            spawn_drive_task(&manager, &run_id, ticket);
+            spawn_drive_task(&manager, &run_id, ticket, Arc::clone(&state.sleep));
         }
     }
     poll_run_with(run_id, state)
@@ -1164,6 +1247,7 @@ mod tests {
                 allow: true,
                 reason: "local mock login is a superuser".into(),
             }),
+            run_window: None,
         }
     }
 
@@ -1386,5 +1470,189 @@ mod tests {
             "failed is final"
         );
         assert_eq!(poll_run_with(id, &state).unwrap().overall_state, "failed");
+    }
+
+    // --- T068: run window, sleep hold and time remaining ---
+
+    /// A URL for a port nothing listens on; the secret is built at run time.
+    fn closed_url() -> String {
+        format!("postgres://u:t{}@127.0.0.1:1/none", std::process::id())
+    }
+
+    /// A run against a port nothing listens on: it fails fast, which is all
+    /// these lifecycle tests need.
+    fn closed_port_input() -> StartRunInput {
+        let url = closed_url();
+        start_input(&url, &url, &[])
+    }
+
+    async fn wait_for_drive_to_return(state: &AppState, id: &str) {
+        let limit = std::time::Duration::from_secs(30);
+        assert!(
+            wait_until(limit, || async { state.runs.drive_returned(id, 1) }).await,
+            "the drive task never returned"
+        );
+    }
+
+    fn state_with(
+        inhibitor: Arc<crate::sleep::stub::CountingInhibitor>,
+    ) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        state.sleep = inhibitor;
+        (dir, state)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sleep_hold_is_taken_for_the_attempt_and_released_when_it_returns() {
+        let hold = Arc::new(crate::sleep::stub::CountingInhibitor::default());
+        let (_dir, state) = state_with(Arc::clone(&hold));
+        let id = start_run_with(closed_port_input(), &state).unwrap().run_id;
+        wait_for_drive_to_return(&state, &id).await;
+        assert_eq!(hold.acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hold.held(), 0, "released once the engine returned");
+        assert_eq!(
+            poll_run_with(id.clone(), &state).unwrap().overall_state,
+            "failed"
+        );
+        let notices = state
+            .runs
+            .control(&id)
+            .unwrap()
+            .with_live(|l| l.notices().to_vec());
+        assert!(notices.is_empty(), "a hold that worked says nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_hold_never_fails_the_run_and_is_noted() {
+        let hold = Arc::new(crate::sleep::stub::CountingInhibitor {
+            fail: true,
+            ..Default::default()
+        });
+        let (_dir, state) = state_with(Arc::clone(&hold));
+        let id = start_run_with(closed_port_input(), &state).unwrap().run_id;
+        wait_for_drive_to_return(&state, &id).await;
+        // The engine still ran (it failed on the connection, not on sleep).
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        assert_eq!(p.overall_state, "failed");
+        assert!(
+            matches!(p.error, Some(CommandError::Database { .. })),
+            "{:?}",
+            p.error
+        );
+        let notices = state
+            .runs
+            .control(&id)
+            .unwrap()
+            .with_live(|l| l.notices().to_vec());
+        assert_eq!(notices, [crate::sleep::SLEEP_WARNING.to_string()]);
+        assert_eq!(hold.held(), 0);
+    }
+
+    #[test]
+    fn the_real_inhibitor_never_panics_whatever_the_machine() {
+        use crate::sleep::SleepInhibitor;
+        // On a build machine without a session bus this is an Err; with one it
+        // holds and releases.  Either way the call returns.
+        let _ = crate::sleep::SystemInhibitor.acquire();
+    }
+
+    #[tokio::test]
+    async fn a_bad_run_window_is_refused_before_anything_starts() {
+        let hold = Arc::new(crate::sleep::stub::CountingInhibitor::default());
+        let (_dir, state) = state_with(Arc::clone(&hold));
+        for bad in ["25:00-05:00", "22:00", "08:00-08:00", "nonsense"] {
+            let mut input = closed_port_input();
+            input.run_window = Some(bad.to_string());
+            let err = start_run_with(input, &state).unwrap_err();
+            assert!(
+                matches!(err, CommandError::InvalidInput { .. }),
+                "{bad}: {err:?}"
+            );
+        }
+        assert_eq!(hold.acquired.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // A blank window means off, and a good one is accepted.
+        let mut input = closed_port_input();
+        input.run_window = Some("  ".to_string());
+        assert!(start_run_with(input, &state).is_ok());
+        let mut input = closed_port_input();
+        input.run_window = Some("22:00-05:00".to_string());
+        assert!(start_run_with(input, &state).is_ok());
+    }
+
+    fn live_state_run() -> (
+        tempfile::TempDir,
+        AppState,
+        String,
+        Arc<dmux_engine::run::RunControl>,
+    ) {
+        let (dir, state) = state_with(Arc::new(crate::sleep::stub::CountingInhibitor::default()));
+        let url = closed_url();
+        let mut config = RunConfig::new(
+            Input::Live(profile_from_url(&url)),
+            Input::Live(profile_from_url(&url)),
+        );
+        for t in ["s.a", "s.b"] {
+            config.levels.insert(t.to_string(), CheckLevel::FullValues);
+        }
+        // Never driven: the test plays the engine through the live numbers.
+        state.runs.insert("run-live", RunHandle::new(config, None));
+        let ticket = state.runs.begin_first("run-live").unwrap();
+        let control = ticket.config.control.clone().unwrap();
+        (dir, state, "run-live".to_string(), control)
+    }
+
+    #[test]
+    fn polling_reports_the_corrected_time_remaining_and_the_window_wait() {
+        let (_dir, state, id, control) = live_state_run();
+        // Before the plan exists nothing is claimed.
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        assert!(p.eta_seconds_min.is_none() && p.eta_seconds_max.is_none());
+        assert!(p.waiting_for_window.is_none() && p.notices.is_empty());
+        assert!(p
+            .tables
+            .iter()
+            .all(|t| t.state == "queued" && t.eta_seconds.is_none()));
+
+        control.with_live(|l| {
+            l.set_plan(
+                ["s.a", "s.b"]
+                    .iter()
+                    .map(|t| (t.to_string(), estimate_from_seconds(100.0)))
+                    .collect(),
+            );
+            l.table_started("s.a", std::time::Instant::now());
+        });
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        let (lo, hi) = (p.eta_seconds_min.unwrap(), p.eta_seconds_max.unwrap());
+        assert!(lo > 0 && lo < hi, "{lo}..{hi}");
+        let a = p.tables.iter().find(|t| t.table_id == "s.a").unwrap();
+        let b = p.tables.iter().find(|t| t.table_id == "s.b").unwrap();
+        assert_eq!(a.state, "running");
+        assert!(a.eta_seconds.is_some_and(|e| e > 0));
+        assert_eq!((b.state.as_str(), b.eta_seconds), ("queued", None));
+
+        control.with_live(|l| l.set_window_wait(Some("22:00".to_string())));
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        assert_eq!(p.waiting_for_window.as_deref(), Some("22:00"));
+
+        // A table finishing slowly raises what is left for the other one.
+        control.with_live(|l| l.table_finished("s.a", 300.0));
+        let p2 = poll_run_with(id.clone(), &state).unwrap();
+        // (The store is absent, so s.a still counts as unfinished here; the
+        // total therefore reflects both tables at the corrected speed.)
+        assert!(p2.eta_seconds_max.unwrap() > hi);
+
+        // A run that is not working shows no live numbers.
+        state
+            .runs
+            .transition(&id, &[RunPhase::Running], RunPhase::Paused)
+            .unwrap();
+        let p = poll_run_with(id, &state).unwrap();
+        assert!(p.eta_seconds_min.is_none() && p.waiting_for_window.is_none());
     }
 }

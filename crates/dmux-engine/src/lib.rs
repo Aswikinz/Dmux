@@ -5,6 +5,7 @@ pub mod consistency;
 pub mod core;
 pub mod db;
 pub mod estimate;
+pub mod eta;
 pub mod fingerprint_file;
 pub mod ident;
 pub mod inventory;
@@ -12,6 +13,7 @@ pub mod mapping;
 pub mod plan;
 pub mod results;
 pub mod run;
+pub mod run_window;
 pub mod schema_diff;
 pub mod store;
 
