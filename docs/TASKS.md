@@ -34,6 +34,8 @@ Status: todo, doing, review, done, blocked.
 
 ## Phase 1–7 (speed mode, decision 15)
 
+**Resume notes (checkpoint 2026-11-17, before owner's offline window).** If agents errored while offline, resume each by session ID (subagent sessionID), or relaunch from its row. In-flight: T018 combined engine fix round (T017+T018+T019 merged into .worktrees/T018; merge with T017 was in progress — Maya commits it after the agent resolves main.rs) → ses_e18c8ad93ffev6FGbVG1Qwc7R7 · T030 Sonar fixes → ses_e18ba8d12ffeJRLwMuq70Vmxg4 · T031 large dataset → ses_e18b714e5ffej9jaGEI7IxndOq · T032 private generator → ses_e18b714e2ffe3cUT8HIsFMfNMu · T033 docs → ses_e18b714deffeeyEGoDu1oySnvr · T019 mutation run: /tmp/opencode/mutants-t019b (local, re-run if killed). Ready to merge after gates: T020 UI (committed 2d5de50; needs main merged in + DeepSeek gate), T019 core (after mutants + T018 branch). Published: v0.0.1 (b1558ba). Next: T022 after the engine branch merges.
+
 | ID | Task | Owner (model) | Status | Depends on |
 |----|------|-------|--------|------------|
 | T015 | `demo_bank` public schema (~40 invented banking tables, keys/FKs, a no-key table, a partitioned table, sequences, views, a function, a large object) + deterministic generator (fixed seed, `small` size) + one build command that loads old (9.6, LATIN1) and new (17) as database `demo_bank` (dump/restore copy) on the mocks. Identical-on-every-run proof. | nina (deepseek-v4.1-flash) | doing | |
@@ -48,7 +50,11 @@ Status: todo, doing, review, done, blocked.
 | T024 | Reports: PDF summary (verdict, coverage line, ignored items, sign-off block, run ID, versions, mapping hash, results SHA-256), Excel detail (rust_xlsxwriter, CSV overflow), run log. | arjun (kimi-k2.7-code) | todo | T022 |
 | T025 | Docs: user guide, "How Dmux decides" (plain language, md5 threat model), DBA setup guide, release notes. | ella (deepseek-v4.1-flash) | todo | T022 |
 | T026 | Security review (PLAN 6, all rules) + final Opus audit; fix list. | zara (claude-opus-5.5) | todo | T023, T024 |
-| T027 | Python hooks (PLAN 4.9) — may move post-pilot per PLAN 11. | arjun (kimi-k2.7-code) | todo | T024 |
+| T027 | Python hooks (PLAN 4.9): script receives results JSON, returns extra findings marked custom; no passwords/connections; off by default; script hash in run log; time limit; Windows ships its own Python, Flatpak uses runtime Python. | arjun (kimi-k2.7-code) | todo | T022 |
+| T030 | SonarCloud findings: exclude *.sql (Oracle rules on Postgres fixtures), suppress mock-password rule with reason, --locked / https-only curl / npx --ignore-scripts, shell [[ ]], release staging dir dist/ → release-out/ (frontend leaked into v0.0.1). | kenji (deepseek-v4-pro) | doing | T021 |
+| T031 | `demo_bank` large size (1M accounts, 20M transactions) as database demo_bank_large + full-size option; estimate-accuracy harness hook for nightly. | nina (deepseek-v4.1-flash) | doing | T016 |
+| T032 | Private generator (private/ only, never Git): build the full private schema (all parsed tables, a few rows each) from the private dictionary file as database private_bank on the mocks, type-mapped per PLAN 8.1. | nina (deepseek-v4.1-flash) | done | T015 |
+| T033 | Docs part 1 (no T022 dependency): "How Dmux decides" (plain-language method, md5 threat model, NeedsReview, stop rule, what PASS does not prove), DBA setup guide (dmux_reader login, read-only, freeze window, replica advice), user-guide skeleton for the 7 screens. | ella (deepseek-v4.1-flash) | doing | |
 
 ## Phase 1: foundation
 
