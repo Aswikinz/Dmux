@@ -43,8 +43,14 @@ pub enum MappingError {
 }
 
 /// A saved mapping, serialisable to/from JSON.
+///
+/// `deny_unknown_fields` matters even though [`from_json`] also rejects unknown
+/// top-level fields by hand: a `Mapping` can be deserialised directly as a
+/// typed command argument (for example from the Tauri webview), where that
+/// manual check never runs.  Rejecting at the serde boundary makes a typo'd
+/// field an error everywhere.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Mapping {
     pub version: u32,
     pub rules: Vec<Rule>,
@@ -442,6 +448,27 @@ pub fn apply_rule(rule: &Rule, name: &str) -> Option<String> {
     }
 }
 
+/// Every new table path claimed by more than one old path, as `new -> olds`.
+///
+/// A many-to-one table mapping is refused (M2): two old tables can never both
+/// PASS against the same new table, because the mapping does not say which old
+/// table the new one really is.  The old paths are sorted for a stable report.
+pub fn duplicate_table_targets(pairs: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut owner: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (old, new) in pairs {
+        owner.entry(new.as_str()).or_default().push(old.as_str());
+    }
+    owner
+        .into_iter()
+        .filter(|(_, olds)| olds.len() > 1)
+        .map(|(new, olds)| {
+            let mut olds: Vec<String> = olds.into_iter().map(str::to_string).collect();
+            olds.sort();
+            (new.to_string(), olds)
+        })
+        .collect()
+}
+
 /// Load a mapping from JSON bytes.
 ///
 /// Validates size, version and rejects unknown fields at any nesting level.
@@ -686,6 +713,34 @@ mod tests {
             MappingError::UnknownFields(fields) => assert!(fields.contains(&"extra".to_string())),
             _ => panic!("expected unknown fields error, got {err}"),
         }
+    }
+
+    #[test]
+    fn a_mapping_with_an_unknown_top_level_field_fails_to_deserialise() {
+        // A typo'd field must be an error even when the Mapping is deserialised
+        // directly (for example as a typed command argument), not only through
+        // from_json's manual check.
+        let json = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[],"mapping_hash":"","extra":"bad"}"#;
+        assert!(serde_json::from_str::<Mapping>(json).is_err());
+        // And a well-formed mapping still round-trips directly.
+        let ok = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[],"mapping_hash":""}"#;
+        assert!(serde_json::from_str::<Mapping>(ok).is_ok());
+    }
+
+    #[test]
+    fn duplicate_table_targets_are_detected() {
+        let pairs = vec![
+            ("s.x".to_string(), "s.z".to_string()),
+            ("s.y".to_string(), "s.z".to_string()),
+            ("s.a".to_string(), "s.b".to_string()),
+        ];
+        let dups = duplicate_table_targets(&pairs);
+        assert_eq!(
+            dups.get("s.z"),
+            Some(&vec!["s.x".to_string(), "s.y".to_string()])
+        );
+        assert!(!dups.contains_key("s.b"));
+        assert!(duplicate_table_targets(&[("s.a".into(), "s.b".into())]).is_empty());
     }
 
     #[test]
