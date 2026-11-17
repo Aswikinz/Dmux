@@ -30,8 +30,9 @@ impl fmt::Display for PasswordMissing {
     }
 }
 
-/// A typed, serialisable command error.
-#[derive(Debug, Error, Serialize)]
+/// A typed, serialisable command error.  `Clone` so a failed run's error can
+/// be kept and reported on every poll.
+#[derive(Debug, Clone, Error, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandError {
     /// Invalid input from the frontend (unknown TLS mode, bad port, etc.).
@@ -92,6 +93,19 @@ pub enum CommandError {
     #[error("results are not available: {message}")]
     ResultsNotAvailable { message: String },
 
+    /// The engine run stopped with an error; it has no results.
+    #[error("the run failed: {message}")]
+    RunFailed { message: String },
+
+    /// The run was paused or cancelled, so it has no results.
+    #[error("the run was stopped: {message}")]
+    RunStopped { message: String },
+
+    /// The run is not in a state that allows this action (for example
+    /// resuming a run that is not paused).
+    #[error("{message}")]
+    RunState { message: String },
+
     /// Something unexpected went wrong (no sensitive detail).
     #[error("{message}")]
     Internal { message: String },
@@ -117,6 +131,22 @@ pub fn from_db_error(err: dmux_engine::db::DbError) -> CommandError {
         dmux_engine::db::DbError::SuperuserRefused => CommandError::SuperuserRefused,
         dmux_engine::db::DbError::PlaintextReasonRequired => CommandError::PlaintextReasonRequired,
         other => CommandError::Database {
+            message: other.to_string(),
+        },
+    }
+}
+
+/// Map an engine [`RunError`](dmux_engine::run::RunError): database errors keep
+/// their typed cases, a stop is [`CommandError::RunStopped`], and everything
+/// else is [`CommandError::RunFailed`].  Engine error text carries no secrets
+/// or row values (engine rule 7).
+pub fn from_run_error(err: dmux_engine::run::RunError) -> CommandError {
+    match err {
+        dmux_engine::run::RunError::Db(db) => from_db_error(db),
+        dmux_engine::run::RunError::Cancelled => CommandError::RunStopped {
+            message: "the run was stopped before it finished".to_string(),
+        },
+        other => CommandError::RunFailed {
             message: other.to_string(),
         },
     }
@@ -152,5 +182,28 @@ impl From<keyring::Error> for CommandError {
         CommandError::Keychain {
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dmux_engine::run::RunError;
+
+    #[test]
+    fn run_errors_keep_their_kind() {
+        assert!(matches!(
+            from_run_error(RunError::Cancelled),
+            CommandError::RunStopped { .. }
+        ));
+        assert!(matches!(
+            from_run_error(RunError::Db(dmux_engine::db::DbError::SuperuserRefused)),
+            CommandError::SuperuserRefused
+        ));
+        let e = from_run_error(RunError::Config("bad".into()));
+        assert!(matches!(e, CommandError::RunFailed { .. }));
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["kind"], "run_failed");
+        assert!(json["message"].as_str().unwrap().contains("bad"));
     }
 }

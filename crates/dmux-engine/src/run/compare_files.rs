@@ -34,9 +34,9 @@ use crate::results::{fresh_run_id, CheckLevel, Verdict};
 use super::structure;
 use super::verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 use super::{
-    apply_replica, counters, definition_hash, epoch, epoch_changed, inventory, live_table,
-    map_table, note_paused, replica, replica_outcome, scan_counts, scan_fingerprint, wal,
-    RunConfig, RunError, RunOutcome,
+    apply_replica, checkpoint, counters, definition_hash, epoch, epoch_changed, inventory,
+    live_table, map_table, note_paused, register, replica, replica_outcome, scan_counts,
+    scan_fingerprint, settle, wal, Input, RunConfig, RunError, RunOutcome,
 };
 
 /// The run warning when a side has no inventory to compare.
@@ -71,7 +71,11 @@ pub fn compare_two_files(
     old: &FingerprintFile,
     new: &FingerprintFile,
 ) -> Result<RunOutcome, RunError> {
-    compare_two_files_with(old, new, &RunConfig::default())
+    compare_two_files_with(
+        old,
+        new,
+        &RunConfig::new(Input::File(old.clone()), Input::File(new.clone())),
+    )
 }
 
 /// Compare two fingerprint files (no live database on either side).
@@ -234,8 +238,11 @@ pub async fn compare_file_to_live(
         )));
     }
     let mapping = &config.mapping;
+    checkpoint(config)?;
     let info = probe_server(live_profile, config.allow_superuser).await?;
+    checkpoint(config)?;
     let mut s = ReadOnlySession::open(live_profile, config.allow_superuser).await?;
+    register(config, &s)?;
 
     let mut b = Builder::new(
         fresh_run_id(),
@@ -256,7 +263,9 @@ pub async fn compare_file_to_live(
     b.results.wal_start_lsn = wal(&mut s, info.version_num).await;
     let epoch_start = epoch(&mut s).await;
 
-    let live_inv = inventory(&mut s).await?;
+    let live_inv = inventory(&mut s).await;
+    checkpoint(config)?;
+    let live_inv = live_inv?;
     // Structure: the captured inventory against the live one, oriented.
     match file_side {
         Side::Old => file_structure(&mut b, file.inventory.as_deref(), Some(&live_inv), mapping),
@@ -346,6 +355,7 @@ pub async fn compare_file_to_live(
     // Change detection on the live side, around all scans.
     let mut before = BTreeMap::new();
     for (path, _, (ls, lt)) in &pairs {
+        checkpoint(config)?;
         before.insert(path.clone(), counters(&mut s, ls, lt).await.ok());
     }
     let live_side = match file_side {
@@ -353,6 +363,7 @@ pub async fn compare_file_to_live(
         Side::New => "old",
     };
     for (path, cap, (ls, lt)) in &pairs {
+        checkpoint(config)?;
         let r_before = replica(&mut s, info.version_num).await;
         let mut e = file_live_pair(
             config,
@@ -365,13 +376,15 @@ pub async fn compare_file_to_live(
             &file.mapping_hash,
         )
         .await;
+        // A stop during the scans is never recorded as the table's result.
+        checkpoint(config)?;
         let d = replica_outcome(&r_before, &replica(&mut s, info.version_num).await);
         note_paused(&mut b.results, live_side, &d);
         apply_replica(&mut e, live_side, &d);
         b.record(e);
     }
     // Let writes made during the run reach the statistics, then sweep.
-    tokio::time::sleep(config.stats_settle).await;
+    settle(config, config.stats_settle).await?;
     let epoch_moved = epoch_changed(&epoch_start, &epoch(&mut s).await);
     if epoch_moved {
         b.results.warnings.push(
@@ -380,6 +393,7 @@ pub async fn compare_file_to_live(
         );
     }
     for (path, _, (ls, lt)) in &pairs {
+        checkpoint(config)?;
         let after = counters(&mut s, ls, lt).await.ok();
         let moved = match (before.get(path).cloned().flatten(), after) {
             (Some(x), Some(y)) => x.moved(&y),
@@ -390,6 +404,7 @@ pub async fn compare_file_to_live(
         }
     }
     b.results.wal_end_lsn = wal(&mut s, info.version_num).await;
+    checkpoint(config)?;
     Ok(b.finish())
 }
 

@@ -7,6 +7,7 @@ import {
   mapOverallState,
   mapTableState,
   mapVerdict,
+  RunFailedError,
   toEngineLevel,
 } from './tauriEngine';
 import type { ConnectionProfile, Inventory, Mapping } from './contract';
@@ -398,6 +399,31 @@ describe('progress-state mapping is strict', () => {
     expect(mapOverallState('done')).toBe('done');
     expect(mapOverallState('cancelled')).toBe('cancelled');
     expect(mapOverallState('paused')).toBe('paused');
+  });
+});
+
+describe('a failed run', () => {
+  it('surfaces the typed error from every progress call, never "running"', async () => {
+    const engine = createTauriEngine();
+    const failed = {
+      run_id: 'run-x',
+      overall_state: 'failed',
+      tables: [],
+      eta_seconds_min: null,
+      eta_seconds_max: null,
+      error: { kind: 'database', message: 'database "nope" does not exist' },
+    };
+    invoke.mockImplementation(() => Promise.resolve(failed));
+    for (const call of [
+      () => engine.pollRun('run-x'),
+      () => engine.setRunPaused('run-x', true),
+      () => engine.cancelRun('run-x'),
+    ]) {
+      const p = call();
+      await expect(p).rejects.toBeInstanceOf(RunFailedError);
+      await expect(p).rejects.toMatchObject({ kind: 'database' });
+      await expect(p).rejects.toThrow(/does not exist/);
+    }
   });
 });
 

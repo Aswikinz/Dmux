@@ -159,14 +159,15 @@ async fn run_engine(key: &Key, mapping: Mapping) -> Option<RunResults> {
     let control = s(&key.exp("m03")["control_total"]["column"]);
     let control = control.rsplit('.').next().unwrap().to_string();
     let config = RunConfig {
-        old: Input::Live(profile_from_url(&old)),
-        new: Input::Live(profile_from_url(&new)),
         mapping,
         default_level: CheckLevel::FullValues,
         control_total_columns: [control].into(),
         allow_superuser: true,
         export_keys: true,
-        ..RunConfig::default()
+        ..RunConfig::new(
+            Input::Live(profile_from_url(&old)),
+            Input::Live(profile_from_url(&new)),
+        )
     };
     Some(
         run(&config)

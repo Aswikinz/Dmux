@@ -7,9 +7,11 @@
 //!
 //! * verdicts are copied verbatim from the engine, never guessed;
 //! * progress is read back from the engine's own resume store, never invented;
-//! * cancel aborts the drive task (dropping the live connections, which stops
-//!   every in-flight server statement); pause/resume re-uses the same resume
-//!   store so the engine's own change-detection vouches for every reused row;
+//! * cancel and pause stop the engine through its `RunControl` and cancel every
+//!   in-flight server statement; a stopped run never reports results, and its
+//!   phase can never be overwritten by the stopped task (see `run_manager`);
+//!   resume re-uses the run's own resume store, so the engine's change
+//!   detection vouches for every reused row;
 //! * row keys reach the UI only via `get_results` (on screen, never logged);
 //!   the report export (T024) owns the separate include-keys gate.
 //!
@@ -31,7 +33,7 @@ use dmux_engine::run::{run, Input, RunConfig};
 
 use crate::commands::gateway::{collect, drive, resolve, SuperuserOverride};
 use crate::error::{from_db_error, CommandError};
-use crate::run_manager::{RunHandle, RunPhase};
+use crate::run_manager::{DriveTicket, RunHandle, RunManager, RunPhase};
 use crate::state::AppState;
 use crate::types::ConnectInput;
 
@@ -119,10 +121,13 @@ pub struct TableProgressDto {
 #[serde(rename_all = "snake_case")]
 pub struct RunProgressDto {
     pub run_id: String,
+    /// `running`, `paused`, `done`, `failed` or `cancelled`.
     pub overall_state: String,
     pub tables: Vec<TableProgressDto>,
     pub eta_seconds_min: Option<u64>,
     pub eta_seconds_max: Option<u64>,
+    /// The typed engine error when `overall_state` is `failed`.
+    pub error: Option<CommandError>,
 }
 
 /// A drill-down row, mirroring the contract's `DrillDownRow` (keys only).
@@ -407,19 +412,27 @@ async fn estimate_run(
 // ---------------------------------------------------------------------------
 
 /// Spawn the engine run on a background task, persisting per-table results to the
-/// engine resume store under the app data dir (PLAN 4.6).  Credentials are
+/// run's own resume store under the app data dir (PLAN 4.6).  Credentials are
 /// resolved once here, through the trusted `resolve` path, and never stored.
 #[tauri::command]
 pub async fn start_run(
     input: StartRunInput,
     state: State<'_, AppState>,
 ) -> Result<StartRunResult, CommandError> {
+    start_run_with(input, &state)
+}
+
+/// [`start_run`] over a plain `&AppState` (so the lifecycle is testable).
+pub(crate) fn start_run_with(
+    input: StartRunInput,
+    state: &AppState,
+) -> Result<StartRunResult, CommandError> {
     let allow = input
         .allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    let old_profile = resolve(&input.old, &state)?;
-    let new_profile = resolve(&input.new, &state)?;
+    let old_profile = resolve(&input.old, state)?;
+    let new_profile = resolve(&input.new, state)?;
     let old_parallelism = input.old_parallelism.unwrap_or(2);
     let new_parallelism = input.new_parallelism.unwrap_or(4);
     if old_parallelism == 0 || new_parallelism == 0 {
@@ -429,73 +442,101 @@ pub async fn start_run(
     }
     let export_keys = input.export_keys.unwrap_or(true);
 
-    let resume_store = crate::state::resume_dir(&state).join("resume.db");
+    let run_id = RunManager::fresh_id();
+    let resume_store = crate::state::resume_store_path(state, &run_id)?;
 
     let config = RunConfig {
-        old: Input::Live(old_profile),
-        new: Input::Live(new_profile),
         mapping: input.mapping.clone(),
         default_level: input.default_level,
         levels: input.levels.clone(),
         control_total_columns: input.control_total_columns.into_iter().collect(),
-        column_options: BTreeMap::new(),
         old_parallelism,
         new_parallelism,
         allow_superuser: allow,
         export_keys,
-        resume_store: Some(resume_store),
-        stats_settle: dmux_engine::run::DEFAULT_STATS_SETTLE,
+        resume_store: Some(resume_store.clone()),
+        ..RunConfig::new(Input::Live(old_profile), Input::Live(new_profile))
     };
 
     let manager = Arc::clone(&state.runs);
-    let handle = RunHandle {
-        config: config.clone(),
-        resume_store: Some(crate::state::resume_dir(&state).join("resume.db")),
-        task: None,
-        phase: RunPhase::Running,
-    };
-    let run_id = manager.insert(handle);
-
-    spawn_drive_task(&manager, &run_id, config);
+    manager.insert(&run_id, RunHandle::new(config, Some(resume_store)));
+    let ticket = manager
+        .begin_first(&run_id)
+        .ok_or_else(|| CommandError::internal("the new run could not be started"))?;
+    spawn_drive_task(&manager, &run_id, ticket);
 
     Ok(StartRunResult { run_id })
 }
 
-/// Spawn (or re-spawn, on resume) the engine run on the blocking pool.  The
-/// engine's run future is `!Send` (it borrows a `tokio_postgres::Transaction`),
-/// so it runs inside `spawn_blocking` + `block_on` on a dedicated OS thread.
-fn spawn_drive_task(
-    manager: &Arc<crate::run_manager::RunManager>,
-    run_id: &str,
-    config: RunConfig,
-) {
-    let manager = Arc::clone(manager);
-    let rid = run_id.to_string();
+/// Spawn one drive attempt on the blocking pool.  The engine's run future is
+/// `!Send` (it borrows a `tokio_postgres::Transaction`), so it runs inside
+/// `spawn_blocking` + `block_on` on a dedicated OS thread.  The task reports
+/// the engine's outcome through [`RunManager::finish`], which applies it only
+/// to its own attempt and only while the run is still running.
+fn spawn_drive_task(manager: &Arc<RunManager>, run_id: &str, ticket: DriveTicket) {
+    let generation = ticket.generation;
     let task = tauri::async_runtime::spawn_blocking({
-        let manager = Arc::clone(&manager);
-        let rid = rid.clone();
+        let manager = Arc::clone(manager);
+        let rid = run_id.to_string();
         move || {
-            let out = tauri::async_runtime::block_on(async move {
-                run(&config)
-                    .await
-                    .map(|o| o.results)
-                    .map_err(|e| e.to_string())
-            });
-            if out.is_ok() {
-                manager.set_phase(&rid, RunPhase::Done);
-            }
-            out
+            let config = ticket.config;
+            let out =
+                tauri::async_runtime::block_on(async { run(&config).await }).map(|o| o.results);
+            manager.finish(&rid, generation, out);
         }
     });
-    manager.set_task(&rid, task);
+    manager.set_task(run_id, generation, task);
+}
+
+/// How often, and for how long, a stop re-sends its server-side cancels.  A
+/// statement the engine started just before the stop flag was set may reach
+/// the server after the first cancel; repeating until the attempt's drive task
+/// returns closes that window.
+const CANCEL_REPEAT: std::time::Duration = std::time::Duration::from_millis(250);
+const CANCEL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Stop the run's current attempt: set the engine's stop flag and cancel every
+/// registered session's statement on the server, then keep cancelling in the
+/// background until that attempt's drive task has returned.
+async fn stop_attempt(manager: &Arc<RunManager>, run_id: &str) {
+    let Some((generation, control)) = manager.stop(run_id) else {
+        return;
+    };
+    for token in control.tokens() {
+        // A failed cancel request is not fatal: the stop flag still ends the
+        // run at its next check, and the background loop retries.
+        let _ = token.cancel().await;
+    }
+    let manager = Arc::clone(manager);
+    let rid = run_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        while started.elapsed() < CANCEL_PATIENCE && !manager.drive_returned(&rid, generation) {
+            tokio::time::sleep(CANCEL_REPEAT).await;
+            if manager.drive_returned(&rid, generation) {
+                break;
+            }
+            for token in control.tokens() {
+                let _ = token.cancel().await;
+            }
+        }
+    });
 }
 
 /// Report honest progress: the set of tables the engine has really finished (from
-/// its resume store) plus the run's lifecycle phase.
+/// its resume store) plus the run's lifecycle phase, and the typed error of a
+/// failed run.
 #[tauri::command]
 pub async fn poll_run(
     run_id: String,
     state: State<'_, AppState>,
+) -> Result<RunProgressDto, CommandError> {
+    poll_run_with(run_id, &state)
+}
+
+pub(crate) fn poll_run_with(
+    run_id: String,
+    state: &AppState,
 ) -> Result<RunProgressDto, CommandError> {
     let manager = Arc::clone(&state.runs);
     let Some((config, resume)) = manager.snapshot(&run_id) else {
@@ -539,107 +580,123 @@ pub async fn poll_run(
     }
     tables.sort_by(|a, b| a.table_id.cmp(&b.table_id));
 
-    let overall_state = match phase {
-        RunPhase::Running => "running",
-        RunPhase::Paused => "paused",
-        RunPhase::Done => "done",
-        RunPhase::Cancelled => "cancelled",
-    };
-
     Ok(RunProgressDto {
-        run_id,
-        overall_state: overall_state.to_string(),
+        run_id: run_id.clone(),
+        overall_state: phase_string(phase).to_string(),
         tables,
         eta_seconds_min: None,
         eta_seconds_max: None,
+        error: manager.error(&run_id),
     })
 }
 
-/// Pause (abort the in-flight drive task; completed tables stay in the resume
-/// store) or resume (re-run against the same resume store).
+/// The `overall_state` string of a phase.
+fn phase_string(phase: RunPhase) -> &'static str {
+    match phase {
+        RunPhase::Running => "running",
+        RunPhase::Paused => "paused",
+        RunPhase::Done => "done",
+        RunPhase::Failed => "failed",
+        RunPhase::Cancelled => "cancelled",
+    }
+}
+
+/// Pause (stop the engine and its server queries; completed tables stay in
+/// the run's resume store) or resume (wait for the stopped attempt to return,
+/// then run again against the same store).
 #[tauri::command]
 pub async fn set_run_paused(
     run_id: String,
     paused: bool,
     state: State<'_, AppState>,
 ) -> Result<RunProgressDto, CommandError> {
-    let manager = Arc::clone(&state.runs);
-    let Some((config, _resume)) = manager.snapshot(&run_id) else {
-        return Err(CommandError::RunNotFound {
-            run_id: run_id.clone(),
-        });
-    };
-
-    if paused {
-        // Abort the in-flight drive task (drops connections → stops server
-        // queries); everything completed so far stays in the resume store.
-        manager.abort(&run_id);
-        manager.set_phase(&run_id, RunPhase::Paused);
-    } else {
-        // Re-run against the same resume store: the engine reuses completed
-        // tables only when their counters/epoch/replica marks still vouch.
-        spawn_drive_task(&manager, &run_id, config);
-        manager.set_phase(&run_id, RunPhase::Running);
-    }
-
-    Box::pin(poll_run(run_id, state)).await
+    set_run_paused_with(run_id, paused, &state).await
 }
 
-/// Cancel a run: abort the drive task, which drops the live connections and so
-/// cancels every in-flight server query (PLAN 4.6's "Cancel really stops").
+pub(crate) async fn set_run_paused_with(
+    run_id: String,
+    paused: bool,
+    state: &AppState,
+) -> Result<RunProgressDto, CommandError> {
+    let manager = Arc::clone(&state.runs);
+    if paused {
+        match manager.transition(&run_id, &[RunPhase::Running], RunPhase::Paused) {
+            Ok(_) => stop_attempt(&manager, &run_id).await,
+            Err(None) => {
+                return Err(CommandError::RunNotFound {
+                    run_id: run_id.clone(),
+                })
+            }
+            Err(Some(RunPhase::Paused)) => {}
+            Err(Some(phase)) => {
+                return Err(CommandError::RunState {
+                    message: format!("a {} run cannot be paused", phase_string(phase)),
+                })
+            }
+        }
+    } else {
+        // One resume at a time; the previous attempt is joined before the next
+        // starts, so there are never two drive tasks on one run.
+        let (ticket, previous) = manager.begin_resume(&run_id)?;
+        if let Some(task) = previous {
+            let _ = task.await;
+        }
+        if manager.end_resume(&run_id, ticket.generation) {
+            spawn_drive_task(&manager, &run_id, ticket);
+        }
+    }
+    poll_run_with(run_id, state)
+}
+
+/// Cancel a run: stop the engine and cancel its server queries (PLAN 4.6's
+/// "Cancel really stops").  The phase becomes `Cancelled` for good.
 #[tauri::command]
 pub async fn cancel_run(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<RunProgressDto, CommandError> {
+    cancel_run_with(run_id, &state).await
+}
+
+pub(crate) async fn cancel_run_with(
+    run_id: String,
+    state: &AppState,
+) -> Result<RunProgressDto, CommandError> {
     let manager = Arc::clone(&state.runs);
-    if manager.phase(&run_id).is_none() {
-        return Err(CommandError::RunNotFound {
-            run_id: run_id.clone(),
-        });
+    match manager.transition(
+        &run_id,
+        &[RunPhase::Running, RunPhase::Paused],
+        RunPhase::Cancelled,
+    ) {
+        Ok(_) => stop_attempt(&manager, &run_id).await,
+        Err(None) => {
+            return Err(CommandError::RunNotFound {
+                run_id: run_id.clone(),
+            })
+        }
+        Err(Some(RunPhase::Cancelled)) => {}
+        Err(Some(phase)) => {
+            return Err(CommandError::RunState {
+                message: format!("a {} run cannot be cancelled", phase_string(phase)),
+            })
+        }
     }
-    manager.abort(&run_id);
-    manager.set_phase(&run_id, RunPhase::Cancelled);
-    Box::pin(poll_run(run_id, state)).await
+    poll_run_with(run_id, state)
 }
 
 /// Return the engine's results for a finished run, mapped to the contract.
+/// Refused unless the run is `Done` and the engine returned results.
 #[tauri::command]
 pub async fn get_results(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<ResultsDto, CommandError> {
-    let manager = Arc::clone(&state.runs);
-    let Some(phase) = manager.phase(&run_id) else {
-        return Err(CommandError::RunNotFound {
-            run_id: run_id.clone(),
-        });
-    };
-    if !matches!(phase, RunPhase::Done) {
-        return Err(CommandError::ResultsNotAvailable {
-            message: "the run has not finished; results are not available yet".to_string(),
-        });
-    }
-    let Some(task) = manager.take_task(&run_id) else {
-        return Err(CommandError::ResultsNotAvailable {
-            message: "the run completed but its result was already taken".to_string(),
-        });
-    };
-    let joined = task.await;
-    let results = match joined {
-        Ok(Ok(results)) => results,
-        Ok(Err(why)) => {
-            return Err(CommandError::Database { message: why });
-        }
-        Err(join_err) => {
-            // A cancelled task is already marked Cancelled and never reaches
-            // here; any other join error is an internal failure.
-            return Err(CommandError::internal(format!(
-                "run task failed: {join_err}"
-            )));
-        }
-    };
-    Ok(map_results(&run_id, &results))
+    get_results_with(&run_id, &state)
+}
+
+pub(crate) fn get_results_with(run_id: &str, state: &AppState) -> Result<ResultsDto, CommandError> {
+    let results = state.runs.results(run_id)?;
+    Ok(map_results(run_id, &results))
 }
 
 // ---------------------------------------------------------------------------
@@ -872,19 +929,12 @@ mod tests {
     /// full values (keys exported so the on-screen drill-down is reachable).
     async fn run_live(old_url: &str, new_url: &str) -> RunResults {
         let config = RunConfig {
-            old: Input::Live(profile_from_url(old_url)),
-            new: Input::Live(profile_from_url(new_url)),
-            mapping: Mapping::new(),
-            default_level: CheckLevel::FullValues,
-            levels: BTreeMap::new(),
-            control_total_columns: BTreeSet::new(),
-            column_options: BTreeMap::new(),
-            old_parallelism: 2,
-            new_parallelism: 4,
             allow_superuser: true,
             export_keys: true,
-            resume_store: None,
-            stats_settle: dmux_engine::run::DEFAULT_STATS_SETTLE,
+            ..RunConfig::new(
+                Input::Live(profile_from_url(old_url)),
+                Input::Live(profile_from_url(new_url)),
+            )
         };
         run(&config)
             .await
@@ -1011,5 +1061,276 @@ mod tests {
         // The bank database has no tables here, so the engine reports a non-PASS
         // (never a fabricated clean PASS on nothing).
         assert_ne!(dto.verdict, "PASS", "an empty run must not pass");
+    }
+
+    // --- Live command lifecycle (gated; FAIL under CI when unset) ---
+
+    /// The planted demo URLs, pointed at the 20M-row `demo_bank_large` copy
+    /// so a scan lasts long enough to stop mid-flight.
+    fn large_urls() -> Option<(String, String)> {
+        let old = env_url("DMUX_TEST_DEMO_OLD_URL")?;
+        let new = env_url("DMUX_TEST_DEMO_NEW_URL")?;
+        let large = |u: &str| match u.rsplit_once('/') {
+            Some((base, _)) => format!("{base}/demo_bank_large"),
+            None => panic!("a database URL"),
+        };
+        Some((large(&old), large(&new)))
+    }
+
+    fn connect_input(url: &str) -> ConnectInput {
+        let p = profile_from_url(url);
+        ConnectInput {
+            profile: crate::types::ProfileInput {
+                id: format!("test-{}", p.port),
+                label: "lifecycle test".into(),
+                host: p.host.clone(),
+                port: p.port,
+                database: p.dbname.clone(),
+                user: p.user.clone(),
+                encryption: "allow-plaintext".into(),
+                tls_fingerprint: None,
+                plaintext_reason: Some("mock database has no TLS".into()),
+            },
+            password: Some(p.password.clone()),
+        }
+    }
+
+    fn start_input(old: &str, new: &str, levels: &[(&str, CheckLevel)]) -> StartRunInput {
+        StartRunInput {
+            old: connect_input(old),
+            new: connect_input(new),
+            mapping: Mapping::new(),
+            levels: levels.iter().map(|(t, l)| (t.to_string(), *l)).collect(),
+            default_level: CheckLevel::Structure,
+            control_total_columns: vec![],
+            old_parallelism: None,
+            new_parallelism: None,
+            export_keys: Some(false),
+            allow_superuser: Some(SuperuserOverride {
+                allow: true,
+                reason: "local mock login is a superuser".into(),
+            }),
+        }
+    }
+
+    /// How many of Dmux's sessions on `url`'s database are running a
+    /// statement (`text` filters the statement; `None` counts every session,
+    /// active or idle).  The watcher's own session is excluded.
+    async fn dmux_sessions(url: &str, text: Option<&str>, active_only: bool) -> i64 {
+        let mut s = ReadOnlySession::open(&profile_from_url(url), true)
+            .await
+            .expect("watcher session");
+        let pattern = format!("%{}%", text.unwrap_or(""));
+        s.with_read_only("10s", |txn| {
+            Box::pin(async move {
+                let row = txn
+                    .query_one(
+                        "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                         WHERE application_name = 'dmux' AND pid <> pg_catalog.pg_backend_pid() \
+                         AND datname = pg_catalog.current_database() \
+                         AND ($2::bool IS FALSE OR state = 'active') AND query LIKE $1",
+                        &[&pattern, &active_only],
+                    )
+                    .await
+                    .map_err(|e| dmux_engine::db::DbError::Postgres {
+                        message: e.to_string(),
+                    })?;
+                Ok(row.get::<_, i64>(0))
+            })
+        })
+        .await
+        .expect("pg_stat_activity")
+    }
+
+    /// Poll `cond` every 50 ms until it holds or `limit` passes.
+    async fn wait_until<F, Fut>(limit: std::time::Duration, mut cond: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn quiet(old: &str, new: &str) -> bool {
+        dmux_sessions(old, None, true).await == 0 && dmux_sessions(new, None, true).await == 0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_and_pause_really_stop_and_never_show_results() {
+        let Some((old, new)) = large_urls() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        let secs = std::time::Duration::from_secs;
+
+        // 1. Cancel during the 20M-row fingerprint scan.
+        let id = start_run_with(
+            start_input(
+                &old,
+                &new,
+                &[("demo_bank.transactions", CheckLevel::FullValues)],
+            ),
+            &state,
+        )
+        .unwrap()
+        .run_id;
+        assert!(
+            wait_until(secs(180), || async {
+                dmux_sessions(&old, Some("transactions"), true).await > 0
+            })
+            .await,
+            "the transactions scan never started"
+        );
+        let p = cancel_run_with(id.clone(), &state).await.unwrap();
+        assert_eq!(p.overall_state, "cancelled");
+        assert!(
+            wait_until(secs(5), || quiet(&old, &new)).await,
+            "a dmux query is still running on a server after cancel"
+        );
+        tokio::time::timeout(secs(30), state.runs.join(&id))
+            .await
+            .expect("the stopped drive task returns");
+        assert_eq!(
+            poll_run_with(id.clone(), &state).unwrap().overall_state,
+            "cancelled"
+        );
+        assert!(matches!(
+            get_results_with(&id, &state),
+            Err(CommandError::RunStopped { .. })
+        ));
+        assert!(
+            wait_until(secs(5), || async {
+                dmux_sessions(&old, None, false).await == 0
+                    && dmux_sessions(&new, None, false).await == 0
+            })
+            .await,
+            "the cancelled run's sessions are closed, not left behind"
+        );
+        // Cancel is final: no resume.
+        assert!(set_run_paused_with(id.clone(), false, &state)
+            .await
+            .is_err());
+
+        // 2. Pause after the first table finished, during the second scan;
+        //    then resume from the run's store and complete.
+        let id = start_run_with(
+            start_input(
+                &old,
+                &new,
+                &[
+                    ("demo_bank.account_types", CheckLevel::FullValues),
+                    ("demo_bank.audit_log", CheckLevel::FullValues),
+                ],
+            ),
+            &state,
+        )
+        .unwrap()
+        .run_id;
+        let store = crate::state::resume_store_path(&state, &id).unwrap();
+        let first_done = || {
+            dmux_engine::store::Store::open(&store)
+                .and_then(|s| s.finished_tables())
+                .map(|t| t.contains(&"demo_bank.account_types".to_string()))
+                .unwrap_or(false)
+        };
+        assert!(
+            wait_until(secs(180), || {
+                let done = first_done();
+                let old = old.clone();
+                async move { done && dmux_sessions(&old, Some("audit_log"), true).await > 0 }
+            })
+            .await,
+            "the audit_log scan never started after account_types finished"
+        );
+        let p = set_run_paused_with(id.clone(), true, &state).await.unwrap();
+        assert_eq!(p.overall_state, "paused");
+        assert!(
+            wait_until(secs(5), || quiet(&old, &new)).await,
+            "a dmux query is still running on a server after pause"
+        );
+        tokio::time::timeout(secs(30), state.runs.join(&id))
+            .await
+            .expect("the paused drive task returns");
+        assert_eq!(
+            poll_run_with(id.clone(), &state).unwrap().overall_state,
+            "paused"
+        );
+        assert!(get_results_with(&id, &state).is_err());
+
+        let p = set_run_paused_with(id.clone(), false, &state)
+            .await
+            .unwrap();
+        assert_eq!(p.overall_state, "running");
+        assert!(
+            set_run_paused_with(id.clone(), false, &state)
+                .await
+                .is_err(),
+            "a running run cannot be resumed again"
+        );
+        assert!(
+            wait_until(secs(300), || {
+                let s = poll_run_with(id.clone(), &state).unwrap().overall_state;
+                async move { s != "running" }
+            })
+            .await,
+            "the resumed run never finished"
+        );
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        assert_eq!(p.overall_state, "done", "{:?}", p.error);
+        assert!(get_results_with(&id, &state).is_ok());
+        let r = state.runs.results(&id).unwrap();
+        assert!(
+            r.resumed_tables
+                .contains(&"demo_bank.account_types".to_string()),
+            "the finished table came from the store: {:?}",
+            r.resumed_tables
+        );
+        assert!(!r
+            .resumed_tables
+            .contains(&"demo_bank.audit_log".to_string()));
+        assert!(
+            r.tables["demo_bank.audit_log"].old_rows.is_some(),
+            "rescanned"
+        );
+
+        // 3. An engine error is Failed with its typed error, never "running".
+        let gone = |u: &str| format!("{}/dmux_no_such_database", u.rsplit_once('/').unwrap().0);
+        let id = start_run_with(start_input(&old, &gone(&new), &[]), &state)
+            .unwrap()
+            .run_id;
+        assert!(
+            wait_until(secs(60), || {
+                let s = poll_run_with(id.clone(), &state).unwrap().overall_state;
+                async move { s == "failed" }
+            })
+            .await
+        );
+        let p = poll_run_with(id.clone(), &state).unwrap();
+        assert!(
+            matches!(p.error, Some(CommandError::Database { .. })),
+            "{:?}",
+            p.error
+        );
+        assert!(matches!(
+            get_results_with(&id, &state),
+            Err(CommandError::Database { .. })
+        ));
+        assert!(
+            cancel_run_with(id.clone(), &state).await.is_err(),
+            "failed is final"
+        );
+        assert_eq!(poll_run_with(id, &state).unwrap().overall_state, "failed");
     }
 }

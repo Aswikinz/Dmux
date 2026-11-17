@@ -34,12 +34,13 @@ fn profile(port: u16) -> ConnProfile {
 
 async fn run_engine(old_port: u16, new_port: u16) -> RunResults {
     let config = RunConfig {
-        old: Input::Live(profile(old_port)),
-        new: Input::Live(profile(new_port)),
         mapping: Mapping::new(),
         default_level: CheckLevel::FullValues,
         allow_superuser: true,
-        ..RunConfig::default()
+        ..RunConfig::new(
+            Input::Live(profile(old_port)),
+            Input::Live(profile(new_port)),
+        )
     };
     run(&config).await.expect("run should succeed").results
 }

@@ -52,6 +52,21 @@ export class EngineError extends Error {
   }
 }
 
+/**
+ * The engine run stopped with an error (backend `overall_state: "failed"`).
+ * `kind` is the backend's typed error kind; the run has no results.  It is
+ * thrown from every progress call so the UI shows the error, never "running".
+ */
+export class RunFailedError extends Error {
+  constructor(
+    readonly kind: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RunFailedError';
+  }
+}
+
 const NOT_AVAILABLE_MESSAGE =
   'Running checks and exporting reports is not available in this version of Dmux yet.';
 
@@ -229,9 +244,16 @@ interface RawTableProgress {
   eta_seconds: number | null;
 }
 
+interface RawRunError {
+  kind: string;
+  message?: string;
+}
+
 interface RawRunProgress {
   run_id: string;
   overall_state: string;
+  /** Present when `overall_state` is `failed`: the typed engine error. */
+  error?: RawRunError | null;
   tables: RawTableProgress[];
   eta_seconds_min: number | null;
   eta_seconds_max: number | null;
@@ -678,6 +700,11 @@ function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
 }
 
 function translateProgress(raw: RawRunProgress): RunProgress {
+  if (raw.overall_state === 'failed') {
+    const kind = raw.error?.kind ?? 'run_failed';
+    const why = raw.error?.message ?? 'no detail was reported';
+    throw new RunFailedError(kind, `The run failed and has no results: ${why}`);
+  }
   const tables: TableProgress[] = raw.tables.map((t) => ({
     tableId: t.table_id,
     schemaName: t.schema_name,
