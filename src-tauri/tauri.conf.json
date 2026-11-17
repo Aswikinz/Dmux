@@ -32,12 +32,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "../crates/dmux-report/fonts/LiberationSans-Regular.ttf",
-      "../crates/dmux-report/fonts/LiberationSans-Bold.ttf",
-      "../crates/dmux-report/fonts/OFL-1.1.txt",
-      "../THIRD_PARTY_NOTICES.md"
-    ],
+    "resources": {
+      "../crates/dmux-report/fonts/LiberationSans-Regular.ttf": "_up_/crates/dmux-report/fonts/LiberationSans-Regular.ttf",
+      "../crates/dmux-report/fonts/LiberationSans-Bold.ttf": "_up_/crates/dmux-report/fonts/LiberationSans-Bold.ttf",
+      "../crates/dmux-report/fonts/OFL-1.1.txt": "_up_/crates/dmux-report/fonts/OFL-1.1.txt",
+      "../THIRD_PARTY_NOTICES.md": "_up_/THIRD_PARTY_NOTICES.md"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser"

@@ -8,6 +8,15 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Dry run: builds and packages everything, uploads the result as one workflow
+  # artifact, and publishes nothing (no release, no attestation, no signature).
+  # Run it from any branch to test the packaging. Publishing needs a v* tag push.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and package everything but do not publish a release'
+        type: boolean
+        default: true
 
 # Least privilege: read-only by default for the whole workflow. The build jobs
 # run pnpm install and tauri build, which execute third-party install scripts,
@@ -31,7 +40,26 @@ jobs:
           persist-credentials: false
 
       - name: Tag must match tauri.conf.json and package.json
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
+          # A manual run from a branch has no tag to compare. It may only be a
+          # dry run; publishing a release always needs a v* tag push.
+          if [ "$REF_TYPE" != "tag" ]; then
+            if [ "$DRY_RUN" != "true" ]; then
+              echo "::error::publishing a release needs a v* tag; run from a branch only as a dry run"
+              exit 1
+            fi
+            conf=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+            pkg=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+            if [ "$conf" != "$pkg" ]; then
+              echo "::error::tauri.conf.json version $conf does not match package.json version $pkg"
+              exit 1
+            fi
+            echo "Dry run on $GITHUB_REF_NAME: manifests agree on $conf (no tag to compare)"
+            exit 0
+          fi
           TAG="${GITHUB_REF_NAME#v}"
           conf=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
           pkg=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
@@ -152,6 +180,59 @@ jobs:
           path: release-out/*
           if-no-files-found: error
 
+  # Flatpak bundle (PLAN.md section 9), built from the release .deb so it is the
+  # same binary as the other Linux installers. Ubuntu 24.04 for a current
+  # flatpak and flatpak-builder; the runtime comes from Flathub.
+  build-flatpak:
+    name: Build Flatpak bundle
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the Linux build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dmux-release-linux
+          path: linux-artifacts
+
+      - name: Install flatpak and flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder appstream desktop-file-utils
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub org.gnome.Platform//50 org.gnome.Sdk//50
+
+      - name: Validate the desktop file and metainfo
+        run: |
+          VERSION=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          sed -i "s/@VERSION@/$VERSION/; s/@DATE@/$(date -u +%F)/" packaging/flatpak/verify.dmux.desktop.metainfo.xml
+          desktop-file-validate packaging/flatpak/verify.dmux.desktop.desktop
+          appstreamcli validate --no-net packaging/flatpak/verify.dmux.desktop.metainfo.xml
+
+      - name: Build the Flatpak bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          # Exactly one .deb is expected; cp fails closed on none or several.
+          cp linux-artifacts/*.deb packaging/flatpak/dmux.deb
+          flatpak-builder --user --force-clean --repo=flatpak-repo flatpak-build \
+            packaging/flatpak/verify.dmux.desktop.yml
+          mkdir -p release-out
+          flatpak build-bundle flatpak-repo "release-out/Dmux_${VERSION}_x86_64.flatpak" \
+            verify.dmux.desktop --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          test -s "release-out/Dmux_${VERSION}_x86_64.flatpak"
+
+      - name: Upload Flatpak release artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dmux-release-flatpak
+          path: release-out/*
+          if-no-files-found: error
+
   build-windows:
     name: Build release (Windows)
     needs: version-guard
@@ -188,10 +269,76 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # PLAN.md 4.9: the Windows build ships its own Python for custom checks.
+      # The official CPython "embeddable package" is downloaded here (never
+      # committed) at a pinned version, and the file must match the pinned
+      # SHA-256 or the build fails. To upgrade: change the version, download the
+      # file from python.org yourself, and record its SHA-256 below.
+      # python.org also publishes an SPDX SBOM for the package; it is pinned the
+      # same way and attached to the release.
+      - name: Download and verify the embedded Python (CPython)
+        shell: pwsh
+        env:
+          PY_VERSION: '3.12.10'
+          PY_ZIP_SHA256: '4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3'
+          PY_SPDX_SHA256: 'efa53ba4f26e8a06410677ec6d010e97133a7a1ab38e0485f6936da2911879fa'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = "https://www.python.org/ftp/python/$env:PY_VERSION"
+          $zipName = "python-$env:PY_VERSION-embed-amd64.zip"
+          $dl = 'packaging/windows/downloads'
+          New-Item -ItemType Directory -Force $dl | Out-Null
+          foreach ($pair in @(@($zipName, $env:PY_ZIP_SHA256), @("$zipName.spdx.json", $env:PY_SPDX_SHA256))) {
+            $file = Join-Path $dl $pair[0]
+            Invoke-WebRequest -Uri "$base/$($pair[0])" -OutFile $file
+            $got = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -ne $pair[1]) {
+              throw "SHA-256 mismatch for $($pair[0]): expected $($pair[1]), got $got"
+            }
+            Write-Host "Verified $($pair[0]) ($got)"
+          }
+          Expand-Archive -Path (Join-Path $dl $zipName) -DestinationPath packaging/windows/python
+          if (-not (Test-Path packaging/windows/python/python.exe)) { throw 'python.exe missing after extraction' }
+          if (-not (Test-Path packaging/windows/python/LICENSE.txt)) { throw 'CPython LICENSE.txt missing after extraction' }
+
       # NSIS is the required gate: per-user, no admin rights (installMode
       # "currentUser" in tauri.conf.json). Tauri downloads NSIS itself.
+      # Every Windows package gets the python/ resource folder through the
+      # extra config file (it exists only in this job, so Linux builds and
+      # local builds are unaffected).
       - name: Bundle NSIS installer (per-user, required gate)
-        run: pnpm tauri build --bundles nsis
+        run: pnpm tauri build --bundles nsis --config packaging/windows/tauri.python.conf.json
+
+      # Stage the normal setup now: the offline build below overwrites the same
+      # file name in target/release/bundle/nsis.
+      - name: Stage the normal setup installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-out | Out-Null
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe
+          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup, found $($setup.Count)" }
+          Copy-Item $setup.FullName release-out/
+
+      # Offline setup (PLAN.md section 9): the same installer with the WebView2
+      # offline installer embedded (about 127 MB larger), for PCs with no
+      # internet. It is a SEPARATE file so the normal installer stays small and
+      # keeps the downloader, which is the right default for PCs with internet.
+      - name: Bundle the offline-WebView2 NSIS installer
+        run: pnpm tauri build --bundles nsis --config packaging/windows/tauri.python.conf.json --config packaging/windows/tauri.offline.conf.json
+
+      - name: Stage the offline setup installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe
+          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup, found $($setup.Count)" }
+          $name = $setup.Name -replace '-setup\.exe$', '-offline-setup.exe'
+          if ($name -eq $setup.Name) { throw "unexpected setup file name $($setup.Name)" }
+          Copy-Item $setup.FullName (Join-Path release-out $name)
+          # The offline installer carries the WebView2 offline installer, so it
+          # must be much larger than the normal one.
+          $normal = Get-ChildItem release-out/*-setup.exe | Where-Object { $_.Name -notlike '*-offline-setup.exe' }
+          $off = Get-Item (Join-Path release-out $name)
+          if ($off.Length -le ($normal.Length + 50MB)) { throw "offline setup ($($off.Length) bytes) is not clearly larger than the normal setup ($($normal.Length) bytes)" }
 
       # MSI is best effort with the same VBSCRIPT caveat as ci.yml: WiX
       # light.exe needs the VBSCRIPT Windows feature, which can be disabled
@@ -199,7 +346,7 @@ jobs:
       # the NSIS installer satisfies the Windows gate.
       - name: Bundle MSI installer (best effort, VBSCRIPT caveat above)
         continue-on-error: true
-        run: pnpm tauri build --bundles msi
+        run: pnpm tauri build --bundles msi --config packaging/windows/tauri.python.conf.json
 
       - name: Report MSI result
         shell: pwsh
@@ -214,16 +361,37 @@ jobs:
       - name: Build CLI (Windows)
         run: cargo build --release -p dmux-cli --locked
 
-      - name: Stage the installers and CLI
+      - name: Stage the MSI, CLI, portable zip and Python SBOM
         shell: pwsh
+        env:
+          PY_VERSION: '3.12.10'
         run: |
-          # Flat staging dir (see the Linux job). NSIS and the CLI are
-          # required; Copy-Item fails without them. MSI is best effort.
+          $ErrorActionPreference = 'Stop'
+          # Flat staging dir (see the Linux job). The setup installers were
+          # staged above; the CLI and portable zip are required (Copy-Item and
+          # Compress-Archive fail without them). MSI is best effort.
           New-Item -ItemType Directory -Force release-out | Out-Null
-          Copy-Item target/release/bundle/nsis/*.exe release-out/
           $msi = Get-ChildItem target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue
           if ($msi) { Copy-Item $msi.FullName release-out/ }
           Copy-Item target/release/dmux.exe release-out/dmux-x86_64-pc-windows-msvc.exe
+
+          # Portable .zip: runs with no install. WebView2 must already be on the
+          # PC (said in README.txt). Same app exe the installers carry, plus the
+          # private Python folder the app looks for next to itself.
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $stage = "portable-stage/Dmux_${version}_x64-portable"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/dmux-app.exe $stage/
+          Copy-Item -Recurse packaging/windows/python $stage/python
+          Copy-Item packaging/windows/PORTABLE-README.txt $stage/README.txt
+          Copy-Item THIRD_PARTY_NOTICES.md $stage/
+          Copy-Item crates/dmux-report/fonts/OFL-1.1.txt $stage/
+          Copy-Item LICENSE $stage/LICENSE.txt
+          Compress-Archive -Path $stage -DestinationPath "release-out/Dmux_${version}_x64-portable.zip"
+
+          # SPDX SBOM of the embedded CPython, as published by python.org
+          # (already SHA-256 verified above).
+          Copy-Item "packaging/windows/downloads/python-$env:PY_VERSION-embed-amd64.zip.spdx.json" release-out/sbom-cpython-windows-embed.spdx.json
 
       - name: Upload Windows release artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -234,7 +402,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [version-guard, build-linux, build-windows]
+    needs: [version-guard, build-linux, build-flatpak, build-windows]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     # The only job that may write to the repository: gh release create below
@@ -245,6 +413,11 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      # 'true' only for a real v* tag push (or a tag run with dry_run off). A
+      # dry run does every build and packaging step but skips attestation,
+      # signing and the release itself.
+      PUBLISH: ${{ github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     steps:
       # gh authenticates with the GH_TOKEN env below, and nothing here pushes
       # through git, so the checkout token is not needed in .git/config either.
@@ -263,7 +436,8 @@ jobs:
         run: |
           ls -l artifacts
           # Fail closed: never publish a release missing a platform's files.
-          for pat in '*.deb' '*.rpm' '*.AppImage' '*-setup.exe' 'dmux-x86_64-unknown-linux-musl' 'dmux-x86_64-pc-windows-msvc.exe'; do
+          # (-setup.exe appears twice: the normal setup and *-offline-setup.exe.)
+          for pat in '*.deb' '*.rpm' '*.AppImage' '*.flatpak' '*_x64-setup.exe' '*_x64-offline-setup.exe' '*_x64-portable.zip' 'sbom-cpython-windows-embed.spdx.json' 'dmux-x86_64-unknown-linux-musl' 'dmux-x86_64-pc-windows-msvc.exe'; do
             if ! compgen -G "artifacts/$pat" > /dev/null; then
               echo "::error::release artifact missing: $pat"
               exit 1
@@ -355,6 +529,7 @@ jobs:
       # bundle (signature metadata, not a build output) is not double-counted.
       # subject-path globs artifacts/ and the action attests each regular file.
       - name: Attest build provenance (SLSA)
+        if: env.PUBLISH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: artifacts/*
@@ -365,8 +540,10 @@ jobs:
       # this workflow on a v* tag, not to a long-lived key. The bundle is
       # written AFTER SHA256SUMS and is not itself listed inside it.
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3 (installs cosign v3.1.4)
+        if: env.PUBLISH == 'true'
 
       - name: Sign SHA256SUMS keylessly (Sigstore)
+        if: env.PUBLISH == 'true'
         run: |
           cosign sign-blob --yes --bundle artifacts/SHA256SUMS.cosign.bundle artifacts/SHA256SUMS
           # Fail closed: a zero-byte or missing bundle means signing did not run.
@@ -377,7 +554,18 @@ jobs:
       # cannot drift from the version the guard just checked. The header states
       # pre-release or stable status and the unsigned-installer SmartScreen note; GitHub's
       # generated notes follow it.
+      # Dry run: keep everything that would have been published, so the
+      # packaging can be inspected without making a release.
+      - name: Upload dry-run artifacts (nothing is published)
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dmux-dry-run-release
+          path: artifacts/*
+          if-no-files-found: error
+
       - name: Create the published release
+        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -411,12 +599,14 @@ jobs:
           before running it: check the signature on `SHA256SUMS`, check the
           file's checksum against it, then install — see `SECURITY.md`.
 
-          Attached: Linux deb/rpm/AppImage installers, Windows NSIS/MSI
-          installers (MSI when the build runner allows), static Linux and
-          Windows CLI binaries, SHA-256 checksums plus their Sigstore signature,
-          and CycloneDX SBOMs for the Rust workspace and the npm production
-          dependencies. Every attached file carries a build-provenance
-          attestation.
+          Attached: Linux deb/rpm/AppImage installers and a Flatpak bundle,
+          Windows setup installers (normal, and an offline one that carries
+          WebView2 for PCs with no internet), an MSI (when the build runner
+          allows) and a portable zip, static Linux and Windows CLI binaries,
+          SHA-256 checksums plus their Sigstore signature, and SBOMs for the
+          Rust workspace, the npm production dependencies and the Python that
+          the Windows builds carry. Every attached file carries a
+          build-provenance attestation.
           EOF
           # The heredoc sits inside this indented run block, so strip that
           # indentation: Markdown would otherwise render the header as code.

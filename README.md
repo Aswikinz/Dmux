@@ -44,10 +44,13 @@ Download the file for your computer from the
 
 | Your computer | Download | How to install |
 | --- | --- | --- |
-| Windows 10 or 11 | `Dmux_<version>_x64-setup.exe` | Double-click it. It installs for your user only and needs no administrator rights. |
+| Windows 10 or 11 | `Dmux_<version>_x64-setup.exe` | Double-click it. It installs for your user only and needs no administrator rights. It downloads WebView2 if the PC lacks it. |
+| Windows, no internet | `Dmux_<version>_x64-offline-setup.exe` | The same installer, carrying Microsoft's WebView2 component for PCs that cannot download it. About 130 MB larger. |
+| Windows, locked down | `Dmux_<version>_x64-portable.zip` | Unzip anywhere and run `dmux-app.exe`. No install, no administrator rights. Needs WebView2 already on the PC (see `README.txt` in the zip). |
 | Windows, managed by IT | `Dmux_<version>_x64_en-US.msi` | For central deployment by your IT team. |
 | Ubuntu or Debian | `Dmux_<version>_amd64.deb` | `sudo apt install ./Dmux_<version>_amd64.deb` |
 | Fedora or RHEL | `Dmux-<version>-1.x86_64.rpm` | `sudo dnf install ./Dmux-<version>-1.x86_64.rpm` |
+| Any Linux, sandboxed | `Dmux_<version>_x86_64.flatpak` | `flatpak install --user ./Dmux_<version>_x86_64.flatpak`, then run `flatpak run verify.dmux.desktop`. |
 | Any Linux, no install | `Dmux_<version>_amd64.AppImage` | `chmod +x Dmux_*.AppImage`, then run it. Needs FUSE 2. |
 | A server, command line only | `dmux-x86_64-unknown-linux-musl` or `dmux-x86_64-pc-windows-msvc.exe` | Copy it to the server and run it; nothing else to install. |
 
