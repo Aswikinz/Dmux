@@ -107,9 +107,29 @@ reason. Everything else is one of the following.
 | **PASS** | Every checked table matched at its chosen level. | Read the coverage line (below) before signing, so you know what was actually covered. |
 | **FAIL** | The data differs. Dmux says where: which table, how big the gap is, and for up to 100 changed rows per table, which columns differ. | Give the report to the migration team. A FAIL is a finding about the data, not about the tool. |
 | **WIDELY DIFFERENT** | So much of the table differs that listing rows would be useless. Dmux shows a sample of the differing parts instead of the full row list. | Treat it as a failure of the migration of that table and start from the beginning of that table's load. |
-| **NEEDS REVIEW** | The values matched, but at least one column was compared through a printed form that Dmux cannot prove is exact (an unusual or add-on data type, for instance). A person must look. | A named reviewer checks the listed columns and records the decision. It is never counted as a PASS on its own. |
+| **NEEDS REVIEW** | The values matched, but a person must look. Either at least one column was compared through a printed form that Dmux cannot prove is exact (an unusual or add-on data type, for instance), or Dmux could not tell whether the table changed while it was read ("change detection unavailable", see below). | A named reviewer checks the listed columns or the stated reason and records the decision. It is never counted as a PASS on its own. |
 | **CHANGED DURING CHECK** | Someone inserted, changed or deleted rows in that table while Dmux was reading it. The counts and totals cannot be trusted, so Dmux refuses to call it a PASS. | Re-run that table during a quiet period, or on a frozen copy or a replica (see [the administrator guide](guide/dba-setup.md)). |
 | **TOOL FAULT** | Dmux could not reach a decision: a scan failed, a time limit expired, a table it expected was missing, or the independent spot check disagreed with the fingerprint. This is a statement about the tool, never about the data. | Keep the run log and send it to the Dmux maintainers. Do not sign off on a tool fault, and do not read it as a PASS either. |
+
+### PASS (with options)
+
+A user may tick a looser comparison for a column: ignore trailing spaces, treat an empty
+text and a blank (NULL) as the same, compare dates only (dropping the time of day), or round
+decimals to a chosen number of places. When the report relies on any such option, the
+verdict reads **PASS (with options)**, and the options are listed next to it. Read that
+list before signing: the PASS holds only under those options. A results file made by an
+older version, which did not record options, shows "PASS (options not recorded - older
+results file)" instead of a bare PASS, because Dmux cannot vouch for what was applied.
+
+### Change detection unavailable
+
+To notice that a table changed while it was read, Dmux relies on counters the server keeps
+for inserts, updates and deletes (the `track_counts` setting). If that setting is off, or
+the table is a foreign table (one whose data lives in another system), the counters do not
+move and Dmux cannot tell. Such a table is marked NEEDS REVIEW with the reason "change
+detection unavailable", even when its values match, and a later resume of the run will not
+reuse its stored result. The fix is on the server: see
+[the administrator guide](guide/dba-setup.md), section 5.
 
 A table marked CHANGED DURING CHECK or TOOL FAULT is not a data result. Dmux shows the
 words as well as the colour, because status must never rest on colour alone.
@@ -140,6 +160,9 @@ part of any verification tool.
 - It does not prove that the new database is fast enough.
 - It does not prove that data which was already wrong before the migration is now right.
   Dmux compares the new data with the old data, whatever the old data was.
+- It does not compare the contents of large objects (the special PostgreSQL storage for
+  very big files). Dmux compares only how many large objects each side holds, so a large
+  object whose contents changed, with the count unchanged, is not detected.
 - It does not cover tables, columns or rows that were ignored, unmapped, or checked at a
   lower level. The coverage line and the list of ignored items are part of the verdict.
 - It does not make the report impossible to forge. The report carries the run
@@ -169,6 +192,27 @@ a malicious operator, Dmux is one control among several and not the control that
 that case. Two things back the decision up: an independent database administrator reviews
 the method before the first real use, and the first real run happens alongside the manual
 checks the bank already performs.
+
+## Mapping rules
+
+Renaming rules (a schema rename, a prefix or a suffix) apply to **tables** only, never to
+columns; columns are paired by name, and a column that was renamed must be paired by hand.
+Dmux also refuses a mapping in which two old tables point at the same new table. Two old
+tables cannot both match one new table, because the mapping does not say
+which of them the new table really is, so Dmux asks for a decision rather than choosing.
+
+## Saved captures from other rules are refused
+
+A capture is a saved fingerprint file that can be compared later, without the old database.
+Each one records the version of Dmux's normalisation rules (the conversions in the table
+above) that made it. If the rules in the running Dmux differ, or the file does not say which
+rules it used, Dmux refuses to compare it and asks for the data to be captured again with
+this version: fingerprints made under different rules are not comparable, and quietly
+comparing them could hide a difference. A capture made by a different release of Dmux that
+uses the same rules is accepted, with a warning in the run noting both versions. Dmux also
+recomputes, from the column types recorded in the file, which tables need review, and refuses
+a file whose own "needs review" flag was edited to say otherwise. A capture file larger than
+64 MiB is refused.
 
 ## The stop rule
 
@@ -207,6 +251,12 @@ by value inside the app, without using the fingerprint at all. If that plain com
 disagrees with the fingerprint, the result is reported as a TOOL FAULT, not as a data
 difference: a disagreement means Dmux's own arithmetic is suspect, and the reader must
 not be told that their data is wrong when the tool may be.
+
+The spot check has a limit. It uses the same value conversions as the fingerprint, so it is
+a check on the fingerprint arithmetic, not on the conversion rules themselves. A mistake in
+a conversion rule would be made in both, and the spot check could not catch it. The
+conversion rules are instead checked by the test suite against real servers (see "Proven
+database versions").
 
 ## Where to read more
 
