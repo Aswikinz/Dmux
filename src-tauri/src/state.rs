@@ -16,8 +16,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Open the profile store (at `data_dir/dmux.db`) and build the state.
+    /// Open the profile store (at `data_dir/dmux.db`) and build the state,
+    /// creating the app data directory first so the store always has a home.
     pub fn new(data_dir: PathBuf) -> Result<Self, CommandError> {
+        std::fs::create_dir_all(&data_dir).map_err(|e| CommandError::Store {
+            message: format!("cannot create app data dir: {e}"),
+        })?;
         let store = Store::open(&data_dir.join("dmux.db"))?;
         Ok(Self {
             keychain: Mutex::new(Keychain::default()),

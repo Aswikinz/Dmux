@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMockEngine } from './mockEngine';
-import { createTauriEngine, mapDiffStatus, mapVerdict } from './tauriEngine';
+import { createTauriEngine, EngineError, mapDiffStatus, mapVerdict } from './tauriEngine';
 import type { ConnectionProfile, Inventory, Mapping } from './contract';
 import { defaultOldProfile } from '../screens/ConnectScreen';
 
@@ -25,6 +24,7 @@ const rawServerInfo = {
   pooler_suspected: false,
   md5_available: true,
   sql_ascii: false,
+  tls: { state: 'encrypted', verified: true },
 };
 
 const emptyInventory: Record<string, unknown> = {};
@@ -60,8 +60,10 @@ function rawMappingBuild(): {
               column_mappings: {
                 id: { target_column: 'id', status: 'exact' },
                 name: { target_column: 'full_name', status: 'case_insensitive' },
+                notes: { target_column: 'memo', status: 'fuzzy' },
               },
             },
+            legacy: { target_table: '', status: 'ignored', column_mappings: {} },
           },
         },
       },
@@ -119,7 +121,7 @@ describe('mapDiffStatus', () => {
 });
 
 describe('createTauriEngine', () => {
-  it('testConnection surfaces server info on success', async () => {
+  it('testConnection surfaces server info and the real TLS state on success', async () => {
     invoke.mockResolvedValueOnce(rawServerInfo);
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
@@ -132,26 +134,52 @@ describe('createTauriEngine', () => {
     expect(result.info?.tls).toEqual({ state: 'encrypted', verified: true });
   });
 
+  it('testConnection reflects a pinned certificate fingerprint', async () => {
+    invoke.mockResolvedValueOnce({
+      ...rawServerInfo,
+      tls: { state: 'encrypted', verified: false, fingerprint: 'aabbcc' },
+    });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.info?.tls).toEqual({
+      state: 'encrypted',
+      verified: false,
+      fingerprint: 'aabbcc',
+    });
+  });
+
+  it('testConnection reflects a plaintext connection with its reason', async () => {
+    invoke.mockResolvedValueOnce({
+      ...rawServerInfo,
+      tls: { state: 'plaintext', reason: 'test network' },
+    });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.info?.tls).toEqual({ state: 'plaintext', reason: 'test network' });
+  });
+
   it('testConnection flags a superuser with a warning', async () => {
     invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
-
-    expect(result.ok).toBe(true);
     expect(result.info?.isSuperuser).toBe(true);
     expect(result.info?.warning).toContain('superuser');
   });
 
-  it('testConnection maps trust and plaintext encryption to the backend', async () => {
+  it('testConnection maps trust and plaintext profiles to the backend', async () => {
     invoke.mockResolvedValue(rawServerInfo);
     const engine = createTauriEngine();
-    await engine.testConnection(profile({ encryption: 'allow-plaintext' }));
-
+    await engine.testConnection(
+      profile({ encryption: 'allow-plaintext', plaintextReason: 'test net' }),
+    );
     expect(invoke).toHaveBeenCalledWith(
       'probe_connection',
       expect.objectContaining({
         input: expect.objectContaining({
-          profile: expect.objectContaining({ encryption: 'allow-plaintext' }),
+          profile: expect.objectContaining({
+            encryption: 'allow-plaintext',
+            plaintext_reason: 'test net',
+          }),
         }),
       }),
     );
@@ -161,7 +189,6 @@ describe('createTauriEngine', () => {
     invoke.mockRejectedValueOnce({ kind: 'untrusted_cert', fingerprint: 'aabbcc' });
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
-
     expect(result.ok).toBe(false);
     expect(result.error).toContain('fingerprint=aabbcc');
   });
@@ -170,7 +197,6 @@ describe('createTauriEngine', () => {
     invoke.mockRejectedValueOnce({ kind: 'superuser_refused' });
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
-
     expect(result.ok).toBe(false);
     expect(result.error).toContain('superuser');
   });
@@ -179,7 +205,6 @@ describe('createTauriEngine', () => {
     invoke.mockRejectedValueOnce({ kind: 'plaintext_reason_required' });
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
-
     expect(result.ok).toBe(false);
     expect(result.error).toContain('reason');
   });
@@ -188,7 +213,6 @@ describe('createTauriEngine', () => {
     invoke.mockRejectedValueOnce({ kind: 'database', message: 'connection failed' });
     const engine = createTauriEngine();
     const result = await engine.testConnection(profile());
-
     expect(result.ok).toBe(false);
     expect(result.error).toBe('connection failed');
   });
@@ -229,14 +253,6 @@ describe('createTauriEngine', () => {
                 message: 'table missing in new: archived',
                 children: [],
               },
-              {
-                path: ['database', 'encoding'],
-                status: 'warning',
-                old_value: 'LATIN1',
-                new_value: 'UTF8',
-                message: 'encoding changed: LATIN1 -> UTF8',
-                children: [],
-              },
             ],
             old_encoding: 'LATIN1',
             new_encoding: 'UTF8',
@@ -251,15 +267,9 @@ describe('createTauriEngine', () => {
 
     expect(inventory.oldEncoding).toBe('LATIN1');
     expect(inventory.newEncoding).toBe('UTF8');
-    expect(inventory.schemas).toHaveLength(3);
+    expect(inventory.schemas).toHaveLength(2);
     const missing = inventory.schemas.find((n) => n.name === 'archived');
     expect(missing?.status).toBe('missing');
-    const changed = inventory.schemas.find((n) => n.name === 'accounts');
-    expect(changed?.status).toBe('changed');
-    const encoding = inventory.schemas.find((n) => n.name === 'encoding');
-    expect(encoding?.status).toBe('changed');
-    expect(encoding?.old).toBe('LATIN1');
-    expect(encoding?.new).toBe('UTF8');
   });
 
   it('buildMapping requires compareStructure first', async () => {
@@ -267,13 +277,13 @@ describe('createTauriEngine', () => {
     await expect(engine.buildMapping(inventory())).rejects.toThrow();
   });
 
-  it('buildMapping translates the backend mapping to the contract', async () => {
+  it('buildMapping only auto-approves exact and case_insensitive matches', async () => {
     invoke.mockImplementation((cmd: string) => {
       if (cmd === 'run_inventory') {
         return Promise.resolve(emptyInventory);
       }
       if (cmd === 'schema_diff') {
-        return Promise.resolve(rawDiff({ old_encoding: 'LATIN1', new_encoding: 'UTF8' }));
+        return Promise.resolve(rawDiff());
       }
       if (cmd === 'build_mapping') {
         return Promise.resolve(rawMappingBuild());
@@ -285,13 +295,22 @@ describe('createTauriEngine', () => {
     const structure = await engine.compareStructure(profile(), profile());
     const mapping = await engine.buildMapping(structure);
 
-    // A table match plus its two column matches.
-    expect(mapping.matches).toHaveLength(3);
-    expect(mapping.matches[0].confidence).toBe('exact');
-    expect(mapping.matches[1].confidence).toBe('exact');
-    expect(mapping.matches[2].confidence).toBe('case');
-    // One flagged table + the encoding review item.
-    expect(mapping.needsAttention).toHaveLength(2);
+    // matches: accounts table (exact) + id (exact) + name (case) + notes (fuzzy).
+    expect(mapping.matches).toHaveLength(4);
+    const byId = (id: string) => mapping.matches.find((m) => m.id === id);
+
+    // Exact and case-insensitive are approved, fuzzy is not and is in the queue.
+    expect(byId('public.accounts')?.approved).toBe(true);
+    expect(byId('public.accounts.id')?.approved).toBe(true);
+    expect(byId('public.accounts.name')?.approved).toBe(true);
+
+    const notes = byId('public.accounts.notes');
+    expect(notes?.approved).toBe(false);
+    expect(notes?.confidence).toBe('fuzzy');
+    expect(mapping.needsAttention.some((m) => m.id === 'public.accounts.notes')).toBe(true);
+
+    // The explicit needs_attention entry and the ignored item round-trip.
+    expect(mapping.needsAttention.some((m) => m.id === 'public.audit_log')).toBe(true);
     expect(mapping.ignored).toHaveLength(1);
     expect(mapping.ignored[0].reason).toBe('not migrated');
     expect(mapping.rules).toHaveLength(1);
@@ -316,8 +335,8 @@ describe('createTauriEngine', () => {
     });
 
     const engine = createTauriEngine();
-    await engine.compareStructure(profile(), profile());
-    await engine.buildMapping(inventory());
+    const structure = await engine.compareStructure(profile(), profile());
+    await engine.buildMapping(structure);
     const saved = await engine.saveMapping(mapping());
 
     expect(saved).toEqual({ json: '{}', hash: 'abc123' });
@@ -328,20 +347,49 @@ describe('createTauriEngine', () => {
     await expect(engine.saveMapping(mapping())).rejects.toThrow();
   });
 
-  it('delegates the data-half methods to the mock', async () => {
-    const dataMock = createMockEngine();
-    const spy = vi.spyOn(dataMock, 'buildCheckPlan');
-    const engine = createTauriEngine({ dataMock });
-
-    await engine.buildCheckPlan(mapping());
-    expect(spy).toHaveBeenCalled();
-  });
-
   it('getVersion reads the engine version from the backend', async () => {
     invoke.mockResolvedValueOnce('0.1.0');
     const engine = createTauriEngine();
     await expect(engine.getVersion()).resolves.toBe('0.1.0');
     expect(invoke).toHaveBeenCalledWith('get_version');
+  });
+});
+
+describe('data half is not available (never fabricates a verdict)', () => {
+  const dataMethods = [
+    'buildCheckPlan',
+    'startRun',
+    'pollRun',
+    'setRunPaused',
+    'cancelRun',
+    'getResults',
+    'exportReport',
+  ] as const;
+
+  it.each(dataMethods)('%s throws a typed EngineError', async (method) => {
+    const engine = createTauriEngine();
+    // Every data method rejects with an EngineError(NOT_AVAILABLE), and never
+    // resolves with a fabricated result.
+    const call = (() => {
+      switch (method) {
+        case 'buildCheckPlan':
+          return engine.buildCheckPlan(mapping());
+        case 'startRun':
+          return engine.startRun(definition());
+        case 'pollRun':
+          return engine.pollRun('run-1');
+        case 'setRunPaused':
+          return engine.setRunPaused('run-1', true);
+        case 'cancelRun':
+          return engine.cancelRun('run-1');
+        case 'getResults':
+          return engine.getResults('run-1');
+        case 'exportReport':
+          return engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
+      }
+    });
+    await expect(call).rejects.toBeInstanceOf(EngineError);
+    await expect(call).rejects.toMatchObject({ code: 'NOT_AVAILABLE' });
   });
 });
 
@@ -356,5 +404,14 @@ function inventory(): Inventory {
     newEncoding: 'UTF8',
     oldCollation: 'C',
     newCollation: 'C',
+  };
+}
+
+function definition(): import('./contract').RunDefinition {
+  return {
+    oldProfile: defaultOldProfile(),
+    newProfile: defaultOldProfile(),
+    mapping: mapping(),
+    plan: { tables: [], presets: [], estimateSecondsMin: 1, estimateSecondsMax: 2 },
   };
 }

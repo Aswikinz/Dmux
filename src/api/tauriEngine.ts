@@ -3,16 +3,16 @@
  *
  * Structure half (Connect / Compare structure / Map) calls the backend commands
  * and maps their serde (snake_case) JSON onto the frontend contract.  The data
- * half (checks / run / results / report) is still owned by the mock engine
- * until T022 lands — those methods delegate to the deterministic mock.
+ * half (checks / run / results / report) is NOT implemented yet — until T022
+ * lands those methods throw a typed `EngineError` so the UI shows a plain
+ * notice instead of a fabricated verdict.  A false PASS is the worst bug this
+ * project can have, so nothing here ever invents one.
  *
  * Every mapping is strict: an unknown status or verdict is treated as a
- * non-PASS result, never silently coerced to "same" or "PASS" (a false PASS is
- * the worst bug this project can have).
+ * non-PASS result, never silently coerced to "same" or "PASS".
  */
 
 import { invoke } from '@tauri-apps/api/core';
-import { createMockEngine } from './mockEngine';
 import type { Engine } from './engine';
 import type {
   CheckPlan,
@@ -23,21 +23,45 @@ import type {
   MappingMatch,
   IgnoreItem,
   MatchConfidence,
-  ReportRequest,
   ReportResult,
   Results,
-  RunDefinition,
   RunProgress,
   SchemaDiffNode,
   ServerInfo,
+  TlsState,
   Verdict,
 } from './contract';
+
+/** A typed engine error the UI can distinguish from a connection/database error. */
+export class EngineError extends Error {
+  constructor(
+    readonly code: 'NOT_AVAILABLE',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'EngineError';
+  }
+}
+
+const NOT_AVAILABLE_MESSAGE =
+  'Running checks and exporting reports is not available in this version of Dmux yet.';
+
+function notAvailable(): Promise<never> {
+  return Promise.reject(new EngineError('NOT_AVAILABLE', NOT_AVAILABLE_MESSAGE));
+}
 
 // ---------------------------------------------------------------------------
 // Engine-native (snake_case) shapes, matching the Rust commands' serde output.
 // ---------------------------------------------------------------------------
 
-/** Engine `db::ServerInfo`. */
+/** Engine `db::ServerInfo` plus the real TLS state (see `gateway::ProbeResult`). */
+interface RawTlsState {
+  state: 'encrypted' | 'plaintext';
+  verified?: boolean;
+  fingerprint?: string | null;
+  reason?: string;
+}
+
 interface RawServerInfo {
   version_num: number;
   version_string: string;
@@ -50,6 +74,7 @@ interface RawServerInfo {
   pooler_suspected: boolean;
   md5_available: boolean;
   sql_ascii: boolean;
+  tls: RawTlsState;
 }
 
 /** Engine `schema_diff::DiffStatus`. */
@@ -75,7 +100,7 @@ interface RawSchemaDiff {
   entries: RawSchemaDiffEntry[];
 }
 
-/** Engine `mapping::MappingStatus` / rule kinds (snake_case). */
+/** Engine `mapping::Mapping` rule kinds. */
 interface RawRule {
   kind: string;
   pattern: string;
@@ -272,11 +297,16 @@ function mapConfidence(status: string): MatchConfidence {
       return 'exact';
     case 'case_insensitive':
       return 'case';
-    case 'fuzzy':
-      return 'fuzzy';
     default:
+      // `fuzzy`, `unmapped` and any unknown status are all "needs attention",
+      // never an auto-approved exact/case match.
       return 'fuzzy';
   }
+}
+
+/** Only `exact` and `case_insensitive` are auto-approved. */
+function isAutoApproved(status: string): boolean {
+  return status === 'exact' || status === 'case_insensitive';
 }
 
 /** Project the engine `Mapping` + attention queue onto the contract `Mapping`. */
@@ -287,25 +317,45 @@ function translateMapping(
   const matches: MappingMatch[] = [];
   const needsAttention: MappingMatch[] = [];
 
-  // Approved (exact/case) matches come from the engine's schema/table/column
-  // mappings; the attention queue is the human-review items the backend flags.
+  const addMatch = (match: MappingMatch, status: string) => {
+    matches.push(match);
+    if (!isAutoApproved(status)) {
+      // Fuzzy, unmapped and any unknown status require a human decision.
+      needsAttention.push({ ...match, approved: false });
+    }
+  };
+
   for (const [schema, schemaMapping] of Object.entries(build.mapping.schema_mappings)) {
     for (const [oldTable, tableMapping] of Object.entries(schemaMapping.table_mappings)) {
-      matches.push({
-        id: `${schema}.${oldTable}`,
-        oldName: `${schema}.${oldTable}`,
-        newName: `${schemaMapping.target_schema}.${tableMapping.target_table}`,
-        confidence: mapConfidence(tableMapping.status),
-        approved: tableMapping.status !== 'ignored' && tableMapping.status !== 'unmapped',
-      });
+      const tableStatus = tableMapping.status;
+      if (tableStatus === 'ignored') {
+        continue; // surfaced through build.mapping.ignored
+      }
+      addMatch(
+        {
+          id: `${schema}.${oldTable}`,
+          oldName: `${schema}.${oldTable}`,
+          newName: `${schemaMapping.target_schema}.${tableMapping.target_table}`,
+          confidence: mapConfidence(tableStatus),
+          approved: isAutoApproved(tableStatus),
+        },
+        tableStatus,
+      );
       for (const [oldCol, colMapping] of Object.entries(tableMapping.column_mappings)) {
-        matches.push({
-          id: `${schema}.${oldTable}.${oldCol}`,
-          oldName: `${oldTable}.${oldCol}`,
-          newName: colMapping.target_column,
-          confidence: mapConfidence(colMapping.status),
-          approved: colMapping.status !== 'ignored' && colMapping.status !== 'unmapped',
-        });
+        const colStatus = colMapping.status;
+        if (colStatus === 'ignored') {
+          continue;
+        }
+        addMatch(
+          {
+            id: `${schema}.${oldTable}.${oldCol}`,
+            oldName: `${oldTable}.${oldCol}`,
+            newName: colMapping.target_column,
+            confidence: mapConfidence(colStatus),
+            approved: isAutoApproved(colStatus),
+          },
+          colStatus,
+        );
       }
     }
   }
@@ -350,12 +400,7 @@ function translateMapping(
 // ---------------------------------------------------------------------------
 
 function toBackendProfile(profile: ConnectionProfile): BackendProfile {
-  // The frontend contract carries the encryption mode but not a trust
-  // fingerprint or a plaintext reason (that is a T023-follow-up gap).  For now
-  // `trust` and `allow-plaintext` are passed with null extras and the backend
-  // rejects them with a clear, typed error rather than guessing.
-  const encryption: EncryptionField =
-    profile.encryption === 'trust' ? 'trust' : profile.encryption === 'allow-plaintext' ? 'allow-plaintext' : 'verify';
+  const encryption: EncryptionField = profile.encryption;
   return {
     id: profile.id,
     label: profile.label,
@@ -364,8 +409,8 @@ function toBackendProfile(profile: ConnectionProfile): BackendProfile {
     database: profile.database,
     user: profile.user,
     encryption,
-    tls_fingerprint: null,
-    plaintext_reason: null,
+    tls_fingerprint: profile.tlsFingerprint ?? null,
+    plaintext_reason: profile.plaintextReason ?? null,
   };
 }
 
@@ -378,6 +423,20 @@ function toConnectInput(profile: ConnectionProfile): {
   return { profile: toBackendProfile(profile), password: null };
 }
 
+/** Map the backend's real TLS state, never hardcoding `verified: true`. */
+function toTlsState(raw: RawTlsState): TlsState {
+  if (raw.state === 'encrypted') {
+    if (raw.verified) {
+      return { state: 'encrypted', verified: true };
+    }
+    return { state: 'encrypted', verified: false, fingerprint: raw.fingerprint ?? '' };
+  }
+  if (raw.state === 'plaintext') {
+    return { state: 'plaintext', reason: raw.reason };
+  }
+  return { state: 'unknown' };
+}
+
 function toServerInfo(raw: RawServerInfo): ServerInfo {
   return {
     version: raw.version_string,
@@ -387,7 +446,7 @@ function toServerInfo(raw: RawServerInfo): ServerInfo {
     canWrite: raw.can_write,
     poolerSuspected: raw.pooler_suspected,
     md5Available: raw.md5_available,
-    tls: { state: 'encrypted', verified: true },
+    tls: toTlsState(raw.tls),
   };
 }
 
@@ -416,28 +475,18 @@ function describeError(error: unknown): string {
 // The engine.
 // ---------------------------------------------------------------------------
 
-export interface TauriEngineOptions {
-  /**
-   * The mock engine the data half (checks / run / results / report) delegates
-   * to until T022 wires those to the backend.  Defaults to the deterministic
-   * mock; tests inject their own or force a fixture.
-   */
-  dataMock?: Engine;
-}
-
 /**
  * Create the Tauri-backed engine.
  *
- * Structure methods call the backend; data methods delegate to `dataMock`.
+ * Structure methods call the backend; data methods throw a typed `EngineError`
+ * (NOT_AVAILABLE) until T022 wires them — never fabricating a verdict.
  *
  * The flow is linear (connect -> compare -> map), so the adapter remembers the
  * profiles used by `compareStructure` and reuses them in `buildMapping`, which
  * the backend computes against the two live databases.  The raw engine mapping
  * produced by `build_mapping` is kept for `saveMapping`.
  */
-export function createTauriEngine(options: TauriEngineOptions = {}): Engine {
-  const dataMock = options.dataMock ?? createMockEngine();
-
+export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
   let lastNewProfile: ConnectionProfile | null = null;
   let lastRawMapping: RawMapping | null = null;
@@ -509,28 +558,28 @@ export function createTauriEngine(options: TauriEngineOptions = {}): Engine {
       return { hash: exported.hash, json: exported.json };
     },
 
-    // --- Data half: delegated to the mock until T022. ---
+    // --- Data half: not available until T022 (never fabricate a verdict). ---
 
-    buildCheckPlan(mapping: Mapping): Promise<CheckPlan> {
-      return dataMock.buildCheckPlan(mapping);
+    buildCheckPlan(): Promise<CheckPlan> {
+      return notAvailable();
     },
-    startRun(definition: RunDefinition): Promise<RunProgress> {
-      return dataMock.startRun(definition);
+    startRun(): Promise<RunProgress> {
+      return notAvailable();
     },
-    pollRun(runId: string): Promise<RunProgress> {
-      return dataMock.pollRun(runId);
+    pollRun(): Promise<RunProgress> {
+      return notAvailable();
     },
-    setRunPaused(runId: string, paused: boolean): Promise<RunProgress> {
-      return dataMock.setRunPaused(runId, paused);
+    setRunPaused(): Promise<RunProgress> {
+      return notAvailable();
     },
-    cancelRun(runId: string): Promise<RunProgress> {
-      return dataMock.cancelRun(runId);
+    cancelRun(): Promise<RunProgress> {
+      return notAvailable();
     },
-    getResults(runId: string): Promise<Results> {
-      return dataMock.getResults(runId);
+    getResults(): Promise<Results> {
+      return notAvailable();
     },
-    exportReport(request: ReportRequest): Promise<ReportResult> {
-      return dataMock.exportReport(request);
+    exportReport(): Promise<ReportResult> {
+      return notAvailable();
     },
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');

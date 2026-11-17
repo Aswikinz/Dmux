@@ -24,6 +24,8 @@ coverage/
 .wdio*
 e2e/logs/
 e2e/artifacts/
+test-results/
+playwright-report/
 
 # Local noise
 *.log

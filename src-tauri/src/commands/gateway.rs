@@ -10,27 +10,152 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use dmux_engine::db::{probe_server, ReadOnlySession};
+use dmux_engine::db::{probe_server, ReadOnlySession, TlsMode};
 use dmux_engine::inventory::{collect_inventory, DatabaseInventory};
 use dmux_engine::mapping::{self, Mapping};
 use dmux_engine::schema_diff::{compare_inventories, SchemaDiff};
 
 use crate::error::{from_db_error, CommandError};
 use crate::state::AppState;
-use crate::types::{build_profile, parse_tls_mode, ConnectInput};
+use crate::store::StoredProfile;
+use crate::types::{build_profile, parse_tls_mode, ConnectInput, ProfileInput};
 
-/// Resolve a [`ConnectInput`] into an engine profile plus its password, reading
-/// the password from the keychain when the caller did not supply one.
+/// Which connection fields a [`ConnectInput`] is allowed to use, decided by
+/// where the password comes from.
+///
+/// This is the anti-password-theft rule (PLAN 6.5): a password stored in the
+/// keychain belongs to the profile it was saved for, so it must only ever be
+/// sent to that profile's persisted host/port/database/user/encryption — never
+/// to whatever the current UI request happens to supply.
+enum ProfileSource {
+    /// The user typed the password this run: the UI-supplied fields are trusted.
+    Ui(ProfileInput),
+    /// The password comes from the keychain: trust ONLY the stored fields.
+    Stored(StoredProfile),
+}
+
+/// Decide the trusted source of connection fields.
+fn profile_source(input: &ConnectInput, state: &AppState) -> Result<ProfileSource, CommandError> {
+    match &input.password {
+        Some(_) => Ok(ProfileSource::Ui(input.profile.clone())),
+        None => {
+            let stored = state.store()?.get(&input.profile.id)?.ok_or_else(|| {
+                CommandError::ProfileNotFound {
+                    key: input.profile.id.clone(),
+                }
+            })?;
+            Ok(ProfileSource::Stored(stored))
+        }
+    }
+}
+
+/// Build an engine profile from a persisted [`StoredProfile`] and its password,
+/// ignoring any UI-supplied connection fields entirely.
+fn build_profile_from_stored(
+    stored: &StoredProfile,
+    password: String,
+) -> Result<dmux_engine::db::ConnProfile, CommandError> {
+    let input = ProfileInput {
+        id: stored.id.clone(),
+        label: stored.label.clone(),
+        host: stored.host.clone(),
+        port: stored.port,
+        database: stored.database.clone(),
+        user: stored.user.clone(),
+        encryption: stored.encryption.clone(),
+        tls_fingerprint: stored.tls_fingerprint.clone(),
+        plaintext_reason: stored.plaintext_reason.clone(),
+    };
+    let tls = parse_tls_mode(&input)?;
+    Ok(build_profile(&input, password, tls))
+}
+
+/// Resolve a [`ConnectInput`] into an engine profile plus its password.
 fn resolve(
     input: &ConnectInput,
     state: &AppState,
 ) -> Result<dmux_engine::db::ConnProfile, CommandError> {
-    let tls = parse_tls_mode(&input.profile)?;
-    let password = match &input.password {
-        Some(p) => p.clone(),
-        None => state.keychain()?.get(&input.profile.id)?,
-    };
-    Ok(build_profile(&input.profile, password, tls))
+    match profile_source(input, state)? {
+        ProfileSource::Ui(profile) => {
+            let tls = parse_tls_mode(&profile)?;
+            // `profile_source` returned `Ui` only when a password was typed.
+            let password = input.password.clone().unwrap_or_default();
+            Ok(build_profile(&profile, password, tls))
+        }
+        ProfileSource::Stored(stored) => {
+            let password = state.keychain()?.get(&stored.id)?;
+            build_profile_from_stored(&stored, password)
+        }
+    }
+}
+
+/// The actual TLS state of the connection, serialised for the UI.  It is derived
+/// from the profile's [`TlsMode`] (the mode the connection really used), never
+/// guessed or hardcoded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TlsStateDto {
+    Encrypted {
+        verified: bool,
+        fingerprint: Option<String>,
+    },
+    Plaintext {
+        reason: String,
+    },
+}
+
+fn tls_state_from(mode: &TlsMode) -> TlsStateDto {
+    match mode {
+        TlsMode::VerifyFull => TlsStateDto::Encrypted {
+            verified: true,
+            fingerprint: None,
+        },
+        TlsMode::TrustFingerprint(fp) => TlsStateDto::Encrypted {
+            verified: false,
+            fingerprint: Some(fp.clone()),
+        },
+        TlsMode::Disable(reason) => TlsStateDto::Plaintext {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// The `probe_connection` result: the engine's server metadata plus the actual
+/// TLS state the connection used.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProbeResult {
+    pub version_num: i32,
+    pub version_string: String,
+    pub encoding: String,
+    pub collation: String,
+    pub ctype: String,
+    pub lc_monetary: String,
+    pub is_superuser: bool,
+    pub can_write: bool,
+    pub pooler_suspected: bool,
+    pub md5_available: bool,
+    pub sql_ascii: bool,
+    pub tls: TlsStateDto,
+}
+
+impl From<(dmux_engine::db::ServerInfo, TlsStateDto)> for ProbeResult {
+    fn from((info, tls): (dmux_engine::db::ServerInfo, TlsStateDto)) -> Self {
+        Self {
+            version_num: info.version_num,
+            version_string: info.version_string,
+            encoding: info.encoding,
+            collation: info.collation,
+            ctype: info.ctype,
+            lc_monetary: info.lc_monetary,
+            is_superuser: info.is_superuser,
+            can_write: info.can_write,
+            pooler_suspected: info.pooler_suspected,
+            md5_available: info.md5_available,
+            sql_ascii: info.sql_ascii,
+            tls,
+        }
+    }
 }
 
 /// Drive a `!Send` engine future to completion on Tauri's blocking pool.
@@ -74,12 +199,16 @@ pub async fn probe_connection(
     input: ConnectInput,
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
-) -> Result<dmux_engine::db::ServerInfo, CommandError> {
+) -> Result<ProbeResult, CommandError> {
     let profile = resolve(&input, &state)?;
+    let tls = tls_state_from(&profile.tls_mode);
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    drive(move || async move { probe_server(&profile, allow).await.map_err(from_db_error) }).await
+    let info =
+        drive(move || async move { probe_server(&profile, allow).await.map_err(from_db_error) })
+            .await?;
+    Ok(ProbeResult::from((info, tls)))
 }
 
 /// Collect one database's structural inventory (engine-native, no network glue
@@ -593,5 +722,134 @@ mod tests {
             .await
             .expect("probe");
         assert!(info.version_num >= 100000);
+    }
+
+    // --- Anti-password-theft tests (PLAN 6.5) ---
+
+    fn stored_profile(id: &str, host: &str, encryption: &str) -> crate::store::StoredProfile {
+        crate::store::StoredProfile {
+            id: id.to_string(),
+            label: "stored".to_string(),
+            host: host.to_string(),
+            port: 5433,
+            database: "bank".to_string(),
+            user: "dmux_dev".to_string(),
+            encryption: encryption.to_string(),
+            tls_fingerprint: None,
+            plaintext_reason: None,
+        }
+    }
+
+    #[test]
+    fn keychain_path_uses_only_the_stored_fields_not_the_ui_supplied_ones() {
+        let state = test_state();
+        state
+            .store()
+            .unwrap()
+            .save(&stored_profile("stored-1", "127.0.0.1", "verify"))
+            .unwrap();
+
+        // The UI claims a different host and asks to downgrade to plaintext, but
+        // supplies no password — so the keychain password for "stored-1" must be
+        // used, and it must go only to the persisted host/encryption.
+        let input = ConnectInput {
+            profile: ProfileInput {
+                id: "stored-1".to_string(),
+                label: "attacker".to_string(),
+                host: "evil.example.com".to_string(),
+                port: 9999,
+                database: "other".to_string(),
+                user: "other".to_string(),
+                encryption: "allow-plaintext".to_string(),
+                tls_fingerprint: None,
+                plaintext_reason: Some("downgrade".to_string()),
+            },
+            password: None,
+        };
+
+        match profile_source(&input, &state).expect("source") {
+            ProfileSource::Stored(stored) => {
+                assert_eq!(stored.host, "127.0.0.1", "must use the stored host");
+                assert_eq!(stored.port, 5433);
+                assert_eq!(stored.database, "bank");
+                assert_eq!(stored.user, "dmux_dev");
+                assert_eq!(stored.encryption, "verify");
+            }
+            ProfileSource::Ui(_) => panic!("password came from the keychain, not the UI"),
+        }
+    }
+
+    #[test]
+    fn ui_supplied_fields_are_used_only_when_a_password_was_typed() {
+        let state = test_state();
+        // No stored profile is needed: with a typed password the UI fields win.
+        let input = ConnectInput {
+            profile: ProfileInput {
+                id: "anything".to_string(),
+                label: "ui".to_string(),
+                host: "ui.example.com".to_string(),
+                port: 5432,
+                database: "db".to_string(),
+                user: "u".to_string(),
+                encryption: "verify".to_string(),
+                tls_fingerprint: None,
+                plaintext_reason: None,
+            },
+            password: Some("typed-this-run".to_string()),
+        };
+        match profile_source(&input, &state).expect("source") {
+            ProfileSource::Ui(profile) => assert_eq!(profile.host, "ui.example.com"),
+            ProfileSource::Stored(_) => panic!("typed password must use the UI fields"),
+        }
+    }
+
+    #[test]
+    fn stored_profile_cannot_be_downgraded_to_plaintext() {
+        let stored = stored_profile("stored-1", "127.0.0.1", "verify");
+        let profile = build_profile_from_stored(&stored, "pw".to_string()).expect("profile");
+        assert!(
+            matches!(profile.tls_mode, dmux_engine::db::TlsMode::VerifyFull),
+            "a stored `verify` profile must stay encrypted, never downgrade"
+        );
+    }
+
+    #[test]
+    fn resolve_missing_profile_is_a_typed_error_not_a_panic() {
+        let state = test_state();
+        let input = ConnectInput {
+            profile: ProfileInput {
+                id: "no-such-profile".to_string(),
+                label: String::new(),
+                host: "h".to_string(),
+                port: 5432,
+                database: "d".to_string(),
+                user: "u".to_string(),
+                encryption: "verify".to_string(),
+                tls_fingerprint: None,
+                plaintext_reason: None,
+            },
+            password: None,
+        };
+        let err = resolve(&input, &state).unwrap_err();
+        assert!(matches!(err, CommandError::ProfileNotFound { .. }));
+    }
+
+    #[test]
+    fn tls_state_reflects_the_real_mode() {
+        assert!(matches!(
+            tls_state_from(&dmux_engine::db::TlsMode::VerifyFull),
+            TlsStateDto::Encrypted { verified: true, .. }
+        ));
+        assert!(matches!(
+            tls_state_from(&dmux_engine::db::TlsMode::TrustFingerprint("aabb".to_string())),
+            TlsStateDto::Encrypted {
+                verified: false,
+                fingerprint: Some(fp)
+            } if fp == "aabb"
+        ));
+        assert!(matches!(
+            tls_state_from(&dmux_engine::db::TlsMode::Disable("test net".to_string())),
+            TlsStateDto::Plaintext { reason } if reason == "test net"
+        ));
     }
 }

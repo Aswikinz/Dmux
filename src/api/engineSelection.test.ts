@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { isTauri, forcedFixture, resolveEngine } from './engineSelection';
+import { isTauri, mayForceFixture, forcedFixture, resolveEngine } from './engineSelection';
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 afterEach(() => {
-  // Restore a clean window between tests.
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   delete (window as unknown as Record<string, unknown>).__dmuxForcedFixture;
 });
@@ -21,11 +20,29 @@ describe('isTauri', () => {
   });
 });
 
+describe('forcedFixture gating', () => {
+  it('is honoured in a test/dev build outside Tauri', () => {
+    // Vitest runs with MODE === 'test' and PROD === false.
+    (window as unknown as Record<string, unknown>).__dmuxForcedFixture = 'fail';
+    expect(mayForceFixture()).toBe(true);
+    expect(forcedFixture()).toBe('fail');
+  });
+
+  it('is ignored inside Tauri, even in a test build', () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    (window as unknown as Record<string, unknown>).__dmuxForcedFixture = 'fail';
+    expect(mayForceFixture()).toBe(false);
+    expect(forcedFixture()).toBeUndefined();
+  });
+
+  it('is undefined when never set', () => {
+    expect(forcedFixture()).toBeUndefined();
+  });
+});
+
 describe('resolveEngine', () => {
   it('returns the mock in the browser (no Tauri internals)', () => {
     const engine = resolveEngine();
-    expect(engine).toBeDefined();
-    // The mock returns a deterministic mock version, not the backend version.
     return engine.getVersion().then((v) => {
       expect(v).toContain('mock');
     });
@@ -34,31 +51,19 @@ describe('resolveEngine', () => {
   it('returns the real engine inside Tauri', () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     const engine = resolveEngine();
-    // The real engine's getVersion reads from the backend via invoke.
     invoke.mockResolvedValueOnce('0.1.0');
     return engine.getVersion().then((v) => {
       expect(v).toBe('0.1.0');
     });
   });
 
-  it('honours a forced fixture even inside Tauri', () => {
+  it('ignores a forced fixture inside Tauri and uses the real engine', () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     (window as unknown as Record<string, unknown>).__dmuxForcedFixture = 'fail';
     const engine = resolveEngine();
-    // A forced fixture routes to the mock regardless of the Tauri runtime.
+    invoke.mockResolvedValueOnce('0.1.0');
     return engine.getVersion().then((v) => {
-      expect(v).toContain('mock');
+      expect(v).toBe('0.1.0'); // real engine, not the forced mock
     });
-  });
-});
-
-describe('forcedFixture', () => {
-  it('reads the window override', () => {
-    (window as unknown as Record<string, unknown>).__dmuxForcedFixture = 'pass';
-    expect(forcedFixture()).toBe('pass');
-  });
-
-  it('is undefined when not set', () => {
-    expect(forcedFixture()).toBeUndefined();
   });
 });
