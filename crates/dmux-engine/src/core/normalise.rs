@@ -143,8 +143,11 @@ impl PgType {
         if let Some(inner) = s.strip_suffix("[]") {
             return PgType::Array(Box::new(PgType::parse(inner)));
         }
-        let (base, modifier) = match (s.find('('), s.find(')')) {
-            (Some(a), Some(b)) if a < b => {
+        let paren = s
+            .find('(')
+            .and_then(|a| s[a..].find(')').map(|r| (a, a + r)));
+        let (base, modifier) = match paren {
+            Some((a, b)) => {
                 let base = format!("{}{}", s[..a].trim_end(), &s[b + 1..]);
                 (base, Some(&s[a + 1..b]))
             }
@@ -601,13 +604,45 @@ pub async fn resolve_type(
     resolve(client, oid, typmod, 0).await
 }
 
+/// The depth for the next level of type nesting; refuses past the limit.
+fn next_depth(depth: u8) -> Result<u8, CoreError> {
+    if depth >= MAX_TYPE_DEPTH {
+        return Err(CoreError::Plan("type nesting too deep"));
+    }
+    Ok(depth + 1)
+}
+
+/// How one `pg_type` row is resolved.
+#[derive(Debug, PartialEq, Eq)]
+enum TypeKind {
+    Domain,
+    Array,
+    Builtin,
+    Enum,
+    Range,
+    Composite,
+    Unknown,
+}
+
+fn type_kind(typtype: &str, category: &str, elem: u32, schema: &str) -> TypeKind {
+    match typtype {
+        "d" => TypeKind::Domain,
+        // Geometric types also have typelem (point -> float8) but are not arrays.
+        "b" if category == "A" && elem != 0 => TypeKind::Array,
+        // A base type outside pg_catalog may reuse a built-in name.
+        "b" if schema == "pg_catalog" => TypeKind::Builtin,
+        "e" => TypeKind::Enum,
+        "r" => TypeKind::Range,
+        "c" => TypeKind::Composite,
+        _ => TypeKind::Unknown,
+    }
+}
+
 type TypeFuture<'a> = Pin<Box<dyn Future<Output = Result<PgType, CoreError>> + 'a>>;
 
 fn resolve<C: GenericClient>(c: &C, oid: u32, typmod: i32, depth: u8) -> TypeFuture<'_> {
     Box::pin(async move {
-        if depth > MAX_TYPE_DEPTH {
-            return Err(CoreError::Plan("type nesting too deep"));
-        }
+        let next = next_depth(depth)?;
         let row = c
             .query_opt(TYPE_SQL, &[&oid, &typmod])
             .await?
@@ -617,36 +652,34 @@ fn resolve<C: GenericClient>(c: &C, oid: u32, typmod: i32, depth: u8) -> TypeFut
         let elem: u32 = row.try_get(4)?;
         let category: String = row.try_get(5)?;
         let schema: String = row.try_get(7)?;
-        Ok(match typtype.as_str() {
-            "d" => {
-                let base = resolve(c, row.try_get(1)?, row.try_get(2)?, depth + 1).await?;
+        Ok(match type_kind(&typtype, &category, elem, &schema) {
+            TypeKind::Domain => {
+                let base = resolve(c, row.try_get(1)?, row.try_get(2)?, next).await?;
                 PgType::Domain {
                     name,
                     base: Box::new(base),
                 }
             }
-            "b" if category == "A" && elem != 0 => {
-                PgType::Array(Box::new(resolve(c, elem, typmod, depth + 1).await?))
-            }
-            "b" if schema == "pg_catalog" => PgType::parse(&name),
-            "e" => PgType::Enum(name),
-            "r" => {
+            TypeKind::Array => PgType::Array(Box::new(resolve(c, elem, typmod, next).await?)),
+            TypeKind::Builtin => PgType::parse(&name),
+            TypeKind::Enum => PgType::Enum(name),
+            TypeKind::Range => {
                 let sub: Option<u32> = row.try_get(8)?;
                 let sub = sub.ok_or(CoreError::Malformed("range without subtype"))?;
                 PgType::Range {
                     name,
-                    sub: Box::new(resolve(c, sub, -1, depth + 1).await?),
+                    sub: Box::new(resolve(c, sub, -1, next).await?),
                 }
             }
-            "c" => {
+            TypeKind::Composite => {
                 let relid: u32 = row.try_get(6)?;
                 let mut fields = Vec::new();
                 for f in c.query(FIELDS_SQL, &[&relid]).await? {
-                    fields.push(resolve(c, f.try_get(0)?, f.try_get(1)?, depth + 1).await?);
+                    fields.push(resolve(c, f.try_get(0)?, f.try_get(1)?, next).await?);
                 }
                 PgType::Composite { name, fields }
             }
-            _ => PgType::Unknown(name),
+            TypeKind::Unknown => PgType::Unknown(name),
         })
     })
 }
@@ -870,6 +903,82 @@ mod tests {
         assert!(!plan_column(&map(Enum("e".into()), Enum("e".into())))
             .unwrap()
             .needs_review());
+    }
+
+    #[test]
+    fn depth_and_kind_rules() {
+        assert_eq!(next_depth(0), Ok(1));
+        assert_eq!(next_depth(MAX_TYPE_DEPTH - 1), Ok(MAX_TYPE_DEPTH));
+        assert!(next_depth(MAX_TYPE_DEPTH).is_err());
+        use TypeKind as K;
+        let cases = [
+            (("d", "N", 0, "public"), K::Domain),
+            (("b", "A", 701, "pg_catalog"), K::Array),
+            (("b", "A", 701, "public"), K::Array),
+            (("b", "A", 0, "pg_catalog"), K::Builtin),
+            (("b", "G", 701, "pg_catalog"), K::Builtin), // point
+            (("b", "U", 0, "public"), K::Unknown),
+            (("b", "G", 600, "public"), K::Unknown),
+            (("e", "E", 0, "public"), K::Enum),
+            (("r", "R", 0, "pg_catalog"), K::Range),
+            (("c", "C", 0, "public"), K::Composite),
+            (("p", "P", 0, "pg_catalog"), K::Unknown),
+        ];
+        for ((t, c, e, n), want) in cases {
+            assert_eq!(type_kind(t, c, e, n), want, "{t} {c} {e} {n}");
+        }
+    }
+
+    #[test]
+    fn guards_and_boundaries() {
+        // Parentheses in the wrong order never panic or yield a modifier.
+        assert!(matches!(PgType::parse(")numeric("), Unknown(_)));
+        assert!(matches!(PgType::parse("numeric)(1"), Unknown(_)));
+        assert_eq!(
+            same(Array(Box::new(Float4))),
+            "encode(array_send(\"c\"::float4[]), 'hex')"
+        );
+        let (o, n) = exprs(Array(Box::new(Int4)), Text);
+        assert_eq!((o.as_str(), n.as_str()), ("\"c\"::text", "\"c\"::text"));
+        let r = Range {
+            name: "int4range".into(),
+            sub: Box::new(Int4),
+        };
+        assert_eq!(same(r), "\"c\"::text");
+        let comp = Composite {
+            name: "public.c".into(),
+            fields: vec![Array(Box::new(Int4))],
+        };
+        assert!(!plan_column(&map(comp.clone(), comp))
+            .unwrap()
+            .needs_review());
+        // Widening may reach exactly precision 1000.
+        assert_eq!(
+            widened_numeric((999, 0), (999, 1)).unwrap(),
+            "numeric(1000,1)"
+        );
+        assert_eq!(
+            widened_numeric((1000, 0), (1000, 1)),
+            Err(NormaliseError::NumericTooWide)
+        );
+        let mut m = map(Numeric(None), Numeric(None));
+        m.options.round_decimals = Some(MAX_ROUND_DECIMALS);
+        assert!(plan_column(&m).is_ok());
+        // Same scale, different precision: no scale flag. Both unconstrained: none.
+        let p = plan_column(&map(Numeric(Some((10, 2))), Numeric(Some((12, 2))))).unwrap();
+        assert!(!p.flags.contains(&Flag::NumericScaleRaised { scale: 2 }));
+        assert!(plan_column(&map(Numeric(None), Numeric(None)))
+            .unwrap()
+            .flags
+            .is_empty());
+        let p = plan_column(&map(Int4, Int8)).unwrap();
+        assert_eq!(
+            p.flags,
+            vec![Flag::TypeChanged {
+                old: "Int4".into(),
+                new: "Int8".into()
+            }]
+        );
     }
 
     #[test]

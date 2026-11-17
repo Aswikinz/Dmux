@@ -629,6 +629,9 @@ pub(crate) mod tests {
         assert_ne!(Decimal::parse("1.10"), Decimal::parse("1.11"));
         assert_eq!(Decimal::parse("-0.005").unwrap().to_string(), "-0.005");
         assert_eq!(Decimal::parse("42").unwrap().to_string(), "42");
+        assert_eq!(Decimal::ZERO.to_string(), "0");
+        assert_eq!(Decimal::parse("0.00").unwrap().to_string(), "0.00");
+        assert_eq!(Decimal::parse("-0.00").unwrap().to_string(), "0.00");
         let tiny = Decimal::parse(&format!("0.{}1", "0".repeat(37))).unwrap();
         assert!(tiny
             .checked_add(Decimal::parse(&"9".repeat(38)).unwrap())
