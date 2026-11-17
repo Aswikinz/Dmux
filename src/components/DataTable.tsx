@@ -6,7 +6,7 @@ import {
   type RowSelectionState,
 } from '@tanstack/react-table';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { cn } from '../design/cn';
 import { Search } from 'lucide-react';
 
@@ -37,18 +37,28 @@ export function DataTable<T extends object>({
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const parentRef = useRef<HTMLDivElement>(null);
 
-  const filteredData = filterFn
-    ? data.filter((row) => filterFn(row, filter.toLowerCase()))
-    : data.filter((row) =>
-        Object.values(row)
-          .filter((v): v is string => typeof v === 'string')
-          .some((v) => v.toLowerCase().includes(filter.toLowerCase())),
-      );
+  // Memoised: a new array on every render looks like new data to the table,
+  // which resets its state and renders again, and so on without end.
+  const filteredData = useMemo(
+    () =>
+      filterFn
+        ? data.filter((row) => filterFn(row, filter.toLowerCase()))
+        : data.filter((row) =>
+            Object.values(row)
+              .filter((v): v is string => typeof v === 'string')
+              .some((v) => v.toLowerCase().includes(filter.toLowerCase())),
+          ),
+    [data, filter, filterFn],
+  );
 
   const table = useReactTable({
     data: filteredData,
     columns,
     state: enableSelection ? { rowSelection } : undefined,
+    // There is no paging here.  Without this, react-table resets the page index
+    // whenever `data` changes identity, and `filteredData` is a new array on
+    // every render, so any parent re-render would loop forever.
+    autoResetPageIndex: false,
     enableRowSelection: enableSelection,
     onRowSelectionChange: (updater) => {
       const next = typeof updater === 'function' ? updater(rowSelection) : updater;

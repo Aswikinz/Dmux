@@ -23,10 +23,6 @@
   <a href="https://sonarcloud.io/summary/new_code?id=Aswikinz_Dmux"><img src="https://sonarcloud.io/api/project_badges/measure?project=Aswikinz_Dmux&metric=alert_status" alt="Quality Gate Status" /></a>
 </p>
 
-<p align="center">
-  <img src="docs/screenshots/results.png" alt="The Results screen: a prominent FAIL verdict, the coverage line, ignored tables with reasons, and the failure cards" width="860" />
-</p>
-
 Dmux connects **read-only** to an old and a new PostgreSQL database, compares their
 structure and their data, and produces a report a team can sign. It was started for a
 core banking system upgrade, from Postgres 9.x to a current release, but holds nothing
@@ -48,10 +44,13 @@ Download the file for your computer from the
 
 | Your computer | Download | How to install |
 | --- | --- | --- |
-| Windows 10 or 11 | `Dmux_<version>_x64-setup.exe` | Double-click it. It installs for your user only and needs no administrator rights. |
+| Windows 10 or 11 | `Dmux_<version>_x64-setup.exe` | Double-click it. It installs for your user only and needs no administrator rights. It downloads WebView2 if the PC lacks it. |
+| Windows, no internet | `Dmux_<version>_x64-offline-setup.exe` | The same installer, carrying Microsoft's WebView2 component for PCs that cannot download it. About 130 MB larger. |
+| Windows, locked down | `Dmux_<version>_x64-portable.zip` | Unzip anywhere and run `dmux-app.exe`. No install, no administrator rights. Needs WebView2 already on the PC (see `README.txt` in the zip). |
 | Windows, managed by IT | `Dmux_<version>_x64_en-US.msi` | For central deployment by your IT team. |
 | Ubuntu or Debian | `Dmux_<version>_amd64.deb` | `sudo apt install ./Dmux_<version>_amd64.deb` |
 | Fedora or RHEL | `Dmux-<version>-1.x86_64.rpm` | `sudo dnf install ./Dmux-<version>-1.x86_64.rpm` |
+| Any Linux, sandboxed | `Dmux_<version>_x86_64.flatpak` | `flatpak install --user ./Dmux_<version>_x86_64.flatpak`, then run `flatpak run verify.dmux.desktop`. |
 | Any Linux, no install | `Dmux_<version>_amd64.AppImage` | `chmod +x Dmux_*.AppImage`, then run it. Needs FUSE 2. |
 | A server, command line only | `dmux-x86_64-unknown-linux-musl` or `dmux-x86_64-pc-windows-msvc.exe` | Copy it to the server and run it; nothing else to install. |
 
@@ -90,35 +89,19 @@ and choose **Test connection** on each. Dmux shows **Connected** and what it che
 Passwords go to your system keychain; on a computer without one, Dmux keeps the
 password in memory until you close the app.
 
-<p align="center"><img src="docs/screenshots/connect.png" alt="The Connect screen with both databases connected" width="760" /></p>
-
 **3. Compare structure, then map.** Dmux lists every table, column, index and constraint
 side by side (red is missing, green is added, amber is changed, with the old and new
 type). On **Map**, approve or ignore the few pairings it could not make on its own;
 every ignored item needs a reason, which goes into the report.
-
-<p align="center"><img src="docs/screenshots/compare-structure.png" alt="The Compare structure screen with a changed column type shown as before and after" width="760" /></p>
 
 **4. Choose checks and run.** Pick a preset, or set each table to **Structure only**,
 **Counts and totals**, or **Full values**. Dmux shows how long it expects to take. Start
 the run; you can pause or cancel it at any time, and the verdict appears as soon as it
 ends.
 
-<p align="center">
-  <img src="docs/screenshots/choose-checks.png" alt="The Choose checks screen with presets and per-table levels" width="420" />
-  <img src="docs/screenshots/run.png" alt="The Run screen showing a FAIL verdict as soon as the run ends" width="420" />
-</p>
-
 **5. Read the results and save the report.** The verdict comes first, then the coverage
 line, everything that was ignored and why, and a card for each failing table. On
 **Report**, save a PDF summary to sign and an Excel workbook with the detail.
-
-<p align="center">
-  <img src="docs/screenshots/report.png" alt="The Report screen with Export PDF and Export Excel" width="420" />
-  <img src="docs/screenshots/results-dark.png" alt="The Results screen in dark mode" width="420" />
-</p>
-
-<sub>Screenshots use Dmux's built-in demo data.</sub>
 
 ### What the verdicts mean
 
@@ -154,7 +137,8 @@ dmux report --results results.json --pdf report.pdf --xlsx report.xlsx
 ```
 
 `dmux capture` and `dmux compare` save a database's fingerprint to a file and compare it
-later, for upgrades where both databases are never online together. See the
+later, for upgrades where both databases are never online together. The desktop app can open
+the results file from its History screen and checks it the same way `dmux report` does. See the
 [user guide](docs/guide/user-guide.md) for every option.
 
 ## Build from source

@@ -1,9 +1,11 @@
 //! Managed Tauri state shared by every command.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::CommandError;
+use crate::history::{self, Opened, OpenedResults, RunMetaTable};
 use crate::run_manager::RunManager;
 use crate::secrets::{Keychain, PasswordStore, SessionPasswords};
 use crate::store::Store;
@@ -17,13 +19,20 @@ pub struct AppState {
     /// exit.
     pub session_passwords: Mutex<SessionPasswords>,
     /// The SQLite profile store, opened at startup.
-    pub store: Mutex<Store>,
+    pub store: Arc<Mutex<Store>>,
+    /// Metadata of in-progress runs (start time, profile labels), used when a
+    /// finished run is written to the history.
+    pub run_meta: RunMetaTable,
+    /// Verified results opened from history or a file, by fresh run id.
+    pub opened: Mutex<OpenedResults>,
     /// The registry of in-progress runs (the data half).
     pub runs: Arc<RunManager>,
     /// The app data directory (home of the profile and resume stores).
     pub data_dir: PathBuf,
     /// Keeps the computer awake while a run works (T068).
     pub sleep: Arc<dyn crate::sleep::SleepInhibitor>,
+    /// A Python shipped next to the app (its `python/` resource folder), if any.
+    pub bundled_python: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -45,16 +54,74 @@ impl AppState {
         std::fs::create_dir_all(&data_dir).map_err(|e| CommandError::Store {
             message: format!("cannot create app data dir: {e}"),
         })?;
-        let store = Store::open(&data_dir.join("dmux.db"))?;
+        let store = Arc::new(Mutex::new(Store::open(&data_dir.join("dmux.db"))?));
+        let run_meta: RunMetaTable = Arc::new(Mutex::new(HashMap::new()));
+        let runs = Arc::new(RunManager::default());
+        // A finished run is written to the local history (results file + row).
+        {
+            let store = Arc::clone(&store);
+            let meta = Arc::clone(&run_meta);
+            let dir = history::history_dir(&data_dir);
+            runs.set_on_done(Arc::new(move |run_id, results| {
+                let run_meta = meta
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(run_id);
+                // A failure to record history never changes the run's outcome.
+                let _ = history::persist_finished(&store, &dir, run_meta.as_ref(), run_id, results);
+            }));
+        }
         Ok(Self {
             keychain: Mutex::new(keychain),
             session_passwords: Mutex::new(SessionPasswords::default()),
-            store: Mutex::new(store),
-            runs: Arc::new(RunManager::default()),
+            store,
+            run_meta,
+            opened: Mutex::new(OpenedResults::default()),
+            runs,
             data_dir,
             // Tests use this constructor: never touch the real power manager.
             sleep: Arc::new(crate::sleep::NoInhibitor),
+            bundled_python: Mutex::new(None),
         })
+    }
+
+    /// The folder of stored results files.
+    pub fn history_dir(&self) -> PathBuf {
+        history::history_dir(&self.data_dir)
+    }
+
+    /// Remember a run's start time and profile labels for its history row.
+    pub fn note_run_start(&self, run_id: &str, old_label: &str, new_label: &str) {
+        self.run_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                run_id.to_string(),
+                history::RunMeta {
+                    started_at: history::now_secs(),
+                    old_label: old_label.to_string(),
+                    new_label: new_label.to_string(),
+                },
+            );
+    }
+
+    /// Register verified results under a fresh run id; returns the id.
+    pub fn register_opened(&self, opened: Opened) -> Result<String, CommandError> {
+        let id = history::fresh_opened_id();
+        self.opened
+            .lock()
+            .map_err(|_| CommandError::internal("opened results lock poisoned"))?
+            .insert(id.clone(), opened);
+        Ok(id)
+    }
+
+    /// Verified results previously registered under `id`.
+    pub fn opened_results(&self, id: &str) -> Result<Option<Opened>, CommandError> {
+        Ok(self
+            .opened
+            .lock()
+            .map_err(|_| CommandError::internal("opened results lock poisoned"))?
+            .get(id))
     }
 
     /// A guard over the profile store (locks the store mutex).
@@ -75,6 +142,21 @@ impl AppState {
 
     /// Drop every session password (called when the app exits).  A poisoned
     /// lock is recovered so the secrets are still zeroed.
+    /// The bundled interpreter, if the app ships one.
+    pub fn bundled_python(&self) -> Option<PathBuf> {
+        self.bundled_python
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_bundled_python(&self, path: Option<PathBuf>) {
+        *self
+            .bundled_python
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+    }
+
     pub fn clear_session_passwords(&self) {
         match self.session_passwords.lock() {
             Ok(mut g) => g.clear(),

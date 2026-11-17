@@ -759,12 +759,24 @@ describe('RunScreen', () => {
     };
     let state: RunProgress = { ...runningProgress };
     const engine: Engine = {
+      ...createMockEngine(),
       setSuperuserOverride: () => {},
       testConnection: async () => ({ ok: true }),
       saveProfile: async (profile) => ({ profile }),
       profileHasPassword: async () => false,
+      listProfiles: async () => [],
+      deleteProfile: async () => false,
+      listHistory: async () => [],
+      openHistoryEntry: async () => { throw new Error('not in history'); },
+      openResultsFile: async () => ({ ok: false, cancelled: true }),
+      getHistoryLog: async () => '',
+      saveHistoryLog: async () => ({ ok: false, cancelled: true }),
+      purgeHistory: async () => 0,
       compareStructure: async () => ({ schemas: [], oldEncoding: 'UTF8', newEncoding: 'UTF8', oldCollation: 'C', newCollation: 'C' }),
       buildMapping: async () => ({ rules: [], matches: [], needsAttention: [], ignored: [] }),
+      editMapping: async (mapping) => mapping,
+      previewRules: async () => ({ tablesTotal: 0, tablesByRules: 0, tablesMatched: 0 }),
+      rebuildMapping: async () => ({ rules: [], matches: [], needsAttention: [], ignored: [] }),
       saveMapping: async () => ({ hash: 'h', json: '{}' }),
       buildCheckPlan: async () => ({ tables: [], presets: [], estimateSecondsMin: 1, estimateSecondsMax: 2 }),
       startRun: async () => state,
@@ -1102,23 +1114,19 @@ describe('ReportScreen', () => {
     ).toBeDefined();
   });
 
-  it('exports a PDF and shows the saved path', async () => {
+  it('the browser demo says plainly that it saves no file, never a fake path', async () => {
     const engine = createMockEngine();
     wrap(
       <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
     );
     fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
-    expect(await screen.findByText(/report saved/)).toBeDefined();
-  });
-
-  it('exports Excel and toggles row keys', async () => {
-    const engine = createMockEngine();
-    wrap(
-      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
-    );
+    expect(await screen.findByText(/browser demo, so no PDF file was saved/)).toBeDefined();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+    expect(screen.queryByText(/chosen-location/)).toBeNull();
+    expect(screen.queryByText('Export failed')).toBeNull();
     fireEvent.click(screen.getByRole('checkbox'));
     fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
-    expect(await screen.findByText(/report saved/)).toBeDefined();
+    expect(await screen.findByText(/browser demo, so no Excel file was saved/)).toBeDefined();
   });
 
   it('shows an error when export fails', async () => {

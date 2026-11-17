@@ -12,8 +12,10 @@ they only show that a file matches what this project's release process published
 
 ## What a release gives you
 
-Every release page lists the installers, the command-line program, and three
-kinds of evidence you can check:
+Every release page lists the installers (Windows setup, offline setup, portable
+zip and MSI; Linux deb, rpm, AppImage and Flatpak), the command-line program, the
+software bills of materials, and three kinds of evidence you can check. All of
+these files are covered by `SHA256SUMS` and have a build-provenance attestation:
 
 - **`SHA256SUMS`** — a checksums file. It lists a short code (a SHA-256
   fingerprint) for every file in the release. If a file has been changed even a

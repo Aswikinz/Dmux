@@ -1296,6 +1296,7 @@ name = "dmux-app"
 version = "1.0.0"
 dependencies = [
  "dmux-engine",
+ "dmux-hooks",
  "dmux-report",
  "hex",
  "keepawake",
@@ -1334,8 +1335,10 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "flate2",
+ "futures-util",
  "hex",
  "jiff",
+ "md-5",
  "proptest",
  "rcgen",
  "rusqlite",

@@ -1,15 +1,23 @@
 import type { Engine } from './engine';
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
+  HistoryEntry,
+  OpenResultsResult,
   CoverageSummary,
   DrillDownRow,
   FailureCard,
   IgnoreItem,
   Inventory,
   Mapping,
+  MappingEdit,
+  MappingItemRef,
   MappingMatch,
+  MappingRule,
+  RulePreview,
   ReportRequest,
   ReportResult,
   Results,
@@ -178,12 +186,152 @@ const makeMapping = (inventory: Inventory): Mapping => {
     });
   });
 
-  return {
+  const mapping: Mapping = {
     rules: ['identity mapping'],
+    ruleSpecs: [],
     matches,
     needsAttention,
     ignored: [],
+    suggestions: [],
+    unmatchedNew: [],
   };
+
+  // A differing inventory also has old tables with no partner, so the screen
+  // can show suggestions, the pairing picker and the duplicate-target refusal.
+  const differs = inventory.schemas.some((sc) =>
+    sc.children?.some((t) => t.status === 'missing'),
+  );
+  if (differs) {
+    const schema = 'demo_bank';
+    const unmatched = (table: string, column?: string): MappingItemRef => ({
+      schema,
+      table,
+      ...(column ? { column } : {}),
+    });
+    for (const table of ['legacy_ledger', 'ledger_old', 'audit_trail']) {
+      const ref = unmatched(table);
+      mapping.needsAttention.push({
+        id: `${schema}.${table}`,
+        oldName: `${schema}.${table}`,
+        newName: '',
+        confidence: 'fuzzy',
+        approved: false,
+        ref,
+      });
+    }
+    mapping.suggestions = [
+      { id: `${schema}.legacy_ledger`, ref: unmatched('legacy_ledger'), candidate: 'ledger_entries', confidence: 82 },
+      { id: `${schema}.ledger_old`, ref: unmatched('ledger_old'), candidate: 'ledger_entries', confidence: 61 },
+    ];
+    mapping.unmatchedNew = ['ledger_entries', 'audit_log', 'customer_notes'].map((table) => ({
+      id: `${schema}.${table}`,
+      ref: unmatched(table),
+    }));
+  }
+  return mapping;
+};
+
+/** Apply edits to a mock mapping with the same refusals the backend makes. */
+const editMockMapping = (mapping: Mapping, edits: MappingEdit[]): Mapping => {
+  let next: Mapping = {
+    ...mapping,
+    matches: [...mapping.matches],
+    needsAttention: [...mapping.needsAttention],
+    ignored: [...mapping.ignored],
+    suggestions: [...(mapping.suggestions ?? [])],
+    unmatchedNew: [...(mapping.unmatchedNew ?? [])],
+  };
+  for (const edit of edits) {
+    if (edit.kind === 'ignore') {
+      if (!edit.reason.trim()) throw new Error('a reason is required to ignore an item');
+      next = {
+        ...next,
+        matches: next.matches.filter((m) => m.id !== edit.path),
+        needsAttention: next.needsAttention.filter((m) => m.id !== edit.path),
+        suggestions: next.suggestions!.filter((x) => x.id !== edit.path),
+        ignored: [
+          ...next.ignored.filter((i) => i.id !== edit.path),
+          { id: edit.path, name: edit.path, reason: edit.reason.trim() },
+        ],
+      };
+    } else if (edit.kind === 'pair_table') {
+      const id = `${edit.schema}.${edit.table}`;
+      const target = `${edit.schema}.${edit.newTable}`;
+      const owner = next.matches.find((m) => m.newName === target && m.id !== id);
+      if (owner) {
+        throw new Error(
+          `${owner.oldName} is already paired with ${target}. Two old tables cannot map to one new table: unpair one of them first.`,
+        );
+      }
+      next = {
+        ...next,
+        matches: [
+          ...next.matches.filter((m) => m.id !== id),
+          {
+            id,
+            oldName: id,
+            newName: target,
+            confidence: 'confirmed',
+            approved: true,
+            ref: { schema: edit.schema, table: edit.table },
+          },
+        ],
+        needsAttention: next.needsAttention.filter((m) => m.id !== id),
+        suggestions: next.suggestions!.filter((x) => x.id !== id),
+        unmatchedNew: next.unmatchedNew!.filter(
+          (u) => !(u.ref.column === undefined && u.ref.table === edit.newTable),
+        ),
+        ignored: next.ignored.filter((i) => i.id !== id),
+      };
+    } else {
+      const id = `${edit.schema}.${edit.table}.${edit.column}`;
+      const owner = next.matches.find(
+        (m) => m.ref?.column !== undefined && m.ref.table === edit.table && m.newName === edit.newColumn && m.id !== id,
+      );
+      if (owner) {
+        throw new Error(
+          `${owner.oldName} is already paired with ${edit.newColumn}. Two old columns cannot map to one new column: unpair one of them first.`,
+        );
+      }
+      next = {
+        ...next,
+        matches: [
+          ...next.matches.filter((m) => m.id !== id),
+          {
+            id,
+            oldName: `${edit.table}.${edit.column}`,
+            newName: edit.newColumn,
+            confidence: 'confirmed',
+            approved: true,
+            ref: { schema: edit.schema, table: edit.table, column: edit.column },
+          },
+        ],
+        needsAttention: next.needsAttention.filter((m) => m.id !== id),
+        suggestions: next.suggestions!.filter((x) => x.id !== id),
+        unmatchedNew: next.unmatchedNew!.filter(
+          (u) => !(u.ref.column === edit.newColumn && u.ref.table === edit.table),
+        ),
+      };
+    }
+  }
+  return next;
+};
+
+/** How the mock counts the tables a rule set would pair. */
+const previewMockRules = (inventory: Inventory | null, rules: MappingRule[]): RulePreview => {
+  const names = (inventory?.schemas ?? []).flatMap((sc) =>
+    (sc.children ?? []).filter((t) => t.status !== 'added').map((t) => ({ schema: sc.name, table: t.name })),
+  );
+  const byRules = names.filter(({ schema, table }) =>
+    rules.some((r) =>
+      r.kind === 'prefix_replace'
+        ? table.startsWith(r.pattern)
+        : r.kind === 'suffix_replace'
+          ? table.endsWith(r.pattern)
+          : schema.toLowerCase() === r.pattern.toLowerCase(),
+    ),
+  ).length;
+  return { tablesTotal: names.length, tablesByRules: byRules, tablesMatched: Math.min(names.length, byRules + 2) };
 };
 
 const makeCheckPlan = (tableCount: number): CheckPlan => {
@@ -198,10 +346,11 @@ const makeCheckPlan = (tableCount: number): CheckPlan => {
     if (hasBalance) controls.push('balance');
     tables.push({
       tableId: deterministicId('tbl', i),
-      schemaName: 'demo_bank',
+      schemaName: i % 10 === 9 ? 'archive' : 'demo_bank',
       tableName: `table_${i.toString().padStart(4, '0')}`,
       level,
-      controlTotalColumns: controls.length ? controls : undefined,
+      controlTotalSuggestions: controls.length ? controls : undefined,
+      sizeBytes: (i + 1) * 3 * 1024 * 1024,
     });
   }
   return {
@@ -475,9 +624,46 @@ export const fixtureNames: FixtureName[] = [
   'cancelled',
 ];
 
+/** Two stable history entries so the History screen has something to show. */
+const seedHistory = (): HistoryEntry[] => [
+  {
+    id: 'run-fail-hist-0002',
+    startedAt: '2026-11-16T09:12:00Z',
+    endedAt: '2026-11-16T09:48:30Z',
+    verdict: 'FAIL',
+    optionsApplied: false,
+    optionsRecorded: true,
+    coverage: fixtures.fail.coverage
+      ? `${fixtures.fail.coverage.fullValuesTables} of ${fixtures.fail.coverage.totalTables} tables fully checked, ${fixtures.fail.coverage.countsTables} counts only, ${fixtures.fail.coverage.structureTables} structure only, ${fixtures.fail.coverage.ignoredTables} ignored`
+      : '',
+    oldLabel: 'Old database',
+    newLabel: 'New database',
+    mappingHash: 'mock-map-2',
+    definitionHash: 'mock-def-2',
+    resultsSha256: 'mock-sha-2',
+  },
+  {
+    id: 'run-pass-hist-0001',
+    startedAt: '2026-11-15T14:00:00Z',
+    endedAt: '2026-11-15T14:21:10Z',
+    verdict: 'PASS',
+    optionsApplied: false,
+    optionsRecorded: true,
+    coverage: `${fixtures.pass.coverage.fullValuesTables} of ${fixtures.pass.coverage.totalTables} tables fully checked, ${fixtures.pass.coverage.countsTables} counts only, ${fixtures.pass.coverage.structureTables} structure only, ${fixtures.pass.coverage.ignoredTables} ignored`,
+    oldLabel: 'Old database',
+    newLabel: 'New database',
+    mappingHash: 'mock-map-1',
+    definitionHash: 'mock-def-1',
+    resultsSha256: 'mock-sha-1',
+  },
+];
+
 export interface MockEngineOptions {
   /** Force a fixture for results; otherwise the engine uses the runId suffix. */
   forcedFixture?: FixtureName;
+  /** What "Open a results file" does in the mock: open a verified file
+   *  (default), report a dismissed dialog, or refuse a changed file. */
+  openFile?: 'opened' | 'cancelled' | 'tampered';
 }
 
 /**
@@ -487,12 +673,31 @@ export interface MockEngineOptions {
  * inputs so tests are stable.
  */
 export function createMockEngine(options: MockEngineOptions = {}): Engine {
+  // Custom checks start off, like the real app.
+  const settings: AppSettings = {
+    customChecksEnabled: false,
+    pythonSource: 'auto',
+    pythonFound: '/usr/bin/python3',
+    timeoutSecs: 60,
+    startingLevel: 'suggested',
+    oldParallelism: 2,
+    newParallelism: 4,
+    includeKeysDefault: false,
+    appVersion: version,
+    dataDir: '/home/you/.local/share/verify.dmux.desktop',
+    licence: 'Apache-2.0',
+    warning: 'A custom check runs with your full permissions. Only run scripts you trust.',
+  };
   let currentRunId = 0;
+  let lastInventory: Inventory | null = null;
   let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
   // the backend's "password lives in the keychain, not in the profile" shape so
   // `saveProfile` / `profileHasPassword` behave like the real engine.
   const savedPasswords = new Map<string, string>();
+  const savedProfiles = new Map<string, ConnectionProfile>();
+  let history = seedHistory();
+  let openedCount = 0;
 
   return {
     setSuperuserOverride(override): void {
@@ -560,12 +765,22 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       if (password) {
         savedPasswords.set(profile.id, password);
       }
+      savedProfiles.set(profile.id, { ...profile });
       // The mock always has a working keychain, so there is no warning.
       return { profile };
     },
 
     async profileHasPassword(id: string): Promise<boolean> {
       return savedPasswords.has(id);
+    },
+
+    async listProfiles(): Promise<ConnectionProfile[]> {
+      return [...savedProfiles.values()].sort((a, b) => a.label.localeCompare(b.label));
+    },
+
+    async deleteProfile(id: string): Promise<boolean> {
+      savedPasswords.delete(id);
+      return savedProfiles.delete(id);
     },
 
     async compareStructure(
@@ -579,7 +794,25 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     },
 
     async buildMapping(inventory: Inventory): Promise<Mapping> {
+      lastInventory = inventory;
       return makeMapping(inventory);
+    },
+
+    async editMapping(mapping: Mapping, edits: MappingEdit[]): Promise<Mapping> {
+      return editMockMapping(mapping, edits);
+    },
+
+    async previewRules(rules: MappingRule[]): Promise<RulePreview> {
+      return previewMockRules(lastInventory, rules);
+    },
+
+    async rebuildMapping(rules: MappingRule[]): Promise<Mapping> {
+      const base = makeMapping(lastInventory ?? baseInventory());
+      return {
+        ...base,
+        rules: rules.map((r) => `${r.kind}: ${r.pattern} -> ${r.target}`),
+        ruleSpecs: rules,
+      };
     },
 
     async saveMapping(mapping: Mapping): Promise<{ hash: string; json: string }> {
@@ -631,11 +864,118 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       return fixtures[fixture] ?? fixtures.pass;
     },
 
-    async exportReport(request: ReportRequest): Promise<ReportResult> {
-      // The mock never touches a real path: it reports a placeholder destination
-      // so the "saved to …" message stays meaningful.
-      const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
-      return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the demo saves nothing
+    async exportReport(_request: ReportRequest): Promise<ReportResult> {
+      // The browser demo has no file system and no save dialog. Say so plainly
+      // instead of pretending a file was saved somewhere.
+      return { ok: false, demoOnly: true };
+    },
+
+    async getSettings(): Promise<AppSettings> {
+      return { ...settings };
+    },
+    async updateSettings(update: AppSettingsUpdate): Promise<AppSettings> {
+      if (update.customChecksEnabled !== undefined) {
+        settings.customChecksEnabled = update.customChecksEnabled;
+      }
+      if (update.timeoutSecs !== undefined) {
+        settings.timeoutSecs = update.timeoutSecs;
+      }
+      if (update.startingLevel !== undefined) settings.startingLevel = update.startingLevel;
+      if (update.oldParallelism !== undefined) settings.oldParallelism = update.oldParallelism;
+      if (update.newParallelism !== undefined) settings.newParallelism = update.newParallelism;
+      if (update.includeKeysDefault !== undefined) {
+        settings.includeKeysDefault = update.includeKeysDefault;
+      }
+      return { ...settings };
+    },
+    async chooseHooksFolder(): Promise<AppSettings> {
+      // The mock "dialog" always picks a sample folder with one good script and
+      // one that is refused, so the Settings screen shows both states.
+      settings.hooksFolder = '/home/you/custom-checks';
+      settings.folderScan = {
+        scripts: [
+          { name: 'balance_totals.py', usable: true },
+          { name: 'shared_script.py', usable: false, reason: 'other users on this computer can change it; make it writable only by you' },
+        ],
+      };
+      return { ...settings };
+    },
+    async clearHooksFolder(): Promise<AppSettings> {
+      settings.hooksFolder = undefined;
+      settings.folderScan = undefined;
+      return { ...settings };
+    },
+    async choosePython(): Promise<AppSettings> {
+      settings.pythonPath = '/usr/bin/python3';
+      settings.pythonFound = '/usr/bin/python3';
+      settings.pythonSource = 'chosen';
+      return { ...settings };
+    },
+    async clearPython(): Promise<AppSettings> {
+      settings.pythonPath = undefined;
+      settings.pythonFound = '/usr/bin/python3';
+      settings.pythonSource = 'auto';
+      return { ...settings };
+    },
+
+    async listHistory(): Promise<HistoryEntry[]> {
+      return history.map((h) => ({ ...h }));
+    },
+
+    async openHistoryEntry(id: string): Promise<Results> {
+      const entry = history.find((h) => h.id === id);
+      if (!entry) {
+        throw new Error('That run is not in the history.');
+      }
+      openedCount += 1;
+      const fixture = extractFixture(entry.id);
+      return { ...fixtures[fixture], runId: `run-${fixture}-opened-${openedCount}` };
+    },
+
+    async openResultsFile(): Promise<OpenResultsResult> {
+      if (options.openFile === 'cancelled') {
+        return { ok: false, cancelled: true };
+      }
+      if (options.openFile === 'tampered') {
+        return {
+          ok: false,
+          error:
+            'This results file has been changed since Dmux wrote it, so it cannot be trusted and is not shown.',
+        };
+      }
+      openedCount += 1;
+      return { ok: true, results: { ...fixtures.fail, runId: `run-fail-opened-${openedCount}` } };
+    },
+
+    async getHistoryLog(id: string): Promise<string> {
+      const entry = history.find((h) => h.id === id);
+      if (!entry) {
+        throw new Error('That run is not in the history.');
+      }
+      return [
+        'Dmux run log',
+        'tool_version: 0.0.1-mock',
+        `run_id: ${entry.id}`,
+        `mapping_hash: ${entry.mappingHash}`,
+        `definition_hash: ${entry.definitionHash}`,
+        `verdict: ${entry.verdict}`,
+        `coverage: ${entry.coverage}`,
+        `results_sha256: ${entry.resultsSha256}`,
+        '',
+      ].join('\n');
+    },
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the demo saves nothing
+    async saveHistoryLog(_id: string): Promise<ReportResult> {
+      // The browser demo has no file system: say so, never a fake path.
+      return { ok: false, demoOnly: true };
+    },
+
+    async purgeHistory(): Promise<number> {
+      const removed = history.length;
+      history = [];
+      return removed;
     },
 
     async getVersion(): Promise<string> {

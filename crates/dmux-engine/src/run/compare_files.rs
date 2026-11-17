@@ -38,7 +38,7 @@ use super::{
     apply_replica, checkpoint, connection_info, connection_warnings, counters, definition_hash,
     epoch, epoch_changed, foreign_tables_set, inventory, live_table, map_table, note_paused,
     register, replica, replica_outcome, scan_counts, scan_fingerprint, settle, track_counts_on,
-    wal, Input, RunConfig, RunError, RunOutcome,
+    wal, HashMode, Input, RunConfig, RunError, RunOutcome,
 };
 
 /// The run warning when a side has no inventory to compare.
@@ -285,6 +285,15 @@ pub async fn compare_file_to_live(
         definition_hash(config),
     );
     b.set_sql_ascii(file.server.sql_ascii || info.sql_ascii);
+    // md5 unavailable on the live server (FIPS): hash it in the app (PLAN 2.2).
+    let live_mode = HashMode::of(info.md5_available);
+    let live_side_name = match file_side {
+        Side::Old => "new",
+        Side::New => "old",
+    };
+    if let Some(w) = super::app_hash_warning(live_side_name, live_mode) {
+        b.results.warnings.push(w);
+    }
     if file.server.sql_ascii {
         b.results
             .warnings
@@ -506,6 +515,7 @@ pub async fn compare_file_to_live(
             lt,
             file_side,
             &file.mapping_hash,
+            live_mode,
         )
         .await;
         // A stop during the scans is never recorded as the table's result.
@@ -591,6 +601,7 @@ async fn file_live_pair(
     live_name: &str,
     file_side: Side,
     mapping_hash: &str,
+    live_mode: HashMode,
 ) -> Evidence {
     let level = cap.level;
     let fault = |why: String| {
@@ -749,7 +760,7 @@ async fn file_live_pair(
                     return e;
                 }
             };
-            match scan_fingerprint(s, &plan, Side::Old, &src, mapping_hash).await {
+            match scan_fingerprint(s, &plan, Side::Old, &src, mapping_hash, live_mode, None).await {
                 Ok(live_fp) => {
                     let (o, n) = orient(captured_fp(cap, mapping_hash), live_fp);
                     match compare(SideOutcome::Ok(&o), SideOutcome::Ok(&n)) {

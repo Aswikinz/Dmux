@@ -15,18 +15,28 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Engine } from './engine';
 import type {
+  AppSettings,
+  AppSettingsUpdate,
+  CustomSeverity,
   CheckLevel,
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
   CoverageSummary,
+  HistoryEntry,
   DrillDownRow,
   FailureCard,
   Inventory,
   Mapping,
   MappingMatch,
+  MappingEdit,
+  MappingRule,
+  MappingSuggestion,
+  RulePreview,
+  UnmatchedNewItem,
   IgnoreItem,
   MatchConfidence,
+  OpenResultsResult,
   ReportRequest,
   ReportResult,
   Results,
@@ -169,14 +179,27 @@ interface RawMappingBuild {
 
 interface RawAttentionEntry {
   path: string;
+  schema: string;
+  table: string | null;
+  column: string | null;
   issue: string;
   candidates: string[];
 }
 
 interface RawSuggestionEntry {
   path: string;
+  schema: string;
+  table: string | null;
+  column: string | null;
   candidate: string;
   confidence: number;
+}
+
+/** `preview_rules` -> `RulePreview`. */
+interface RawRulePreview {
+  tables_total: number;
+  tables_by_rules: number;
+  tables_matched: number;
 }
 
 /** The `export_mapping` command's payload. */
@@ -214,6 +237,47 @@ interface BackendProfile {
 /** Shape `export_report` returns (`commands::report::ExportReportResult`). */
 type RawExportReport = { status: 'saved'; path: string } | { status: 'cancelled' };
 
+/** `commands::history::OpenResultsOutcome`. */
+type RawOpenResults = { status: 'opened'; results: RawResults } | { status: 'cancelled' };
+
+/** `store::HistoryRow`. */
+interface RawHistoryRow {
+  id: string;
+  started_at: number;
+  ended_at: number;
+  verdict: string;
+  options_applied: boolean;
+  options_recorded: boolean;
+  coverage_line: string;
+  old_label: string;
+  new_label: string;
+  mapping_hash: string;
+  definition_hash: string;
+  results_sha256: string;
+}
+
+function isoFromSeconds(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function translateHistoryRow(raw: RawHistoryRow): HistoryEntry {
+  return {
+    id: raw.id,
+    startedAt: isoFromSeconds(raw.started_at),
+    endedAt: isoFromSeconds(raw.ended_at),
+    // Anything outside the engine vocabulary is a non-PASS tool fault.
+    verdict: mapVerdict(raw.verdict),
+    optionsApplied: raw.options_applied,
+    optionsRecorded: raw.options_recorded,
+    coverage: raw.coverage_line,
+    oldLabel: raw.old_label,
+    newLabel: raw.new_label,
+    mappingHash: raw.mapping_hash,
+    definitionHash: raw.definition_hash,
+    resultsSha256: raw.results_sha256,
+  };
+}
+
 interface RawSaveProfileResult {
   profile: BackendProfile;
   warning: string | null;
@@ -228,7 +292,9 @@ interface RawTableCheck {
   schema_name: string;
   table_name: string;
   level: EngineLevel;
+  /** The columns Dmux suggests; none is a control total until confirmed. */
   control_total_columns: string[] | null;
+  size_bytes?: number;
 }
 
 interface RawCheckPlan {
@@ -330,6 +396,89 @@ interface RawResults {
   options_applied: boolean;
   options_recorded: boolean;
   warnings: string[];
+  custom_checks?: {
+    findings: { id: string; severity: string; message: string; table: string | null }[];
+    scripts: { name: string; sha256: string }[];
+    warnings: string[];
+  } | null;
+}
+
+interface RawSettings {
+  custom_checks_enabled: boolean;
+  hooks_folder: string | null;
+  scan: {
+    folder_problem: string | null;
+    scripts: { name: string; usable: boolean; reason: string | null }[];
+  } | null;
+  python_path: string | null;
+  python_source: 'chosen' | 'bundled' | 'auto';
+  python_found: string | null;
+  timeout_secs: number;
+  warning: string;
+  starting_level: string;
+  old_parallelism: number;
+  new_parallelism: number;
+  include_keys_default: boolean;
+  app_version: string;
+  data_dir: string;
+  licence: string;
+}
+
+/** Map the backend settings; text from the file system stays plain text. */
+export function translateSettings(raw: RawSettings): AppSettings {
+  return {
+    customChecksEnabled: raw.custom_checks_enabled,
+    hooksFolder: raw.hooks_folder ?? undefined,
+    folderScan: raw.scan
+      ? {
+          folderProblem: raw.scan.folder_problem ?? undefined,
+          scripts: raw.scan.scripts.map((s) => ({
+            name: s.name,
+            usable: s.usable,
+            reason: s.reason ?? undefined,
+          })),
+        }
+      : undefined,
+    pythonPath: raw.python_path ?? undefined,
+    pythonSource: raw.python_source,
+    pythonFound: raw.python_found ?? undefined,
+    timeoutSecs: raw.timeout_secs,
+    warning: raw.warning,
+    startingLevel: mapStartingLevel(raw.starting_level),
+    oldParallelism: raw.old_parallelism,
+    newParallelism: raw.new_parallelism,
+    includeKeysDefault: raw.include_keys_default,
+    appVersion: raw.app_version,
+    dataDir: raw.data_dir,
+    licence: raw.licence,
+  };
+}
+
+/** An unknown starting level keeps the engine's own suggestion. */
+function mapStartingLevel(raw: string): AppSettings['startingLevel'] {
+  switch (raw) {
+    case 'structure':
+    case 'counts':
+      return raw;
+    case 'full_values':
+      return 'full-values';
+    default:
+      return 'suggested';
+  }
+}
+
+/** Run a settings command; a failure becomes a plain `Error` with readable text. */
+async function settingsCall(command: string, args?: Record<string, unknown>): Promise<AppSettings> {
+  try {
+    return translateSettings(await invoke<RawSettings>(command, args));
+  } catch (error) {
+    throw new Error(describeError(error), { cause: error });
+  }
+}
+
+/** Unknown custom-check severities are shown as failures, never hidden. */
+function mapSeverity(raw: string): CustomSeverity {
+  return raw === 'info' || raw === 'warning' ? raw : 'fail';
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +592,10 @@ function mapConfidence(status: string): MatchConfidence {
       return 'exact';
     case 'case_insensitive':
       return 'case';
+    case 'rule':
+      return 'rule';
+    case 'confirmed':
+      return 'confirmed';
     default:
       // `fuzzy`, `unmapped` and any unknown status are all "needs attention",
       // never an auto-approved exact/case match.
@@ -450,9 +603,79 @@ function mapConfidence(status: string): MatchConfidence {
   }
 }
 
-/** Only `exact` and `case_insensitive` are auto-approved. */
+/** Exact, case-insensitive, rule and user-confirmed pairings need no decision. */
 function isAutoApproved(status: string): boolean {
-  return status === 'exact' || status === 'case_insensitive';
+  return (
+    status === 'exact' || status === 'case_insensitive' || status === 'rule' || status === 'confirmed'
+  );
+}
+
+/** The `edit_mapping` wire form of an edit (snake_case fields). */
+function toRawEdit(edit: MappingEdit): Record<string, string> {
+  switch (edit.kind) {
+    case 'pair_table':
+      return {
+        kind: 'pair_table',
+        schema: edit.schema,
+        table: edit.table,
+        new_table: edit.newTable,
+      };
+    case 'pair_column':
+      return {
+        kind: 'pair_column',
+        schema: edit.schema,
+        table: edit.table,
+        column: edit.column,
+        new_column: edit.newColumn,
+      };
+    case 'ignore':
+      return { kind: 'ignore', path: edit.path, reason: edit.reason };
+  }
+}
+
+/**
+ * Lay an edited engine mapping over the queue the build produced: an item that
+ * is now paired or ignored leaves the queue, a new item that is now taken
+ * leaves the picker's list, and a suggestion goes with its item.
+ */
+function pruneBuild(build: RawMappingBuild, raw: RawMapping): RawMappingBuild {
+  const ignored = new Set(raw.ignored.map((i) => i.path));
+  const tableOf = (schema: string, table: string) =>
+    raw.schema_mappings[schema]?.table_mappings[table];
+  const paired = (e: { schema: string; table: string | null; column: string | null }) => {
+    if (!e.table) return false;
+    const tm = tableOf(e.schema, e.table);
+    if (!tm) return false;
+    return e.column ? e.column in tm.column_mappings : true;
+  };
+  const taken = (e: { schema: string; table: string | null; column: string | null }) => {
+    if (!e.table) return false;
+    if (e.column) {
+      const tm = tableOf(e.schema, e.table);
+      return Object.values(tm?.column_mappings ?? {}).some((c) => c.target_column === e.column);
+    }
+    return Object.values(raw.schema_mappings[e.schema]?.table_mappings ?? {}).some(
+      (t) => t.target_table === e.table,
+    );
+  };
+  const needs_attention = build.needs_attention.filter((a) =>
+    a.issue === 'add_back_review'
+      ? !taken(a) && !ignored.has(a.path)
+      : !paired(a) && !ignored.has(a.path),
+  );
+  const kept = new Set(
+    needs_attention.filter((a) => a.issue !== 'add_back_review').map((a) => a.path),
+  );
+  const suggestions = build.suggestions.filter(
+    (s) =>
+      kept.has(s.path) &&
+      !taken({ schema: s.schema, table: s.column ? s.table : s.candidate, column: s.column ? s.candidate : null }),
+  );
+  return { mapping: raw, needs_attention, suggestions };
+}
+
+function isRuleKind(kind: string): kind is MappingRule['kind'] {
+  return kind === 'schema_rename' || kind === 'prefix_replace' || kind === 'suffix_replace';
 }
 
 /** Project the engine `Mapping` + attention queue onto the contract `Mapping`. */
@@ -470,10 +693,11 @@ function translateMapping(
     }
   };
 
+  const ignoredPaths = new Set(build.mapping.ignored.map((i) => i.path));
   for (const [schema, schemaMapping] of Object.entries(build.mapping.schema_mappings)) {
     for (const [oldTable, tableMapping] of Object.entries(schemaMapping.table_mappings)) {
       const tableStatus = tableMapping.status;
-      if (tableStatus === 'ignored') {
+      if (tableStatus === 'ignored' || ignoredPaths.has(`${schema}.${oldTable}`)) {
         continue; // surfaced through build.mapping.ignored
       }
       addMatch(
@@ -488,7 +712,7 @@ function translateMapping(
       );
       for (const [oldCol, colMapping] of Object.entries(tableMapping.column_mappings)) {
         const colStatus = colMapping.status;
-        if (colStatus === 'ignored') {
+        if (colStatus === 'ignored' || ignoredPaths.has(`${schema}.${oldTable}.${oldCol}`)) {
           continue;
         }
         addMatch(
@@ -505,13 +729,46 @@ function translateMapping(
     }
   }
 
+  const unmatchedNew: UnmatchedNewItem[] = [];
   for (const attention of build.needs_attention) {
+    const ref = attention.table
+      ? {
+          schema: attention.schema,
+          table: attention.table,
+          ...(attention.column ? { column: attention.column } : {}),
+        }
+      : undefined;
+    if (attention.issue === 'add_back_review') {
+      // Only the new database has it: not a decision for the user, but a
+      // counterpart the pairing picker can offer for an unmatched old item.
+      if (ref) unmatchedNew.push({ id: attention.path, ref });
+      continue;
+    }
+    // Nothing is paired yet, so there is no new name to approve.  The user
+    // accepts a suggestion or picks a counterpart.
     needsAttention.push({
       id: attention.path,
       oldName: attention.path,
-      newName: attention.candidates[0] ?? '',
+      newName: '',
       confidence: 'fuzzy',
       approved: false,
+      ...(ref ? { ref } : {}),
+      candidates: attention.candidates,
+    });
+  }
+
+  const suggestions: MappingSuggestion[] = [];
+  for (const s of build.suggestions) {
+    if (!s.table) continue;
+    suggestions.push({
+      id: s.path,
+      ref: {
+        schema: s.schema,
+        table: s.table,
+        ...(s.column ? { column: s.column } : {}),
+      },
+      candidate: s.candidate,
+      confidence: s.confidence,
     });
   }
 
@@ -528,7 +785,12 @@ function translateMapping(
   // An encoding difference is not a mapping decision: Dmux converts every
   // value to UTF-8 before comparing.  It is shown as information on Compare
   // structure, never as a blocking "needs attention" item.
-  return { rules, matches, needsAttention, ignored };
+  const ruleSpecs: MappingRule[] = build.mapping.rules.flatMap((rule) =>
+    isRuleKind(rule.kind)
+      ? [{ kind: rule.kind, pattern: rule.pattern, target: rule.target }]
+      : [],
+  );
+  return { rules, ruleSpecs, matches, needsAttention, ignored, suggestions, unmatchedNew };
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +838,7 @@ function toConnectionProfile(raw: BackendProfile): ConnectionProfile {
     encryption: raw.encryption,
     tlsFingerprint: raw.tls_fingerprint ?? undefined,
     plaintextReason: raw.plaintext_reason ?? undefined,
+    caFile: raw.ca_file ?? undefined,
   };
 }
 
@@ -725,7 +988,9 @@ function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
     schemaName: t.schema_name,
     tableName: t.table_name,
     level: mapLevel(t.level),
-    controlTotalColumns: t.control_total_columns ?? undefined,
+    // The backend's list is what it *suggests*; nothing is confirmed yet.
+    controlTotalSuggestions: t.control_total_columns ?? undefined,
+    sizeBytes: t.size_bytes ?? undefined,
   }));
   return {
     tables,
@@ -817,6 +1082,18 @@ function translateResults(raw: RawResults): Results {
     // "options not recorded" rather than assume none (never a bare PASS).
     optionsRecorded: raw.options_recorded ?? false,
     warnings: raw.warnings ?? [],
+    customChecks: raw.custom_checks
+      ? {
+          findings: raw.custom_checks.findings.map((f) => ({
+            id: f.id,
+            severity: mapSeverity(f.severity),
+            message: f.message,
+            table: f.table ?? undefined,
+          })),
+          scripts: raw.custom_checks.scripts,
+          warnings: raw.custom_checks.warnings,
+        }
+      : undefined,
   };
 }
 
@@ -841,6 +1118,8 @@ export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
   let lastNewProfile: ConnectionProfile | null = null;
   let lastRawMapping: RawMapping | null = null;
+  /** The build behind `lastRawMapping`: its queue, suggestions and new-only items. */
+  let lastBuild: RawMappingBuild | null = null;
   let superuserOverride: SuperuserOverride | null = null;
   /** The backend's `SuperuserOverride { allow, reason }`, or null (refuse). */
   const allowSuperuser = () =>
@@ -899,6 +1178,15 @@ export function createTauriEngine(): Engine {
       return invoke<boolean>('profile_has_password', { id });
     },
 
+    async listProfiles(): Promise<ConnectionProfile[]> {
+      const rows = await invoke<BackendProfile[]>('list_profiles');
+      return rows.map(toConnectionProfile);
+    },
+
+    async deleteProfile(id: string): Promise<boolean> {
+      return invoke<boolean>('delete_profile', { id });
+    },
+
     async compareStructure(
       oldProfile: ConnectionProfile,
       newProfile: ConnectionProfile,
@@ -936,7 +1224,73 @@ export function createTauriEngine(): Engine {
         allowSuperuser: allowSuperuser(),
       });
       lastRawMapping = build.mapping;
+      lastBuild = build;
       return translateMapping(build);
+    },
+
+    // The webview's mapping is a projection and is never sent back: the backend
+    // changes its own copy, after checking every name against the live databases.
+    async editMapping(_mapping: Mapping, edits: MappingEdit[]): Promise<Mapping> {
+      if (!lastOldProfile || !lastNewProfile || !lastRawMapping) {
+        throw new Error('buildMapping must run before editMapping');
+      }
+      // A refusal (such as two old tables for one new table) is thrown as its
+      // plain-language message and leaves the mapping as it was.
+      let raw: RawMapping;
+      try {
+        raw = await invoke<RawMapping>('edit_mapping', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          mapping: lastRawMapping,
+          edits: edits.map(toRawEdit),
+          allowSuperuser: allowSuperuser(),
+        });
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
+      lastRawMapping = raw;
+      lastBuild = pruneBuild(lastBuild ?? { mapping: raw, needs_attention: [], suggestions: [] }, raw);
+      return translateMapping(lastBuild);
+    },
+
+    async previewRules(rules: MappingRule[]): Promise<RulePreview> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before previewRules');
+      }
+      try {
+        const raw = await invoke<RawRulePreview>('preview_rules', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          rules,
+          allowSuperuser: allowSuperuser(),
+        });
+        return {
+          tablesTotal: raw.tables_total,
+          tablesByRules: raw.tables_by_rules,
+          tablesMatched: raw.tables_matched,
+        };
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
+    },
+
+    async rebuildMapping(rules: MappingRule[]): Promise<Mapping> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before rebuildMapping');
+      }
+      try {
+        const build = await invoke<RawMappingBuild>('rebuild_mapping', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          rules,
+          allowSuperuser: allowSuperuser(),
+        });
+        lastRawMapping = build.mapping;
+        lastBuild = build;
+        return translateMapping(build);
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the projected mapping is rebuilt from the backend `lastRawMapping`
@@ -1030,6 +1384,79 @@ export function createTauriEngine(): Engine {
         return { ok: false, error: describeError(error) };
       }
     },
+    async getSettings(): Promise<AppSettings> {
+      return settingsCall('get_settings');
+    },
+    async updateSettings(update: AppSettingsUpdate): Promise<AppSettings> {
+      return settingsCall('update_settings', {
+        input: {
+          custom_checks_enabled: update.customChecksEnabled,
+          timeout_secs: update.timeoutSecs,
+          starting_level:
+            update.startingLevel === 'full-values' ? 'full_values' : update.startingLevel,
+          old_parallelism: update.oldParallelism,
+          new_parallelism: update.newParallelism,
+          include_keys_default: update.includeKeysDefault,
+        },
+      });
+    },
+    async chooseHooksFolder(): Promise<AppSettings> {
+      return settingsCall('choose_hooks_folder');
+    },
+    async clearHooksFolder(): Promise<AppSettings> {
+      return settingsCall('clear_hooks_folder');
+    },
+    async choosePython(): Promise<AppSettings> {
+      return settingsCall('choose_python');
+    },
+    async clearPython(): Promise<AppSettings> {
+      return settingsCall('clear_python');
+    },
+    async listHistory(): Promise<HistoryEntry[]> {
+      const rows = await invoke<RawHistoryRow[]>('list_history');
+      return rows.map(translateHistoryRow);
+    },
+
+    async openHistoryEntry(id: string): Promise<Results> {
+      // The backend verifies the stored file before it returns anything.
+      const raw = await invoke<RawResults>('open_history_entry', { id });
+      return translateResults(raw);
+    },
+
+    async openResultsFile(): Promise<OpenResultsResult> {
+      // The native open dialog, the read and the verification all happen in
+      // the backend; no path and no file content cross the IPC.
+      try {
+        const raw = await invoke<RawOpenResults>('open_results_file');
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, results: translateResults(raw.results) };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
+    },
+
+    async getHistoryLog(id: string): Promise<string> {
+      return invoke<string>('get_history_log', { id });
+    },
+
+    async saveHistoryLog(id: string): Promise<ReportResult> {
+      try {
+        const raw = await invoke<RawExportReport>('save_history_log', { id });
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, filePath: raw.path };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
+    },
+
+    async purgeHistory(): Promise<number> {
+      return invoke<number>('purge_history');
+    },
+
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');
     },

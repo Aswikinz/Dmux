@@ -25,7 +25,7 @@ use crate::mapping::Mapping;
 use crate::plan::{build_table_spec, core_table_plan, SpecInputs};
 use crate::results::CheckLevel;
 
-use super::{inventory, live_table, scan_counts, scan_fingerprint, RunError};
+use super::{inventory, live_table, scan_counts, scan_fingerprint, HashMode, RunError};
 
 /// What to capture.
 #[derive(Debug, Clone)]
@@ -123,6 +123,8 @@ pub async fn capture(
                         Side::Old,
                         &src,
                         &opts.mapping.mapping_hash,
+                        HashMode::of(info.md5_available),
+                        None,
                     )
                     .await
                     .map_err(fail)?;

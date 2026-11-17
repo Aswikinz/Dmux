@@ -6,6 +6,7 @@
 //! never opens, commits or ends a transaction itself; it checks the session
 //! settings before each scan and refuses to run in any other session.
 
+pub mod apphash;
 pub mod compare;
 pub mod drilldown;
 pub mod fingerprint;

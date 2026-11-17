@@ -26,7 +26,9 @@ safety rules live in `docs/PLAN.md`, section 6.
 
 ## Verifying a download
 
-Every release publishes, alongside the installers and command-line binaries:
+Every release publishes, alongside the installers (Windows setup, offline setup,
+portable zip and MSI; Linux deb, rpm, AppImage and Flatpak), the command-line
+binaries and the software bills of materials:
 
 - a **checksums file** (`SHA256SUMS`) listing the SHA-256 fingerprint of each
   file, so you can confirm a download is complete and unmodified;

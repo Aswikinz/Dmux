@@ -80,7 +80,7 @@ server when the laptop cannot reach the database. It runs `dmux capture`, `dmux 
 and `dmux run <definition file>`, and writes a results file. Turn that file into the PDF
 and Excel reports with `dmux report --results results.json --pdf report.pdf --xlsx
 report.xlsx`; it checks the file's SHA-256 first and refuses a file that was edited.
-(Opening a results file in the desktop app is planned but not in this version.) Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
+You can also open that results file in the desktop app (see "History" below), which checks it the same way and shows the verdict and findings. Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
 script can act on the result.
 
 A run definition file names the databases and the checks; it never holds a database
@@ -147,6 +147,15 @@ anything else happens.
    Dmux then trusts certificates from that authority as well as the public ones, and still
    checks the server's host name.
 4. Press **Test connection** on each side, then **Continue**.
+
+**Saved connections.** A connection that tests successfully is saved automatically, so you
+do not have to enter it again. The card under it says **Saved**, when it was last tested,
+and where its password is: in your system keychain, or only in memory until you close the
+app. Each side has a list, **Saved connections**, to fill the form from one you saved
+before. The card also has **Retry connection** (test again without retyping the password),
+**Edit** (go to the details) and **Delete connection** (asks first, and also deletes the
+saved password). If you change the details of a saved connection, the card says so; type
+the password again to test the new details.
 
 **What you see.** For each server: its version, its text encoding, whether the connection
 is encrypted, whether the login can write or is a superuser, and whether a connection
@@ -219,30 +228,48 @@ up. Nothing is compared until it is mapped or deliberately ignored.
 
 **Steps.**
 
-1. Dmux applies your rules first, then exact name matches, then matches that differ only in
-   upper or lower case. You only see what is left.
-2. Work through the **Needs attention** queue from the top. Each item shows the old name,
-   the suggested new name and a confidence score.
-3. Tick a suggestion to accept it, or drag the correct table onto it. One decision can
-   cover many tables when a renaming rule applies.
-4. For a table that should not be checked, choose **Ignore** and type the reason. The
+1. Optional: add **rename rules** at the top. A schema rename says that everything in the
+   old schema `legacy` now lives in the new schema `public`. A prefix or suffix rule says
+   that a table whose name starts (or ends) with some text has that text replaced, for
+   example `tbl_` becomes nothing. Press **Preview rules** to see how many tables the rules
+   pair, then **Apply rules and rebuild mapping**. Rules rename schemas and tables only,
+   never columns. Applying rules starts the mapping again, so do it before you pair
+   anything by hand.
+2. Dmux applies your rules first, then exact name matches, then matches that differ only in
+   upper or lower case. You only see what is left, in the **Needs attention** queue.
+3. Work through the queue from the top. For an item with no partner Dmux may show a
+   **suggestion**: the closest name in the new database and a percentage for how alike the
+   names are. A suggestion is only a guess and is never used by itself. Press
+   **Use suggestion** to accept it. Weak guesses (under 40 percent) are not shown.
+4. If there is no suggestion, or it is wrong, press **Choose counterpart**. A search box
+   lists the tables (or, for a column, the columns) that exist only in the new database.
+   Type to narrow the list, then click one, or use the arrow keys and Enter. Escape closes
+   the list without choosing.
+5. Two old tables can never map to the same new table, and neither can two old columns.
+   If you try, Dmux refuses and says which old table already has that partner. Pair or
+   ignore one of them differently.
+6. For a table that should not be checked, choose **Ignore** and type the reason. The
    reason is required and appears in the report.
-5. When the queue is empty, press **Continue**.
+7. When the queue is empty, press **Choose checks**.
 
 **What you see.** A queue, not a thousand-row board. Suggestions are never accepted
 automatically: a "close enough" name match is exactly how the wrong columns get compared.
-The count of unmapped and ignored tables stays visible at the top.
+Items that exist only in the new database are counted below the queue and offered when you
+choose a counterpart.
 
 **If something goes wrong.**
 
-- *"Two candidates match equally well"*: Dmux will not guess. Pick one.
-- *You ignored a table by mistake*: reopen it from the ignored list; the reason is removed
-  with it.
-- *You cannot find a table*: check the case-insensitive option and the search; a table
-  folded under a parent partition will not appear on its own.
+- *"Two old tables cannot map to one new table"*: Dmux will not guess which one the new
+  table really is. Unpair one or choose a different partner.
+- *You ignored a table by mistake*: pair it again from the queue; pairing removes the ignore
+  and its reason.
+- *You cannot find a table in the picker*: it may already be paired with another old table,
+  or it may be in a different schema. A table can only be paired within the schema its old
+  schema maps to; use a schema rename rule to change that.
+- *The rules paired fewer tables than you expected*: the preview shows how many. A rule only
+  pairs a table when the renamed table really exists in the new database.
 
-> **TODO (wiring):** screenshot of the queue with a suggestion and an ignore dialog;
-> confirm the wording of the confidence column.
+> **TODO (wiring):** screenshot of the queue with a suggestion and the pairing list.
 
 ### 4. Choose checks
 
@@ -252,13 +279,22 @@ take before you start.
 **Steps.**
 
 1. Pick a preset: full values for everything; counts for everything with full values for
-   selected tables; or structure only.
+   selected tables; or structure only. Changing a table by hand switches the preset to
+   **Custom**.
 2. Adjust individual tables if needed. Each table has one of three levels: **Structure**,
    **Counts and totals**, or **Full values**.
-3. Confirm the control-total columns. Dmux suggests number columns whose names look like
-   amounts or balances; tick the ones your auditors expect.
-4. Read the estimate: a range per table and in total.
-5. If the databases are only quiet at certain hours, switch on **Only run during certain
+3. To change many tables at once, tick them in the first column, or use the selection tools:
+   **Select schema**, **Select by name** (type a pattern; `*` stands for any text, upper
+   and lower case do not matter, so `acct_*` finds every table that starts with `acct_`),
+   or **Select by size** (larger or smaller than a number of megabytes). Selecting replaces
+   the earlier selection. Then choose a level under **Set level for the selection** and
+   press **Apply**. Tables with no size on record are skipped by the size selection, and
+   the screen says how many.
+4. Confirm the control-total columns. Dmux suggests number columns whose names look like
+   amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
+   column is added up in every table that has a column with that name.
+5. Read the estimate: a range per table and in total.
+6. If the databases are only quiet at certain hours, switch on **Only run during certain
    hours** and set the times, for example 22:00 until 05:00. It is off unless you turn it on.
    Outside those hours Dmux waits between tables, and carries on by itself when the hours
    start again. A window that crosses midnight works. The times are the clock of the
@@ -272,11 +308,11 @@ pass, because Dmux then goes back for the rows.
 
 **If something goes wrong.**
 
-- *The estimate is far longer than the window you have*: drop the largest tables to
-  counts and totals, or ask for a longer window. The report will say which tables got
-  which level, so nothing is hidden.
+- *The estimate is far longer than the window you have*: select the largest tables by size
+  and set them to counts and totals, or ask for a longer window. The report will say which
+  tables got which level, so nothing is hidden.
 - *A table has no suggested totals*: its columns may not be numeric, or the names are
-  unfamiliar. Tick them by hand or leave counts only.
+  unfamiliar. Counts alone are still checked.
 - *The run window is set outside your quiet hours*: change the times on this screen before
   you press **Run**.
 - *Tables changed while the check was waiting*: Dmux only waits between tables, but if
@@ -284,8 +320,7 @@ pass, because Dmux then goes back for the rows.
   never a tick. Use a window only when the databases are quiet outside it, or accept that
   tables read after a long wait may need a second check.
 
-> **TODO (wiring):** screenshot of the level picker and the estimate panel; confirm the
-> three preset names.
+> **TODO (wiring):** screenshot of the selection tools and the estimate panel.
 
 ### 5. Run
 
@@ -403,8 +438,21 @@ options ticked and every query sent.
 
 ## Below the steps: history, scripts and settings
 
-- **Run history.** Every run, with its verdict, coverage and date. Open one to review or
-  re-export it, or to repeat it from its saved definition.
+- **History.** Press **History** in the sidebar, below the steps. Every finished check is
+  listed with its date, verdict, coverage and the two databases. **Open results** shows that
+  check on the Results screen again, and from there the Report screen can export it as a
+  PDF or Excel file. Before showing a stored check, Dmux verifies its file; if the file was
+  changed since Dmux wrote it, Dmux says so and shows nothing. **Run log** shows what the
+  check recorded as plain text, and **Save run log** saves it where you choose.
+- **Open a results file.** The **Open a results file** button on the History screen opens a
+  results file, for example one written by the command-line version on a jump server. Dmux
+  checks it exactly as `dmux report` does (its SHA-256, and that a PASS does not hide a
+  failing table). A file that fails the check is refused with a plain message and nothing
+  is shown. Files larger than 64 MiB are refused.
+- **Delete local history.** The **Delete all history** button, after a confirmation, deletes
+  every stored results file and the history list on this computer. Saved connections are
+  kept. Reports and files you saved elsewhere are not touched. Stored results files are
+  readable only by you, and hold counts, names and hashes, never row values.
 - **Scripts.** Optional custom checks, written in Python by the bank's own team. A custom check
   runs with your full permissions. Only run scripts you trust. Dmux strips the
   environment and never hands a script the database passwords or connections, but it does
@@ -414,11 +462,61 @@ options ticked and every query sent.
   Off unless switched on.
 - **Settings.** Theme, including the reduced effects theme for remote desktops; the run
   window; parallel-scan limits; where history is kept; and purging.
+- **Settings.** The Settings page is at the bottom of the left-hand list, below the steps.
+  It has five sections:
+  - **Appearance.** Light, dark, or match your computer, and a reduced effects switch for
+    remote desktops. The two small icons at the bottom of the left-hand list change the same
+    settings.
+  - **Run defaults.** The check level a new plan starts from (Dmux's own suggestion unless you
+    pick another), and how many scans run at once on the old and the new database (2 and 4
+    to begin with, never fewer than 1). Use a lower number on a busy production server. You
+    can still change the levels for a single run on the Choose checks step.
+  - **Reports.** Whether the "include row keys" box on the Report step starts ticked. It is off
+    unless you turn it on, and you still decide for each export.
+  - **Custom checks.** See below.
+  - **About.** The Dmux version, the folder where Dmux keeps its settings and history (shown
+    for information; you cannot change it here), and the licence.
+
+### Custom checks
+
+A custom check is a small Python script written by your own team. After Dmux compares the
+databases, it gives each script a summary of the results (table names, counts and verdicts,
+never passwords, connections or row values) and the script can add findings of its own.
+
+**A custom check runs with your full permissions. Only run scripts you trust.** Dmux does not
+sandbox a script. It starts the script with a nearly empty environment and never hands it a
+password or a connection, but a script can still read your files and use your network.
+
+Custom checks are **off** until you turn them on in Settings.
+
+1. Open **Settings**, then **Custom checks**, and switch on "Run custom checks after each
+   comparison".
+2. Choose **Choose folder** and pick the folder that holds your scripts (files ending in
+   `.py`). Dmux lists each script and says whether it will run. On Linux and macOS it
+   refuses a script, or a folder, that other users on the computer could change, or that
+   belongs to another user, and it tells you why. Fix the permissions and the script is
+   accepted. On Windows this check is not available, so the warning above matters even more.
+3. Dmux finds Python for you. If the Windows build ships its own Python (a `python` folder
+   next to the app), that one is used first. You can choose a different Python with
+   **Choose Python**, or go back to automatic.
+4. Set the time limit for each script. A script that runs longer is stopped, and the run
+   shows a warning.
+
+Every time you start a run while custom checks are on, Dmux shows the warning again and asks
+you to confirm before it starts.
+
+On the Results step, the **Custom checks** section lists every finding with its severity
+(Failed, Warning or Note) and its message. A failed custom check makes the overall verdict
+FAIL, so a run with a failing custom check never shows PASS. A script that could not run, ran
+too long or returned something unreadable is shown as a warning and lifts a clean PASS to
+WARNING. The exported report includes the findings and the SHA-256 of each script that ran, so
+anyone can later check which code produced them.
 
 > **TODO (wiring):** screenshots and the final labels for these three pages.
 
 ## Keyboard and accessibility
 
 The whole flow works by keyboard, including mapping: arrow keys move through the queue,
-space ticks a suggestion, and escape closes a dialog. Status is never shown by colour
+the buttons under an item accept a suggestion or open the search list for a counterpart,
+and escape closes the list or a dialog. Status is never shown by colour
 alone; every verdict carries a word and an icon.

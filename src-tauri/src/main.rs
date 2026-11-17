@@ -3,6 +3,9 @@
 
 mod commands;
 mod error;
+mod history;
+mod hooks;
+mod prefs;
 mod run_manager;
 mod secrets;
 mod sleep;
@@ -41,6 +44,9 @@ fn main() {
             commands::gateway::update_mapping,
             commands::gateway::export_mapping,
             commands::gateway::import_mapping,
+            commands::mapping_edit::edit_mapping,
+            commands::mapping_edit::preview_rules,
+            commands::mapping_edit::rebuild_mapping,
             commands::gateway::get_version,
             commands::data::build_check_plan,
             commands::data::start_run,
@@ -49,10 +55,29 @@ fn main() {
             commands::data::cancel_run,
             commands::data::get_results,
             commands::report::export_report,
+            commands::settings::get_settings,
+            commands::settings::update_settings,
+            commands::settings::choose_hooks_folder,
+            commands::settings::clear_hooks_folder,
+            commands::settings::choose_python,
+            commands::settings::clear_python,
+            commands::history::list_history,
+            commands::history::open_history_entry,
+            commands::history::open_results_file,
+            commands::history::get_history_log,
+            commands::history::save_history_log,
+            commands::history::purge_history,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());
             let app_state = state::AppState::new(data_dir)?;
+            // A Python shipped with the app (the Windows build), if present.
+            app_state.set_bundled_python(
+                app.path()
+                    .resource_dir()
+                    .ok()
+                    .and_then(|dir| hooks::bundled_interpreter(&dir)),
+            );
             app.manage(app_state);
             Ok(())
         })
