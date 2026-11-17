@@ -3,7 +3,8 @@ name: Release
 # Decision 14: pushing a v* tag creates a PUBLISHED release (not a draft)
 # with both-platform installers, CLI binaries, SHA-256 checksums and an SBOM.
 # Unsigned until code-signing approval; the release body carries the SmartScreen
-# note. Decision 20: every pre-1.0 tag (v0.*) is published as a PRE-RELEASE.
+# note. Decision 20: every pre-1.0 tag (v0.*), and any tag with a
+# pre-release suffix (v1.0.0-rc.1), is published as a PRE-RELEASE.
 on:
   push:
     tags: ['v*']
@@ -374,7 +375,7 @@ jobs:
       # Decision 14: PUBLISHED, not draft (no --draft). Decision 20: any v0.*
       # tag is a pre-release, so the flag is computed from the tag itself and
       # cannot drift from the version the guard just checked. The header states
-      # pre-1.0 status and the unsigned-installer SmartScreen note; GitHub's
+      # pre-release or stable status and the unsigned-installer SmartScreen note; GitHub's
       # generated notes follow it.
       - name: Create the published release
         env:
@@ -382,17 +383,29 @@ jobs:
         run: |
           TAG="$GITHUB_REF_NAME"
           extra=()
-          if [[ "$TAG" == v0.* ]]; then
+          : > header.md
+          # A v0.* tag, or any tag with a pre-release suffix such as
+          # v1.0.0-rc.1, is a GitHub pre-release.
+          if [[ "$TAG" == v0.* || "$TAG" == *-* ]]; then
             extra=(--prerelease)
-            echo "Pre-1.0 tag: publishing as a pre-release"
-          else
-            echo "Tag $TAG is 1.0 or later: publishing as a normal release"
-          fi
-          cat > header.md <<'EOF'
-          **Pre-1.0 release.** Dmux is not yet 1.0: the UI, report formats and
-          comparison details can still change between minor versions. Every
-          pre-1.0 release is published as a GitHub pre-release.
+            echo "Pre-release tag: publishing as a pre-release"
+            cat >> header.md <<'EOF'
+          **Pre-release.** The UI, report formats and comparison details can
+          still change before the next stable version. Pre-releases are
+          published as GitHub pre-releases.
 
+          EOF
+          else
+            echo "Tag $TAG is a stable release: publishing as a normal release"
+            cat >> header.md <<'EOF'
+          **Stable release.** Saved fingerprint files record the normalisation
+          rules they were captured with; a capture made under other rules, or
+          by a version that did not record them, is refused and must be
+          captured again with this version.
+
+          EOF
+          fi
+          cat >> header.md <<'EOF'
           **Unsigned installers.** Windows SmartScreen will warn until
           code-signing approval lands (PLAN.md section 9). Verify every download
           before running it: check the signature on `SHA256SUMS`, check the
