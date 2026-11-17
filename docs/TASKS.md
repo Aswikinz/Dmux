@@ -34,6 +34,8 @@ Status: todo, doing, review, done, blocked.
 
 ## Phase 1–7 (speed mode, decision 15)
 
+**T031 MUST be rebased with `git rebase --onto main 686e8d9` before merging (it branched from the purged tainted board commit; the pre-push hook will refuse it otherwise).**
+
 **Resume notes (checkpoint 2026-11-17, before owner's offline window).** If agents errored while offline, resume each by session ID (subagent sessionID), or relaunch from its row. In-flight: T018 combined engine fix round (T017+T018+T019 merged into .worktrees/T018; merge with T017 was in progress — Maya commits it after the agent resolves main.rs) → ses_e18c8ad93ffev6FGbVG1Qwc7R7 · T030 Sonar fixes → ses_e18ba8d12ffeJRLwMuq70Vmxg4 · T031 large dataset → ses_e18b714e5ffej9jaGEI7IxndOq · T032 private generator → ses_e18b714e2ffe3cUT8HIsFMfNMu · T033 docs → ses_e18b714deffeeyEGoDu1oySnvr · T019 mutation run: /tmp/opencode/mutants-t019b (local, re-run if killed). Ready to merge after gates: T020 UI (committed 2d5de50; needs main merged in + DeepSeek gate), T019 core (after mutants + T018 branch). Published: v0.0.1 (b1558ba). Next: T022 after the engine branch merges.
 
 | ID | Task | Owner (model) | Status | Depends on |
@@ -54,7 +56,7 @@ Status: todo, doing, review, done, blocked.
 | T030 | SonarCloud findings: exclude *.sql (Oracle rules on Postgres fixtures), suppress mock-password rule with reason, --locked / https-only curl / npx --ignore-scripts, shell [[ ]], release staging dir dist/ → release-out/ (frontend leaked into v0.0.1). | kenji (deepseek-v4-pro) | doing | T021 |
 | T031 | `demo_bank` large size (1M accounts, 20M transactions) as database demo_bank_large + full-size option; estimate-accuracy harness hook for nightly. | nina (deepseek-v4.1-flash) | doing | T016 |
 | T032 | Private generator (private/ only, never Git): build the full private schema (all parsed tables, a few rows each) from the private dictionary file as database private_bank on the mocks, type-mapped per PLAN 8.1. | nina (deepseek-v4.1-flash) | done | T015 |
-| T033 | Docs part 1 (no T022 dependency): "How Dmux decides" (plain-language method, md5 threat model, NeedsReview, stop rule, what PASS does not prove), DBA setup guide (dmux_reader login, read-only, freeze window, replica advice), user-guide skeleton for the 7 screens. | ella (deepseek-v4.1-flash) | doing | |
+| T033 | Docs part 1 (no T022 dependency): "How Dmux decides" (plain-language method, md5 threat model, NeedsReview, stop rule, what PASS does not prove), DBA setup guide (dmux_reader login, read-only, freeze window, replica advice), user-guide skeleton for the 7 screens. | ella (deepseek-v4.1-flash) | done | |
 
 ## Phase 1: foundation
 
