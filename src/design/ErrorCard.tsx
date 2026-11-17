@@ -11,16 +11,18 @@ export function ErrorCard({ title, children, className }: ErrorCardProps) {
   return (
     <div
       className={cn(
-        'rounded-xl border-l-4 border-red-500 bg-red-50 p-4 text-red-900 dark:bg-red-900/20 dark:text-red-100',
+        'animate-fade-up rounded-2xl border border-red-200 bg-red-50/80 p-4 text-red-900 dark:border-red-500/30 dark:bg-red-950/30 dark:text-red-100',
         className,
       )}
       role="alert"
     >
       <div className="flex items-start gap-3">
-        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-100 dark:bg-red-500/20">
+          <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-300" aria-hidden="true" />
+        </span>
         <div>
-          <h3 className="font-semibold">{title}</h3>
-          <div className="mt-1 text-sm">{children}</div>
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <div className="mt-0.5 text-sm text-red-800 dark:text-red-200">{children}</div>
         </div>
       </div>
     </div>

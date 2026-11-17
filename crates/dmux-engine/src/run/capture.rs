@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::core::fingerprint::{Side, Source};
-use crate::core::normalise::{plan_column, ColumnOptions};
+use crate::core::normalise::{plan_column, ColumnOptions, NORMALISE_RULES_VERSION};
 use crate::db::{probe_server, ConnProfile, ReadOnlySession};
 use crate::fingerprint_file::{
     CapturedServer, CapturedTable, FingerprintFile, FINGERPRINT_VERSION,
@@ -161,6 +161,8 @@ pub async fn capture(
     let file = FingerprintFile {
         format_version: FINGERPRINT_VERSION,
         tool_version: crate::version().to_string(),
+        // What the hashes mean: a later compare refuses any other rules (H3).
+        normalise_rules_version: Some(NORMALISE_RULES_VERSION),
         mapping_hash: opts.mapping.mapping_hash.clone(),
         server: CapturedServer {
             version_num: info.version_num,

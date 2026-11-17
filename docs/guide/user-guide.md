@@ -82,8 +82,15 @@ for review and reporting. Exit codes are 0 for pass, 1 for fail and 2 for warnin
 script can act on the result.
 
 A run definition file names the databases and the checks; it never holds a database
-password. Point it at a password with `password_env` (the name of an environment variable
-the jump server sets), or use the keychain entry saved in the desktop app.
+password, and Dmux refuses a file that contains a `password` key. Point it at a password
+with `password_env` (the name of an environment variable the jump server sets). If the
+bank signs its server certificates with its own certificate authority, add `ca_file` (the
+path to the CA's PEM file) to the `old` and `new` connection tables, or pass
+`--ca-file <PATH>` to `dmux probe`, `dmux inventory` and `dmux capture`.
+
+A saved capture can be compared again later, but only by a version of Dmux that uses the
+same comparison rules as the one that made it. Dmux refuses any other capture and asks for
+it to be captured again; see [How Dmux decides](../how-dmux-decides.md).
 
 > **TODO (packaging):** link the release page, the SHA-256 checksums and the software bill
 > of materials here once the release workflow publishes them.
@@ -97,7 +104,8 @@ Before installing, check that the download is really this project's: see
    the applications menu if you installed a package.
 2. The window opens on **Connect**, with the step list down the left side.
 3. Nothing needs an account or a sign-in. Dmux asks only for the database details you
-   enter, and keeps passwords in the operating system's keychain.
+   enter, and keeps passwords in the operating system's keychain (see "How Dmux handles passwords"
+   under Connect, below).
 
 > **TODO (design):** screenshot of the first window, light and dark, plus the reduced
 > effects theme used over remote desktop.
@@ -124,7 +132,12 @@ anything else happens.
 2. Choose **New database** and fill in the same five details.
 3. Choose the encryption mode. Leave it on encrypted and verified unless the
    administrator tells you otherwise. If Dmux shows a certificate fingerprint, compare it
-   with the fingerprint on your paper note and trust it once.
+   with the fingerprint on your paper note and trust it once. If your bank signs its server
+   certificates with its own certificate authority, the administrator gives you a
+   certificate authority file (a `.pem` or `.crt` text file); with "Verify certificate"
+   chosen, enter its path in the field "Your bank's certificate authority file (optional)".
+   Dmux then trusts certificates from that authority as well as the public ones, and still
+   checks the server's host name.
 4. Press **Test connection** on each side, then **Continue**.
 
 **What you see.** For each server: its version, its text encoding, whether the connection
@@ -132,6 +145,15 @@ is encrypted, whether the login can write or is a superuser, and whether a conne
 pooler sits in between. Green ticks mean ready. Dmux warns, in words, about anything it
 does not like: a login that can write, an unencrypted connection, an unusual encoding, or
 a server version it does not support.
+
+**How Dmux handles passwords.** A password you type is kept in the operating system's
+keychain, never in a file, a log or a report. On a machine that has no keychain, Dmux says
+so: "No system keychain: Dmux will keep this password in memory until you close the app."
+The password then stays in memory for this session only, tied to exactly the connection
+details you entered. It is forgotten when you change the connection details, when you
+delete the profile, and when you close the app, so you type it again next time. The
+command-line version takes the password from an environment variable (`--password-env`),
+never from a file.
 
 **If something goes wrong.**
 
@@ -318,18 +340,24 @@ the columns a person must look at.
 
 **Steps.**
 
-1. Choose the PDF summary, the Excel detail, or both.
-2. Tick whether key values may appear in the export. Leave it unticked unless the recipient
-   needs them.
-3. Fill in the sign-off block: who ran it, who reviewed it, and the date.
-4. Press **Export** and choose where to save.
-5. Check the first page: the verdict, the coverage line, the ignored items with reasons,
+1. Read the verdict and coverage line at the top of the screen.
+2. Tick **Include row keys in the exported report** only if the recipient needs key values.
+   It is off by default, and row values are never exported.
+3. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or both.
+4. A save dialog from your operating system opens. Choose where to save and confirm.
+5. The screen then shows the path the file was saved to. If you close the dialog, it says
+   the export was cancelled and nothing was saved. If something fails, it says so in plain
+   words.
+6. Check the first page: the verdict, the coverage line, the ignored items with reasons,
    the run identifier, the tool version, the mapping code and the results checksum.
 
 **What you see.** A PDF sized for a signature, and an Excel file with the detail behind it.
-A list that is longer than Excel's row limit is written as a CSV file instead. The run log
-holds the user, time, tool version, profiles, mapping version, options ticked and every
-query sent.
+Dmux builds each file from its own copy of the finished run's results and verifies it
+before saving, and it will not export a run that is not finished or that failed. The file is
+saved readable by you only (on Linux, mode 0600); copy it to a shared place yourself when
+you are ready to share it. A list that is longer than Excel's row limit is written as a CSV
+file instead. The run log holds the user, time, tool version, profiles, mapping version,
+options ticked and every query sent.
 
 **If something goes wrong.**
 
@@ -338,7 +366,8 @@ query sent.
   computed from the saved results file, so any later change to that file shows up. Re-run
   the saved definition to produce a second report with its own checksum and compare the two;
   if the data has not changed, the verdicts and coverage will match. The report says plainly
-  that this is tamper-evident, not tamper-proof.
+  that these hashes detect corruption and show tampering only when compared with the values
+  printed on the signed PDF, so keep the signed PDF where it cannot be changed.
 - *You need an older run*: open **Run history** below the steps, choose the run, and export
   again. History can be purged from the same place if the machine holds sensitive material.
 
@@ -349,10 +378,12 @@ query sent.
 
 - **Run history.** Every run, with its verdict, coverage and date. Open one to review or
   re-export it, or to repeat it from its saved definition.
-- **Scripts.** Optional custom checks, written in Python by the bank's own team. A check
-  runs with your full permissions, so only run scripts you trust: Dmux strips the
+- **Scripts.** Optional custom checks, written in Python by the bank's own team. A custom check
+  runs with your full permissions. Only run scripts you trust. Dmux strips the
   environment and never hands a script the database passwords or connections, but it does
-  not sandbox the script itself. Findings appear in the report marked as custom checks.
+  not sandbox the script itself. On Linux, Dmux refuses a script, or a scripts folder, that
+  is group- or world-writable or owned by someone else, because anyone who could edit it
+  could run commands as you. Findings appear in the report marked as custom checks.
   Off unless switched on.
 - **Settings.** Theme, including the reduced effects theme for remote desktops; the run
   window; parallel-scan limits; where history is kept; and purging.

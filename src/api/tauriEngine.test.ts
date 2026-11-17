@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createTauriEngine,
-  EngineError,
   mapDiffStatus,
   mapLevel,
   mapOverallState,
@@ -136,10 +135,21 @@ describe('createTauriEngine', () => {
 
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: null }),
+      allowSuperuser: null,
     });
     expect(result.ok).toBe(true);
     expect(result.info?.version).toBe('17.0');
     expect(result.info?.tls).toEqual({ state: 'encrypted', verified: true });
+  });
+
+  it('testConnection reports a session-only password, and never a password value', async () => {
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, session_password: true });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.info?.sessionPassword).toBe(true);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    const plain = await engine.testConnection(profile());
+    expect(plain.info?.sessionPassword).toBe(false);
   });
 
   it('testConnection reflects a pinned certificate fingerprint', async () => {
@@ -291,7 +301,8 @@ describe('createTauriEngine', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     const [cmd, args] = invoke.mock.calls[0] as [string, Record<string, unknown>];
     expect(cmd).toBe('compare_structure');
-    expect(Object.keys(args).sort()).toEqual(['new', 'old']);
+    expect(Object.keys(args).sort()).toEqual(['allowSuperuser', 'new', 'old']);
+    expect(args.allowSuperuser).toBeNull();
     const oldArg = args.old as { profile: { port: number } };
     const newArg = args.new as { profile: { port: number } };
     expect(oldArg.profile.port).toBe(5433);
@@ -434,7 +445,59 @@ describe('profile commands', () => {
     await engine.testConnection(profile(), 'hunter2');
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: 'hunter2' }),
+      allowSuperuser: null,
     });
+  });
+
+  it('a superuser is refused until the user allows it with a reason, which every call then carries', async () => {
+    const engine = createTauriEngine();
+    invoke.mockRejectedValueOnce({ kind: 'superuser_refused' });
+    const refused = await engine.testConnection(profile());
+    expect(refused.ok).toBe(false);
+    expect(refused.superuserRefused).toBe(true);
+
+    // A blank reason is not an override.
+    engine.setSuperuserOverride({ reason: '   ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
+
+    engine.setSuperuserOverride({ reason: ' migration rehearsal on a copy ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    const ok = await engine.testConnection(profile());
+    expect(ok.ok).toBe(true);
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Structure and the run carry it too.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      return Promise.resolve({});
+    });
+    await engine.compareStructure(profile(), profile());
+    expect(invoke).toHaveBeenCalledWith(
+      'compare_structure',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Revoking it goes back to refusing.
+    engine.setSuperuserOverride(null);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
   });
 
   it('testConnection surfaces the ask-for-password prompt on password_missing', async () => {
@@ -509,11 +572,35 @@ describe('a failed run', () => {
 });
 
 describe('data half is wired to the backend', () => {
-  it('exportReport is still NOT_AVAILABLE (T024)', async () => {
+  it('exportReport sends only the run id, format and key choice, and maps a saved path', async () => {
+    invoke.mockResolvedValueOnce({ status: 'saved', path: '/home/u/dmux-run-1.pdf' });
     const engine = createTauriEngine();
-    const call = engine.exportReport({ format: 'pdf', includeKeys: false, filePath: '/tmp/x' });
-    await expect(call).rejects.toBeInstanceOf(EngineError);
-    await expect(call).rejects.toMatchObject({ code: 'NOT_AVAILABLE' });
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'pdf', include_keys: false },
+    });
+    expect(res).toEqual({ ok: true, filePath: '/home/u/dmux-run-1.pdf' });
+  });
+
+  it('exportReport reports a dismissed dialog as cancelled', async () => {
+    invoke.mockResolvedValueOnce({ status: 'cancelled' });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: { run_id: 'run-1', format: 'excel', include_keys: true },
+    });
+    expect(res).toEqual({ ok: false, cancelled: true });
+  });
+
+  it('exportReport turns a typed backend error into plain text', async () => {
+    invoke.mockRejectedValueOnce({
+      kind: 'results_not_available',
+      message: 'results are not available: the run has not finished',
+    });
+    const engine = createTauriEngine();
+    const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('has not finished');
   });
 
   it('buildCheckPlan invokes build_check_plan and maps the plan', async () => {
@@ -701,6 +788,70 @@ describe('data half is wired to the backend', () => {
       expect(results.verdict).toBe(v);
       expect(results.tableResults[0].verdict).toBe(v);
     }
+  });
+
+  it('getResults maps options_applied and per-column notes', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-1',
+      verdict: 'PASS',
+      options_applied: true,
+      options_recorded: true,
+      warnings: ['the old database login can write'],
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [
+        {
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          verdict: 'PASS',
+          level: 'full_values',
+          checked: true,
+          drill_down: null,
+          column_notes: [{ column: 'balance', kind: 'option', note: 'round to 2 decimals' }],
+        },
+      ],
+    });
+
+    const results = await engine.getResults('run-1');
+    expect(results.optionsApplied).toBe(true);
+    expect(results.optionsRecorded).toBe(true);
+    expect(results.warnings).toEqual(['the old database login can write']);
+    expect(results.tableResults[0].columnNotes).toEqual([
+      { column: 'balance', kind: 'option', note: 'round to 2 decimals' },
+    ]);
+  });
+
+  it('getResults defaults options_recorded to false when the backend omits it', async () => {
+    // A v2-era backend (or results file) never records options: the adapter must
+    // say "options not recorded", never assume none were applied (never a bare
+    // PASS).  The field is absent here on purpose.
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-v2',
+      verdict: 'PASS',
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [],
+    });
+
+    const results = await engine.getResults('run-v2');
+    expect(results.optionsRecorded).toBe(false);
   });
 
   it('pollRun / setRunPaused / cancelRun invoke their commands', async () => {

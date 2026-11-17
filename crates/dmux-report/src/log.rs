@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use dmux_engine::results::RunResults;
+use dmux_engine::results::{self as results_mod, RunResults};
 
 use crate::layout::{self, ReportOptions};
 use crate::verify::HookEvidence;
@@ -38,21 +38,52 @@ pub struct RunLog {
     pub coverage: String,
     pub results_sha256: String,
     /// Fields the results file does not carry, recorded as an explicit note so
-    /// the log never invents a user, time, profile, option or query.
+    /// the log never invents a user, time, profile or query.
     pub user: String,
     pub time: String,
     pub profiles: String,
+    /// The ticked column options ("table.column: option"), or the honest
+    /// "not recorded" note for an older results file (H2 / decision 23).
     pub options: String,
     pub queries: String,
     pub warnings: Vec<String>,
     pub changed_during_check: Vec<String>,
     /// SHA-256 of the run definition (results schema v2).
     pub definition_hash: String,
+    /// Connection-safety summary lines (audit M5, H1).
+    pub connections: Vec<String>,
     /// Hook script names + the SHA-256 of the code that ran (PLAN 4.9).
     pub hook_scripts: Vec<String>,
 }
 
 const NOT_RECORDED: &str = "not recorded in this results file";
+
+/// The ticked options in "table.column: option" form (sorted), or the honest
+/// "not recorded" note for a results file that predates option recording.
+fn options_text(results: &RunResults) -> String {
+    if !results_mod::options_recorded(results) {
+        return layout::OPTIONS_NOT_RECORDED.to_string();
+    }
+    let mut lines = Vec::new();
+    for (table, t) in &results.tables {
+        for n in &t.column_notes {
+            if n.kind == "option" {
+                lines.push(format!("{table}.{}: {}", n.column, n.note));
+            }
+        }
+    }
+    lines.sort();
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("; ")
+    }
+}
+
+/// The connection-safety summary ("side: ...") for the run (audit M5, H1).
+fn connections_text(results: &RunResults) -> Vec<String> {
+    layout::build(results, None, &ReportOptions::default()).connections
+}
 
 /// Build the log record from the typed results and optional hook evidence.
 pub fn build_log(
@@ -60,27 +91,33 @@ pub fn build_log(
     hooks: Option<&HookEvidence>,
     _options: &ReportOptions,
 ) -> RunLog {
+    // The displayed verdict folds hook findings over the inner verdict, so a
+    // `fail` custom check is never logged as PASS.  It also carries the
+    // "(with options)" / "options not recorded" qualifier (never a bare PASS
+    // that the file cannot vouch for).
+    let inner =
+        crate::verify::displayed_verdict(results, hooks.unwrap_or(&HookEvidence::default()));
+    let verdict = layout::verdict_display(
+        layout::verdict_word(inner),
+        results.options_applied,
+        results_mod::options_recorded(results),
+    );
     RunLog {
         tool_version: results.tool_version.clone(),
         run_id: results.run_id.clone(),
         mapping_hash: results.mapping_hash.clone(),
-        // The displayed verdict folds hook findings over the inner verdict, so a
-        // `fail` custom check is never logged as PASS.
-        verdict: layout::verdict_word(crate::verify::displayed_verdict(
-            results,
-            hooks.unwrap_or(&HookEvidence::default()),
-        ))
-        .to_string(),
+        verdict,
         coverage: results.coverage_line.clone(),
         results_sha256: results.results_sha256.clone(),
         user: NOT_RECORDED.to_string(),
         time: NOT_RECORDED.to_string(),
         profiles: NOT_RECORDED.to_string(),
-        options: NOT_RECORDED.to_string(),
+        options: options_text(results),
         queries: NOT_RECORDED.to_string(),
         warnings: results.warnings.clone(),
         changed_during_check: results.changed_during_check.clone(),
         definition_hash: results.definition_hash.clone(),
+        connections: connections_text(results),
         hook_scripts: hooks
             .map(|h| {
                 h.scripts
@@ -113,6 +150,9 @@ pub fn text_log(
     let _ = writeln!(out, "profiles: {}", log.profiles);
     let _ = writeln!(out, "options: {}", log.options);
     let _ = writeln!(out, "queries: {}", log.queries);
+    for l in &log.connections {
+        let _ = writeln!(out, "connection: {l}");
+    }
     if !log.warnings.is_empty() {
         let _ = writeln!(out, "warnings: {}", log.warnings.join("; "));
     }
@@ -140,10 +180,10 @@ pub fn write_run_log(
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         let log = build_log(results, hooks, options);
         let bytes = serde_json::to_vec_pretty(&log)?;
-        std::fs::write(path, bytes)?;
+        crate::write_private(path, &bytes)?;
     } else {
         let text = text_log(results, hooks, options);
-        std::fs::write(path, text)?;
+        crate::write_private(path, text.as_bytes())?;
     }
     Ok(())
 }
@@ -229,5 +269,75 @@ mod tests {
         let text = text_log(&results(), Some(&hooks), &ReportOptions::default());
         assert!(text.contains("hook.py"), "{text}");
         assert!(text.contains(&"ab".repeat(32)));
+    }
+
+    #[test]
+    fn an_old_results_file_logs_options_not_recorded_not_a_bare_pass() {
+        let mut r = results();
+        r.results_version = 2;
+        r.options_applied = false;
+        let r = finalise(r);
+        let text = text_log(&r, None, &ReportOptions::default());
+        assert!(
+            text.contains("verdict: PASS (options not recorded — older results file)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("options: options not recorded (older results file)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_log_lists_applied_options_and_connections() {
+        use dmux_engine::results::{ColumnNote, ConnectionInfo, Connections, TableResult};
+        let mut r = results();
+        r.options_applied = true;
+        r.tables.insert(
+            "s.t".into(),
+            TableResult {
+                table: "s.t".into(),
+                level: dmux_engine::results::CheckLevel::FullValues,
+                verdict: Verdict::Pass,
+                old_rows: None,
+                new_rows: None,
+                columns_covered: None,
+                differing_buckets: None,
+                missing_buckets: None,
+                extra_buckets: None,
+                missing_rows: None,
+                extra_rows: None,
+                changed_rows: None,
+                reasons: vec![],
+                column_notes: vec![ColumnNote {
+                    column: "balance".into(),
+                    kind: "option".into(),
+                    note: "round to 2 decimals".into(),
+                }],
+            },
+        );
+        r.connections = Connections {
+            old: ConnectionInfo {
+                tls: "plaintext".into(),
+                plaintext_reason: Some("test network".into()),
+                server_version: "17.0".into(),
+                server_encoding: "UTF8".into(),
+                ..ConnectionInfo::default()
+            },
+            new: ConnectionInfo::default(),
+        };
+        let r = finalise(r);
+        let text = text_log(&r, None, &ReportOptions::default());
+        assert!(text.contains("verdict: PASS (with options)"), "{text}");
+        assert!(
+            text.contains("options: s.t.balance: round to 2 decimals"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "connection: old: plaintext (reason: test network); PostgreSQL 17.0, encoding UTF8"
+            ),
+            "{text}"
+        );
     }
 }

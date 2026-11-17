@@ -26,6 +26,9 @@ fn main() {
     );
 
     tauri::Builder::default()
+        // The save dialog for report export is opened from Rust only; the
+        // webview has no dialog permission (see capabilities/default.json).
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::profiles::list_profiles,
             commands::profiles::save_profile,
@@ -44,6 +47,7 @@ fn main() {
             commands::data::set_run_paused,
             commands::data::cancel_run,
             commands::data::get_results,
+            commands::report::export_report,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());
@@ -51,8 +55,16 @@ fn main() {
             app.manage(app_state);
             Ok(())
         })
-        .run(context)
-        .expect("error while running the Dmux app");
+        .build(context)
+        .expect("error while building the Dmux app")
+        .run(|app, event| {
+            // Session-only passwords (no keychain, T055) never outlive the app.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<state::AppState>() {
+                    state.clear_session_passwords();
+                }
+            }
+        });
 }
 
 #[cfg(test)]

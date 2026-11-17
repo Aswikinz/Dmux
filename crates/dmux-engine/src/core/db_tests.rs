@@ -55,7 +55,21 @@ async fn session(c: &mut Client) -> Transaction<'_> {
         .await
         .unwrap();
     t.batch_execute(&settings_block()).await.unwrap();
+    // check_session requires row_security = off on 9.5+, but the setting does
+    // not exist on 9.4 (nightly's OLD server), so it is applied conditionally.
+    if version_num(&t).await >= 90500 {
+        t.batch_execute("SET LOCAL row_security = off")
+            .await
+            .unwrap();
+    }
     t
+}
+
+/// Read `server_version_num` from a live transaction.
+async fn version_num(t: &Transaction<'_>) -> i32 {
+    let row = t.query_one("SHOW server_version_num", &[]).await.unwrap();
+    let text: String = row.get(0);
+    text.parse().unwrap()
 }
 
 const ACC_COLS: &str = "accounts(acct_id, bank_code, holder_name, branch_code, balance, rate, opened_at, doc_blob, remarks)";
@@ -328,6 +342,36 @@ async fn refuses_to_run_outside_the_read_only_session() {
             .unwrap_err(),
         CoreError::Db("42P01".into())
     );
+}
+
+#[tokio::test]
+async fn row_security_off_is_required_on_95_plus_only() {
+    let Some((mut oc, _)) = both().await else {
+        return;
+    };
+    let plan = accounts_plan();
+    let src = Source::Derived(ACC_A);
+    // Everything correct except `row_security = off`, which a session could
+    // omit (e.g. a hand-rolled connection or a pooler that dropped it).  On
+    // 9.5+ that must be refused before any scan; on 9.4 it is not required.
+    let t = oc
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .unwrap();
+    t.batch_execute(&settings_block()).await.unwrap();
+    let result = fingerprint(&t, &plan, Side::Old, &src, "m").await;
+    if version_num(&t).await >= 90500 {
+        assert_eq!(
+            result.unwrap_err(),
+            CoreError::UnsafeSession("row_security")
+        );
+    } else {
+        assert!(result.is_ok(), "9.4 must not require row_security");
+    }
+    t.rollback().await.unwrap();
 }
 
 /// Plan `id integer` (key) + `v` of the given type on both sides.

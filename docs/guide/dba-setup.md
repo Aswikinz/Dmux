@@ -27,7 +27,10 @@ Notes on that command:
 - `-v pw=` is the password, wrapped in single quotes **inside** the double quotes so that
   PostgreSQL stores it as a quoted literal. Pick a long random password; it is stored
   hashed in the server, and Dmux keeps its copy in the operating system's keychain, not
-  in a file.
+  in a file. On a machine with no keychain, the desktop app holds a typed password in
+  memory for that session only, and the command-line version reads it from an environment
+  variable (`--password-env`); neither writes it to disk, and run definition files may not
+  contain a password at all.
 - Your shell keeps the command line in its history. Clear that history entry afterwards,
   or start the command with a space if your shell is configured to ignore such lines.
 - `-v schema=` is the schema Dmux should read. Run the script once per schema. On later
@@ -84,6 +87,46 @@ DROP ROLE dmux_reader;
 
 The same three lines are at the foot of the script, so nobody has to look them up later.
 
+### Row-level security (RLS)
+
+Some tables use row-level security: a policy that decides which rows each login may see.
+For an ordinary query a policy hides rows without any warning, so a comparison tool that
+read such a table normally would compare only the rows it was allowed to see and could
+report a PASS for data it never looked at. Dmux does not allow that. It turns row security
+off for every read (`row_security = off`), and PostgreSQL then answers with an error
+(SQLSTATE 42501) instead of quietly filtering. Dmux reports the table as a **TOOL FAULT**,
+never as a PASS, with this message:
+
+> the Dmux login is not allowed to read this table: grant SELECT, and BYPASSRLS if the
+> table uses row-level security
+
+The same error also appears when the login simply has no `SELECT` on the table, which is why
+the message names both causes. First check the grant (section 1 above). If the table uses
+row-level security (`relrowsecurity` on `pg_class`, PostgreSQL 9.5 and later), one of these
+must hold:
+
+- the `dmux_reader` login has `BYPASSRLS`, or
+- the table's owner has exempted the login from the policy, or
+- the table is left without RLS for the comparison window.
+
+`BYPASSRLS` lets the login read every row regardless of policy, which is what Dmux needs to
+prove the migration copied every row:
+
+```sql
+ALTER ROLE dmux_reader BYPASSRLS;
+```
+
+This is a real extra power for a login that is otherwise read-only: it can then read rows a
+policy would hide. Give it to the comparison login only, for the comparison window, and
+revoke it afterwards:
+
+```sql
+ALTER ROLE dmux_reader NOBYPASSRLS;
+```
+
+Dmux's connection test reports whether the login has `BYPASSRLS` and lists the tables with
+RLS enabled, so the gap is visible before a run rather than discovered half-way through it.
+
 ## 2. Why Dmux refuses a superuser
 
 A superuser can do anything, including things that look read-only and are not. A
@@ -102,7 +145,7 @@ login's own default, the `BEGIN ... READ ONLY` that opens every transaction, and
 that Dmux writes every statement itself, with no free-form SQL accepted from a user, a
 mapping file or a script.
 
-## 3. Encryption, and trusting a certificate once
+## 3. Encryption, certificates and the bank's own CA
 
 Dmux tries a verified encrypted connection first. "Encrypted" means the traffic between
 Dmux and the server cannot be read on the network. "Verified" means Dmux checks that the
@@ -125,6 +168,25 @@ The choices the user sees are:
 | --- | --- |
 | Encrypted and verified (the default) | The certificate must be trusted, either because the machine's certificate store already trusts it, or because the user compared its fingerprint once and chose to trust it. |
 | Not encrypted | Traffic is readable on the network. Dmux demands an explicit choice, and the choice is printed in the report. |
+
+### A private certificate authority (CA file)
+
+Many banks sign their internal server certificates with their own certificate authority
+(CA), which a laptop's built-in list of trusted authorities does not contain. Rather than
+trusting each certificate by fingerprint, give Dmux the CA's certificate as a **PEM file**
+(a text file that starts with `-----BEGIN CERTIFICATE-----`; it may hold several
+certificates). Dmux adds those certificates to the public ones it already trusts. The
+server's host name is still checked, so a certificate from the right CA but for the wrong
+server is refused.
+
+- In the desktop app, choose the encryption mode "Verify certificate" and fill in the field
+  "Your bank's certificate authority file (optional)" on the Connect screen.
+- On the command line, `dmux probe`, `dmux inventory` and `dmux capture` take
+  `--ca-file <PATH>`. In a run definition file for `dmux run`, put `ca_file` in the `old`
+  and `new` connection tables. `ca_file` is part of the run's identity, so a run resumed
+  later cannot quietly start trusting different certificates.
+- An empty path, or a CA file together with encryption switched off, is refused. A file that
+  is missing or is not valid PEM gives an error that names only the path.
 
 Login with Kerberos is not supported in this version. A login and password is required.
 
@@ -154,9 +216,34 @@ practical advice is one of these, in order of preference:
 2. **Run on a replica** (a standby copy of the server). Reads do not compete with
    business traffic and do not hold back clean-up on the primary. Both sides need to be
    at the same point in time for a live comparison; a restored copy with no further writes
-   is the usual shape.
+   is the usual shape. **Pause replay on the replica for the duration of the check**
+   (`pg_wal_replay_pause()` on PostgreSQL 10 and later, `pg_xlog_replay_pause()` on 9.6
+   and earlier), or check a primary instead. A replica that keeps applying changes moves
+   under Dmux's feet. The per-table counters Dmux normally uses to notice a moving table
+   are kept per server and are not carried over by replication, so on a replica Dmux
+   watches the replay position instead: if replay moves while a table is being checked,
+   that table is marked **CHANGED DURING CHECK**, never PASS. Pausing replay avoids those
+   wasted results. Resume replay when the run ends.
 3. **Run in a quiet window** on the live databases. Set the run window in the app, for
    example 22:00 to 05:00, and accept that busy tables may need a second attempt.
+
+### Change detection needs `track_counts`
+
+Dmux notices that a table moved by reading the server's own counters for inserts, updates
+and deletes (the `pg_stat_*` views) before and after reading the table. Those counters only
+move when the server setting `track_counts` is **on**, which is the default. Check it on
+both servers:
+
+```sql
+SHOW track_counts;   -- expect: on
+```
+
+If it is off, or if the table is a foreign table, Dmux cannot detect change on that side.
+It then marks the table **NEEDS REVIEW** with the reason "change detection unavailable"
+(never a PASS), and a resumed run does not reuse that table's stored result. Switch
+`track_counts` on, which needs no restart, or run on a frozen source and accept the review
+note. Also be aware that a server restart or a statistics reset zeroes the counters, so a
+stored result is not reused across one.
 
 Two further points for planning:
 
@@ -199,6 +286,7 @@ SET LOCAL intervalstyle      = 'iso_8601';
 SET LOCAL bytea_output       = 'hex';
 SET LOCAL extra_float_digits = 0;
 SET LOCAL xmloption          = 'document';
+SET LOCAL row_security       = 'off';   -- 9.5 and later
 SET LOCAL statement_timeout  = '<run window>';
 SET LOCAL lock_timeout       = '5s';
 SET LOCAL application_name   = 'dmux';
@@ -277,6 +365,9 @@ with a reason.
 - [ ] The four `pg_roles` flags are all false, and `INSERT` is refused (section 1).
 - [ ] The script has been run for every schema Dmux will read; a default privilege rule
       covers tables created later.
+- [ ] `SHOW track_counts` is `on` on both servers, and replay is paused if a replica is used.
+- [ ] RLS-protected tables are covered: `dmux_reader` has `BYPASSRLS`, or each such table
+      is exempted, for the comparison window (section 1, "Row-level security").
 - [ ] The certificate fingerprint has been compared with the server team's record, and
       the encryption mode is recorded for the report.
 - [ ] You know whether a pooler sits in the path; a direct connection is used if possible.

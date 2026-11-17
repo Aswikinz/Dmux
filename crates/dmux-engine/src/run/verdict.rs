@@ -46,8 +46,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::core::compare::{Comparison, NotPassReason};
 use crate::core::fingerprint::Decimal;
 use crate::results::{
-    add_table, apply_coverage, finalise, from_core, overall_verdict, CheckLevel, IgnoredItem,
-    RunResults, StructureFinding, TableResult, Verdict,
+    add_table, any_options_applied, apply_coverage, finalise, from_core, overall_verdict,
+    CheckLevel, ColumnNote, IgnoredItem, RunResults, StructureFinding, TableResult, Verdict,
 };
 
 use super::RunOutcome;
@@ -109,6 +109,8 @@ pub struct Evidence {
     pub changed_rows: Option<usize>,
     /// Informational reasons from the path (no effect on the verdict).
     pub notes: Vec<String>,
+    /// Per-column notes (ticked options and type-change flags, H2).
+    pub column_notes: Vec<ColumnNote>,
     /// Minimum verdicts with their reasons.
     pub floors: Vec<(Verdict, String)>,
 }
@@ -131,6 +133,7 @@ impl Evidence {
             extra_rows: None,
             changed_rows: None,
             notes: Vec::new(),
+            column_notes: Vec::new(),
             floors: Vec::new(),
         }
     }
@@ -172,6 +175,7 @@ pub fn decide(e: &Evidence) -> (TableResult, bool) {
         extra_rows: e.extra_rows,
         changed_rows: e.changed_rows,
         reasons: Vec::new(),
+        column_notes: e.column_notes.clone(),
     };
 
     // Rules 1 and 2.
@@ -475,6 +479,7 @@ impl Builder {
             ));
         }
         r.verdict = v;
+        r.options_applied = any_options_applied(r);
         let results = finalise(apply_coverage(std::mem::take(r)));
         RunOutcome {
             exit_code: exit_code_for(results.verdict),

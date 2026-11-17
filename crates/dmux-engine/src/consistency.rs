@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_postgres::Transaction;
 
+use crate::results::Verdict;
+
 /// Errors from consistency queries.
 #[derive(Debug, Error)]
 pub enum ConsistencyError {
@@ -107,6 +109,69 @@ pub async fn read_counters(
         n_tup_del: r.try_get(3)?,
         storage: r.try_get(4)?,
     })
+}
+
+/// Read whether `track_counts` is on for this session (9.4-safe, read-only,
+/// fixed SQL).  When it is off the tuple counters never move, so change
+/// detection cannot vouch for a table (M3).
+pub async fn read_track_counts(txn: &Transaction<'_>) -> Result<bool, ConsistencyError> {
+    let row = txn
+        .query_one("SELECT pg_catalog.current_setting('track_counts')", &[])
+        .await?;
+    let value: String = row.try_get(0)?;
+    Ok(value.eq_ignore_ascii_case("on"))
+}
+
+/// Why change detection cannot vouch for one live side of one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideChangeDetection {
+    /// `track_counts` is on and the table is not foreign: counters move.
+    Ok,
+    /// `track_counts` is off: tuple counters never move.
+    TrackCountsOff,
+    /// A foreign table (relkind `f`): it has no counters at all.
+    ForeignTable,
+}
+
+impl SideChangeDetection {
+    pub fn of(track_counts_on: bool, foreign: bool) -> Self {
+        if foreign {
+            SideChangeDetection::ForeignTable
+        } else if !track_counts_on {
+            SideChangeDetection::TrackCountsOff
+        } else {
+            SideChangeDetection::Ok
+        }
+    }
+
+    /// Whether a stored result for this side may be reused on resume.
+    pub fn ok(self) -> bool {
+        matches!(self, SideChangeDetection::Ok)
+    }
+}
+
+/// The per-table NEEDS_REVIEW floor when change detection is unavailable on
+/// either side, with the reason.  `None` when both sides can vouch, so the
+/// runner must apply this floor to every data-level table (M3).
+pub fn change_detection_floor(
+    old: SideChangeDetection,
+    new: SideChangeDetection,
+) -> Option<(Verdict, String)> {
+    match (old, new) {
+        (SideChangeDetection::Ok, SideChangeDetection::Ok) => None,
+        (SideChangeDetection::TrackCountsOff, _) => Some((
+            Verdict::NeedsReview,
+            "change detection unavailable: track_counts is off on old".to_string(),
+        )),
+        (_, SideChangeDetection::TrackCountsOff) => Some((
+            Verdict::NeedsReview,
+            "change detection unavailable: track_counts is off on new".to_string(),
+        )),
+        _ => Some((
+            Verdict::NeedsReview,
+            "change detection unavailable: foreign table".to_string(),
+        )),
+    }
 }
 
 /// What the tuple counters of a server are relative to.
@@ -294,6 +359,47 @@ mod tests {
             n_tup_del: 4,
             ..a.clone()
         }));
+    }
+
+    #[test]
+    fn change_detection_floor_for_track_counts_off_and_foreign() {
+        use SideChangeDetection::*;
+        assert_eq!(change_detection_floor(Ok, Ok), None);
+        assert_eq!(
+            change_detection_floor(TrackCountsOff, Ok),
+            Some((
+                Verdict::NeedsReview,
+                "change detection unavailable: track_counts is off on old".into()
+            ))
+        );
+        assert_eq!(
+            change_detection_floor(Ok, TrackCountsOff),
+            Some((
+                Verdict::NeedsReview,
+                "change detection unavailable: track_counts is off on new".into()
+            ))
+        );
+        for (old, new) in [
+            (ForeignTable, Ok),
+            (Ok, ForeignTable),
+            (ForeignTable, ForeignTable),
+        ] {
+            assert_eq!(
+                change_detection_floor(old, new),
+                Some((
+                    Verdict::NeedsReview,
+                    "change detection unavailable: foreign table".into()
+                ))
+            );
+        }
+        // The (track_counts, foreign) decision for one side.
+        assert_eq!(SideChangeDetection::of(true, false), Ok);
+        assert_eq!(SideChangeDetection::of(false, false), TrackCountsOff);
+        assert_eq!(SideChangeDetection::of(true, true), ForeignTable);
+        assert_eq!(SideChangeDetection::of(false, true), ForeignTable);
+        assert!(Ok.ok());
+        assert!(!TrackCountsOff.ok());
+        assert!(!ForeignTable.ok());
     }
 
     #[test]

@@ -178,18 +178,8 @@ const makeMapping = (inventory: Inventory): Mapping => {
     });
   });
 
-  if (inventory.oldEncoding !== inventory.newEncoding) {
-    needsAttention.push({
-      id: 'm-encoding',
-      oldName: `encoding ${inventory.oldEncoding}`,
-      newName: `encoding ${inventory.newEncoding}`,
-      confidence: 'fuzzy',
-      approved: false,
-    });
-  }
-
   return {
-    rules: ['identity mapping', 'encoding review required'],
+    rules: ['identity mapping'],
     matches,
     needsAttention,
     ignored: [],
@@ -452,6 +442,9 @@ const makeResults = (fixture: string): Results => {
     ignored: makeIgnored(coverage.ignoredTables),
     failures,
     tableResults,
+    optionsApplied: false,
+    optionsRecorded: true,
+    warnings: [],
   };
 };
 
@@ -495,12 +488,17 @@ export interface MockEngineOptions {
  */
 export function createMockEngine(options: MockEngineOptions = {}): Engine {
   let currentRunId = 0;
+  let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
   // the backend's "password lives in the keychain, not in the profile" shape so
   // `saveProfile` / `profileHasPassword` behave like the real engine.
   const savedPasswords = new Map<string, string>();
 
   return {
+    setSuperuserOverride(override): void {
+      superuserReason = override?.reason.trim() ? override.reason.trim() : null;
+    },
+
     async testConnection(
       profile: ConnectionProfile,
       // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the mock ignores the one-time password
@@ -510,13 +508,16 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
         return { ok: false, error: 'Could not reach the database server.' };
       }
       if (profile.user === 'superuser') {
+        // Like the real backend: refused unless the user overrode it with a reason.
+        if (!superuserReason) {
+          return { ok: false, error: 'superuser login refused by Dmux', superuserRefused: true };
+        }
         return {
           ok: true,
           info: makeServerInfo({
             isSuperuser: true,
             canWrite: true,
-            warning:
-              'This login is a superuser. Dmux refuses superuser logins by default because a read-only transaction can still do harm.',
+            warning: `Superuser login allowed by you. Reason recorded in the results: ${superuserReason}`,
           }),
         };
       }
@@ -535,6 +536,17 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
           ok: true,
           info: makeServerInfo({
             tls: { state: 'encrypted', verified: false, fingerprint: 'a1:b2:c3:d4' },
+          }),
+        };
+      }
+      // A private-CA bundle only applies to 'verify'; the mock can't read a real
+      // file, so it reports the connection as verified (the field still flows
+      // through the ConnectionProfile shape unchanged).
+      if (profile.caFile) {
+        return {
+          ok: true,
+          info: makeServerInfo({
+            tls: { state: 'encrypted', verified: true },
           }),
         };
       }
@@ -621,12 +633,9 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
 
     async exportReport(request: ReportRequest): Promise<ReportResult> {
       // The mock never touches a real path: it reports a placeholder destination
-      // so the "saved to …" message stays meaningful without a temp-path default.
-      const base = request.filePath ?? 'chosen-location';
-      if (request.format === 'pdf') {
-        return { ok: true, filePath: `${base}/report.pdf` };
-      }
-      return { ok: true, filePath: `${base}/report.xlsx` };
+      // so the "saved to …" message stays meaningful.
+      const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
+      return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
     },
 
     async getVersion(): Promise<string> {

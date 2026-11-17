@@ -1,11 +1,14 @@
 import { useEffect, useState, useRef } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { ProgressRow } from '../components/ProgressRow';
 import { StatusBadge } from '../design/StatusBadge';
 import { ErrorCard } from '../design/ErrorCard';
+import { VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
+import { formatDurationRange } from '../components/duration';
 import type { Engine } from '../api/engine';
-import type { RunDefinition, RunProgress } from '../api/contract';
+import type { RunDefinition, RunProgress, Verdict } from '../api/contract';
 
 interface RunScreenProps {
   engine: Engine;
@@ -26,6 +29,10 @@ export function RunScreen({
 }: RunScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  // The overall verdict, fetched as soon as the run ends, so the screen never
+  // shows a neutral "finished" next to a FAIL the user has not seen yet.
+  const [verdict, setVerdict] = useState<{ word: Verdict; label?: string } | null>(null);
+  const [verdictError, setVerdictError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -69,6 +76,26 @@ export function RunScreen({
     };
   }, [engine, progress, onProgressChange]);
 
+  const runId = progress?.runId;
+  const isDone = progress?.overallState === 'done';
+  useEffect(() => {
+    if (!isDone || !runId) return;
+    let mounted = true;
+    setVerdictError(null);
+    engine
+      .getResults(runId)
+      .then((r) => {
+        if (!mounted) return;
+        setVerdict({ word: r.verdict, label: qualifiedVerdictLabel(r) });
+      })
+      .catch((e: unknown) => {
+        if (mounted) setVerdictError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [engine, runId, isDone]);
+
   async function togglePause() {
     if (!progress) return;
     try {
@@ -100,7 +127,7 @@ export function RunScreen({
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Run checks</h2>
+      <ScreenHeader title="Run checks" subtitle="Dmux reads both databases and compares them. You can pause or cancel at any time." />
       {error && <ErrorCard title="Run error">{error}</ErrorCard>}
       {progress && (
         <>
@@ -113,18 +140,39 @@ export function RunScreen({
                     : progress.overallState === 'paused'
                       ? 'Paused'
                       : progress.overallState === 'cancelled'
-                        ? 'Cancelled'
-                        : 'Finished'}
+                        ? 'Cancelled: this run has no verdict.'
+                        : 'The run has finished.'}
                 </div>
-                {progress.etaSecondsMin !== undefined && progress.etaSecondsMax !== undefined && (
-                  <div className="text-sm text-slate-600 dark:text-slate-300">
-                    Time remaining: {progress.etaSecondsMin}s – {progress.etaSecondsMax}s
-                  </div>
+                {!finished &&
+                  progress.etaSecondsMin !== undefined &&
+                  progress.etaSecondsMax !== undefined && (
+                    <div className="text-sm text-slate-600 dark:text-slate-300">
+                      Time remaining:{' '}
+                      {formatDurationRange(progress.etaSecondsMin, progress.etaSecondsMax)}
+                    </div>
+                  )}
+              </div>
+              {progress.overallState !== 'done' && <StatusBadge status={progress.overallState} />}
+            </div>
+            {progress.overallState === 'done' && (
+              <div className="mb-4">
+                {verdict ? (
+                  <VerdictBanner verdict={verdict.word} label={verdict.label} />
+                ) : verdictError ? (
+                  <ErrorCard title="Could not load the verdict">
+                    {verdictError} Open the results to see what happened.
+                  </ErrorCard>
+                ) : (
+                  <p className="text-sm text-slate-600 dark:text-slate-300">Getting the verdict…</p>
                 )}
               </div>
-              <StatusBadge status={progress.overallState} />
-            </div>
-            <div className="mb-4 max-h-[50vh] space-y-2 overflow-auto">
+            )}
+            <div
+              className="mb-4 max-h-[50vh] space-y-0.5 overflow-auto rounded-xl"
+              tabIndex={0}
+              role="region"
+              aria-label="Progress per table"
+            >
               {progress.tables.map((t) => (
                 <ProgressRow key={t.tableId} progress={t} />
               ))}
@@ -146,7 +194,7 @@ export function RunScreen({
               </Button>
             </div>
           </Panel>
-          <div className="flex justify-between">
+          <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
               Back
             </Button>

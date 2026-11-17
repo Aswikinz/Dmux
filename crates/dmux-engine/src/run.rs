@@ -36,20 +36,22 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::consistency::{
-    read_counters, read_replica_state, read_server_epoch, read_wal_position, replica_decision,
-    ChangeCounters, ReplicaDecision, ReplicaState, ServerEpoch,
+    change_detection_floor, read_counters, read_replica_state, read_server_epoch,
+    read_track_counts, read_wal_position, replica_decision, ChangeCounters, ReplicaDecision,
+    ReplicaState, ServerEpoch, SideChangeDetection,
 };
 use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerdict};
 use crate::core::drilldown::{classify, fetch_rows};
 use crate::core::fingerprint::{fingerprint, Fingerprint, Side, Source, TablePlan};
 use crate::core::normalise::{plan_column, ColumnOptions};
-use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession};
+use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession, ServerInfo};
 use crate::estimate::{estimate_from_seconds, timed_sample, total_estimate, Estimate};
 use crate::inventory::{ConstraintKind, DatabaseInventory};
 use crate::mapping::Mapping;
-use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecInputs};
+use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecInputs, TableSpec};
 use crate::results::{
-    fresh_run_id, ChangedRowExport, CheckLevel, ControlTotalExport, RunResults, TableDetail,
+    fresh_run_id, ChangedRowExport, CheckLevel, ColumnNote, ConnectionInfo, Connections,
+    ControlTotalExport, RunResults, TableDetail,
 };
 use crate::store::{Loaded, RunKey, SideMark, Store, StoredTableResult};
 
@@ -80,6 +82,10 @@ pub struct RunConfig {
     /// Maximum concurrent scans on the new side (see the module docs).
     pub new_parallelism: usize,
     pub allow_superuser: bool,
+    /// The recorded reason for a superuser override, when one was accepted.
+    /// Recorded in the results `connections` block (audit M5); `None` when the
+    /// caller allowed a superuser without a recorded reason.
+    pub allow_superuser_reason: Option<String>,
     /// Put row keys of differing rows into the results (the user ticked export).
     pub export_keys: bool,
     /// An optional resume store path (see `crate::store`).
@@ -115,6 +121,7 @@ impl RunConfig {
             old_parallelism: 2,
             new_parallelism: 4,
             allow_superuser: false,
+            allow_superuser_reason: None,
             export_keys: false,
             resume_store: None,
             stats_settle: DEFAULT_STATS_SETTLE,
@@ -332,14 +339,23 @@ pub fn map_table(mapping: &Mapping, schema: &str, table: &str) -> (String, Strin
 pub fn definition_hash(config: &RunConfig) -> String {
     use sha2::Digest;
     let input = |i: &Input| match i {
-        Input::Live(p) => serde_json::json!({
-            "host": p.host, "port": p.port, "db": p.dbname, "user": p.user,
-            "tls": match &p.tls_mode {
-                crate::db::TlsMode::VerifyFull => "verify".to_string(),
-                crate::db::TlsMode::TrustFingerprint(f) => format!("fingerprint:{f}"),
-                crate::db::TlsMode::Disable(_) => "disable".to_string(),
-            },
-        }),
+        Input::Live(p) => {
+            let mut v = serde_json::json!({
+                "host": p.host, "port": p.port, "db": p.dbname, "user": p.user,
+                "tls": match &p.tls_mode {
+                    crate::db::TlsMode::VerifyFull => "verify".to_string(),
+                    crate::db::TlsMode::TrustFingerprint(f) => format!("fingerprint:{f}"),
+                    crate::db::TlsMode::Disable(_) => "disable".to_string(),
+                },
+            });
+            // Which certificates the run trusts is part of its definition, so a
+            // resumed run cannot silently swap the CA bundle.  Added only when
+            // set, so runs without one keep their earlier hash.
+            if let Some(ca) = &p.ca_file {
+                v["ca_file"] = serde_json::Value::String(ca.clone());
+            }
+            v
+        }
         Input::File(f) => serde_json::json!({ "file_sha256": f.sha256 }),
     };
     let canonical = serde_json::json!({
@@ -361,6 +377,101 @@ fn level_for(config: &RunConfig, path: &str) -> CheckLevel {
         .get(path)
         .copied()
         .unwrap_or(config.default_level)
+}
+
+/// The connection-safety record for one live side, from its profile's actual
+/// TLS mode and the probe's server information (audit M5).  The superuser
+/// override reason is the run-level override; `None` when no reason was
+/// recorded.
+pub(crate) fn connection_info(
+    profile: &ConnProfile,
+    info: &ServerInfo,
+    superuser_reason: Option<&str>,
+) -> ConnectionInfo {
+    let (tls, tls_fingerprint, plaintext_reason) = match &profile.tls_mode {
+        crate::db::TlsMode::VerifyFull => ("verified".to_string(), None, None),
+        crate::db::TlsMode::TrustFingerprint(fp) => ("pinned".to_string(), Some(fp.clone()), None),
+        crate::db::TlsMode::Disable(reason) => {
+            ("plaintext".to_string(), None, Some(reason.clone()))
+        }
+    };
+    ConnectionInfo {
+        tls,
+        tls_fingerprint,
+        plaintext_reason,
+        superuser: info.is_superuser,
+        superuser_reason: if info.is_superuser {
+            superuser_reason.map(str::to_string)
+        } else {
+            None
+        },
+        can_write: info.can_write,
+        can_write_reasons: info.can_write_reasons.clone(),
+        pooler_suspected: info.pooler_suspected,
+        md5_available: info.md5_available,
+        server_version: info.version_string.clone(),
+        server_encoding: info.encoding.clone(),
+        rolbypassrls: info.rolbypassrls,
+        rls_tables: info.rls_tables.clone(),
+    }
+}
+
+/// Record the plain-language run warnings the connection-safety decisions
+/// imply (audit M5, H1): a login that can write, a superuser login, and
+/// row-level security that Dmux refuses to read filtered.
+pub(crate) fn connection_warnings(
+    results: &mut RunResults,
+    old: &ConnectionInfo,
+    new: &ConnectionInfo,
+) {
+    for (side, info) in [("old", old), ("new", new)] {
+        if info.can_write {
+            let reasons = if info.can_write_reasons.is_empty() {
+                "it can write".to_string()
+            } else {
+                info.can_write_reasons.join("; ")
+            };
+            let w = format!(
+                "the {side} database login can write ({reasons}); the login should be read-only"
+            );
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+        if info.superuser {
+            let why = info
+                .superuser_reason
+                .as_deref()
+                .unwrap_or("no reason recorded");
+            let w = format!("the {side} database login is a superuser (override: {why})");
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+        if !info.rls_tables.is_empty() && !info.rolbypassrls {
+            let w = format!(
+                "the {side} database: {} tables use row-level security; Dmux refused to read them filtered",
+                info.rls_tables.len()
+            );
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+    }
+}
+
+/// Per-column notes for one table's plan, in stable (column, then kind) order
+/// (H2 / decision 23).  Re-planning is pure and cheap; a column that cannot be
+/// planned faults the table elsewhere and simply contributes no note here.
+pub(crate) fn collect_column_notes(spec: &TableSpec) -> Vec<ColumnNote> {
+    let mut notes: Vec<ColumnNote> = Vec::new();
+    for m in &spec.columns {
+        if let Ok(cp) = plan_column(m) {
+            notes.extend(crate::results::column_notes(&m.old_name, &cp.flags));
+        }
+    }
+    notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    notes
 }
 
 /// Run a comparison: live against live, file against live (either side), or
@@ -493,6 +604,36 @@ pub(crate) async fn wal(s: &mut ReadOnlySession, version_num: i32) -> Option<Str
     .await
     .ok()
     .and_then(|w| w.lsn)
+}
+
+/// Whether `track_counts` is on for a live side; an unreadable setting is
+/// treated as off (fail-closed: change detection cannot vouch).
+pub(crate) async fn track_counts_on(s: &mut ReadOnlySession) -> bool {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_track_counts(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The `schema.table` paths of every foreign table on a live side.  A failed
+/// lookup is an error, never "no foreign tables" (fail closed, M3).
+pub(crate) async fn foreign_tables_set(
+    s: &mut ReadOnlySession,
+) -> Result<BTreeSet<String>, RunError> {
+    s.with_read_only("30s", |to| {
+        Box::pin(async move {
+            crate::plan::foreign_tables(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(RunError::from)
 }
 
 pub(crate) async fn scan_fingerprint(
@@ -795,10 +936,33 @@ async fn run_live(
             .warnings
             .push("new database is SQL_ASCII; never a clean PASS on encoding (P19)".into());
     }
+    // Connection-safety decisions reach the results and page 1 of the report
+    // (audit M5): TLS state, superuser override and write access become plain
+    // warnings a signer can read.
+    let old_conn = connection_info(
+        old_profile,
+        &old_info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    let new_conn = connection_info(
+        new_profile,
+        &new_info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    connection_warnings(&mut b.results, &old_conn, &new_conn);
+    b.results.connections = Connections {
+        old: old_conn,
+        new: new_conn,
+    };
     b.results.wal_start_lsn = wal(&mut new_s, new_info.version_num).await;
     // What the counters are relative to (see `crate::consistency`).
     let epoch_old = epoch(&mut old_s).await;
     let epoch_new = epoch(&mut new_s).await;
+    // Change-detection availability (M3): when `track_counts` is off on a side
+    // the counters never move, so every data-level table on that side is
+    // floored at NEEDS_REVIEW and a stored result cannot be reused.
+    let old_track_counts = track_counts_on(&mut old_s).await;
+    let new_track_counts = track_counts_on(&mut new_s).await;
 
     // Structure: both inventories, compared after the mapping is applied.
     checkpoint(config)?;
@@ -807,6 +971,24 @@ async fn run_live(
     let new_inv = inventory(&mut new_s).await;
     checkpoint(config)?;
     let (old_inv, new_inv) = (old_inv?, new_inv?);
+    // L4: a level, column-option or ignore key that names no table or column is
+    // a configuration error, never a silent no-op.
+    let unknown = crate::plan::unknown_paths(
+        &old_inv,
+        &new_inv,
+        &config.levels,
+        &config.column_options,
+        &config.mapping.ignored,
+    );
+    if !unknown.is_empty() {
+        return Err(RunError::Config(format!(
+            "unknown paths in the run definition or mapping: {}",
+            unknown.join(", ")
+        )));
+    }
+    // Foreign tables have no change counters (M3).
+    let old_foreign = foreign_tables_set(&mut old_s).await?;
+    let new_foreign = foreign_tables_set(&mut new_s).await?;
     let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
 
     // Pair every old table with its mapped new table.
@@ -825,6 +1007,7 @@ async fn run_live(
     }
     let mut targets = BTreeSet::new();
     let mut pairs: Vec<Pair> = Vec::new();
+    let mut mapped: Vec<(String, String)> = Vec::new();
     for s in &old_inv.schemas {
         for t in &s.tables {
             let path = format!("{}.{}", s.name, t.name);
@@ -835,6 +1018,7 @@ async fn run_live(
                 b.ignore_table(&path, reason);
                 continue;
             }
+            mapped.push((path.clone(), new_path.clone()));
             let level = level_for(config, &path);
             match new_tables.get(&new_path) {
                 None => b.record(Evidence::new(&path, level, Outcome::MissingOnNew)),
@@ -854,6 +1038,29 @@ async fn run_live(
                 }),
             }
         }
+    }
+    // M2: refuse two old tables mapping to one new table (the mapping does not
+    // say which old table the new one is, so neither may PASS against it).
+    let duplicates = crate::mapping::duplicate_table_targets(&mapped);
+    if !duplicates.is_empty() {
+        let mut kept = Vec::with_capacity(pairs.len());
+        for p in pairs {
+            let np = p.new_path();
+            if let Some(olds) = duplicates.get(&np) {
+                b.record(Evidence::new(
+                    &p.path,
+                    p.level,
+                    Outcome::Fault(format!(
+                        "{} old tables ({}) map to new table {np}",
+                        if olds.len() == 2 { "two" } else { "multiple" },
+                        olds.join(", ")
+                    )),
+                ));
+            } else {
+                kept.push(p);
+            }
+        }
+        pairs = kept;
     }
     for (new_path, _) in new_tables.iter().filter(|(p, _)| !targets.contains(*p)) {
         if let Some(reason) = table_ignores.get(new_path) {
@@ -900,6 +1107,14 @@ async fn run_live(
             continue;
         };
 
+        // Change-detection availability for this table (M3).
+        let old_cd = SideChangeDetection::of(
+            old_track_counts,
+            old_foreign.contains(&format!("{}.{}", p.old.0, p.old.1)),
+        );
+        let new_cd = SideChangeDetection::of(new_track_counts, new_foreign.contains(&p.new_path()));
+        let cd_floor = change_detection_floor(old_cd, new_cd);
+
         let ro = replica(&mut old_s, old_info.version_num).await;
         let rn = replica(&mut new_s, new_info.version_num).await;
 
@@ -912,11 +1127,13 @@ async fn run_live(
                     counters: bo.clone(),
                     epoch: epoch_old.clone().unwrap_or_default(),
                     replica: ro.clone(),
+                    change_detection_ok: old_cd.ok(),
                 };
                 let now_new = SideMark {
                     counters: bn.clone(),
                     epoch: epoch_new.clone().unwrap_or_default(),
                     replica: rn.clone(),
+                    change_detection_ok: new_cd.ok(),
                 };
                 if st.rescan_reason(p.level, &now_old, &now_new).is_none() {
                     b.record_resumed(st.result.clone());
@@ -937,6 +1154,11 @@ async fn run_live(
         // A stop during the last query (which the server cancelled) must
         // never be recorded or stored as this table's result.
         checkpoint(config)?;
+        // Change detection unavailable (track_counts off or a foreign table):
+        // floor the table at NEEDS_REVIEW, never a clean PASS (M3).
+        if let Some((floor, reason)) = cd_floor {
+            e.floors.push((floor, reason));
+        }
 
         // Replica replay during this table's scans (counters are blind there).
         let ro_after = replica(&mut old_s, old_info.version_num).await;
@@ -969,11 +1191,13 @@ async fn run_live(
                             counters: ao,
                             epoch: epoch_old.clone().unwrap_or_default(),
                             replica: ro_after.clone().unwrap_or_default(),
+                            change_detection_ok: old_cd.ok(),
                         },
                         new: SideMark {
                             counters: an,
                             epoch: epoch_new.clone().unwrap_or_default(),
                             replica: rn_after.clone().unwrap_or_default(),
+                            change_detection_ok: new_cd.ok(),
                         },
                         wal_lsn: wal(&mut new_s, new_info.version_num).await,
                     })?;
@@ -1059,13 +1283,19 @@ async fn scan_pair(
             estimated_rows: p.old_rows.max(p.new_rows).max(0) as u64,
         },
     );
+    // M2: two old columns pairing with the same new column is refused.
+    if let Some(dup) = crate::plan::duplicate_column_target(&spec) {
+        return fault(dup.to_string());
+    }
 
+    let notes = collect_column_notes(&spec);
     let with_coverage = |e: Result<Evidence, RunError>| {
         e.map(|mut e| {
             e.dropped = spec.dropped.clone();
             e.added = spec.added.clone();
             e.ignored_columns = spec.ignored_columns.clone();
             e.columns_covered = Some(spec.columns_covered());
+            e.column_notes = notes.clone();
             e
         })
     };
@@ -1547,6 +1777,31 @@ mod tests {
         assert_ne!(definition_hash(&base), definition_hash(&db));
     }
 
+    #[test]
+    fn the_definition_hash_covers_the_ca_file() {
+        let base = mock_config();
+        let with_ca = |side_old: bool, path: &str| {
+            let mut c = base.clone();
+            let side = if side_old { &mut c.old } else { &mut c.new };
+            if let Input::Live(p) = side {
+                *p = p.clone().with_ca_file(path);
+            }
+            c
+        };
+        let a = with_ca(true, "/etc/bank/ca-a.pem");
+        let b = with_ca(true, "/etc/bank/ca-b.pem");
+        let n = with_ca(false, "/etc/bank/ca-a.pem");
+        // Adding, changing or moving the CA file changes the hash.
+        assert_ne!(definition_hash(&base), definition_hash(&a));
+        assert_ne!(definition_hash(&a), definition_hash(&b));
+        assert_ne!(definition_hash(&a), definition_hash(&n));
+        // The same CA file gives the same hash.
+        assert_eq!(
+            definition_hash(&a),
+            definition_hash(&with_ca(true, "/etc/bank/ca-a.pem"))
+        );
+    }
+
     #[tokio::test]
     async fn parallel_limits_below_one_are_rejected() {
         let c = RunConfig {
@@ -1567,6 +1822,64 @@ mod tests {
         let mut with = c.clone();
         with.control = Some(std::sync::Arc::new(RunControl::new()));
         assert_eq!(definition_hash(&c), definition_hash(&with));
+    }
+
+    #[test]
+    fn connection_info_records_tls_superuser_and_write_access() {
+        let profile = ConnProfile::new(
+            "h",
+            5432,
+            "db",
+            "u",
+            format!("{:x}", std::process::id() ^ 0x5a5a),
+            crate::db::TlsMode::Disable("test network".to_string()),
+        );
+        let info = ServerInfo {
+            version_num: 170000,
+            version_string: "17.0".into(),
+            encoding: "UTF8".into(),
+            collation: "C".into(),
+            ctype: "C".into(),
+            lc_monetary: "C".into(),
+            is_superuser: true,
+            can_write: true,
+            pooler_suspected: true,
+            md5_available: false,
+            sql_ascii: false,
+            rolbypassrls: false,
+            rls_tables: vec!["s.accounts".into()],
+            can_write_reasons: vec!["has INSERT on at least one table".into()],
+        };
+        let c = connection_info(&profile, &info, Some("migration needs it"));
+        assert_eq!(c.tls, "plaintext");
+        assert_eq!(c.plaintext_reason.as_deref(), Some("test network"));
+        assert!(c.superuser);
+        assert_eq!(c.superuser_reason.as_deref(), Some("migration needs it"));
+        assert!(c.can_write);
+        assert_eq!(
+            c.can_write_reasons,
+            vec!["has INSERT on at least one table".to_string()]
+        );
+        assert!(!c.rolbypassrls);
+        assert_eq!(c.rls_tables, vec!["s.accounts".to_string()]);
+        assert!(c.pooler_suspected);
+        assert!(!c.md5_available);
+        assert_eq!(c.server_version, "17.0");
+        assert_eq!(c.server_encoding, "UTF8");
+
+        let mut r = RunResults::default();
+        connection_warnings(&mut r, &c, &ConnectionInfo::default());
+        assert!(r.warnings.iter().any(|w| w.contains("can write")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("has INSERT on at least one table")));
+        assert!(r.warnings.iter().any(|w| w.contains("superuser")));
+        assert!(r.warnings.iter().any(|w| w.contains("migration needs it")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("tables use row-level security")));
     }
 
     fn stopped_config() -> (RunConfig, std::sync::Arc<RunControl>) {
@@ -1612,6 +1925,7 @@ mod tests {
         let file = crate::fingerprint_file::FingerprintFile {
             format_version: crate::fingerprint_file::FINGERPRINT_VERSION,
             tool_version: String::new(),
+            normalise_rules_version: Some(crate::core::normalise::NORMALISE_RULES_VERSION),
             mapping_hash: c.mapping.mapping_hash.clone(),
             server: crate::fingerprint_file::CapturedServer {
                 version_num: 170000,

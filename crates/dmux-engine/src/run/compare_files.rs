@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::consistency::{change_detection_floor, SideChangeDetection};
 use crate::core::compare::{compare, SideOutcome};
 use crate::core::fingerprint::{Fingerprint, Side, Source, TablePlan};
 use crate::core::normalise::{plan_column, ColumnMapping};
@@ -28,15 +29,16 @@ use crate::db::{probe_server, ConnProfile, ReadOnlySession};
 use crate::fingerprint_file::{CapturedTable, FingerprintFile};
 use crate::inventory::DatabaseInventory;
 use crate::mapping::Mapping;
-use crate::plan::{build_table_spec, LiveColumn, LiveTable, SpecInputs};
-use crate::results::{fresh_run_id, CheckLevel, Verdict};
+use crate::plan::{build_table_spec, unknown_keys, LiveColumn, LiveTable, SpecInputs};
+use crate::results::{fresh_run_id, CheckLevel, ColumnNote, ConnectionInfo, Connections, Verdict};
 
 use super::structure;
 use super::verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 use super::{
-    apply_replica, checkpoint, counters, definition_hash, epoch, epoch_changed, inventory,
-    live_table, map_table, note_paused, register, replica, replica_outcome, scan_counts,
-    scan_fingerprint, settle, wal, Input, RunConfig, RunError, RunOutcome,
+    apply_replica, checkpoint, connection_info, connection_warnings, counters, definition_hash,
+    epoch, epoch_changed, foreign_tables_set, inventory, live_table, map_table, note_paused,
+    register, replica, replica_outcome, scan_counts, scan_fingerprint, settle, track_counts_on,
+    wal, Input, RunConfig, RunError, RunOutcome,
 };
 
 /// The run warning when a side has no inventory to compare.
@@ -98,6 +100,13 @@ pub fn compare_two_files_with(
         definition_hash(config),
     );
     b.set_sql_ascii(old.server.sql_ascii || new.server.sql_ascii);
+    // Both inputs were capture files: record their SHA-256s for page 1 of the
+    // report (audit M1).  A file built in memory has no hash, so record None.
+    b.results.capture_sha256_old = (!old.sha256.is_empty()).then(|| old.sha256.clone());
+    b.results.capture_sha256_new = (!new.sha256.is_empty()).then(|| new.sha256.clone());
+    // Same rules version (checked by validate), other tool version: a warning.
+    b.results.warnings.extend(old.tool_version_warning("old"));
+    b.results.warnings.extend(new.tool_version_warning("new"));
     if old.server.sql_ascii {
         b.results
             .warnings
@@ -180,8 +189,33 @@ fn captured_fp(t: &CapturedTable, mapping_hash: &str) -> Fingerprint {
         buckets: t.buckets.clone(),
         control_totals: t.control_totals.clone(),
         truncated: false,
-        needs_review: t.needs_review,
+        // Never the stored flag alone: a file is untrusted input, so the
+        // flag is recomputed from its own types and options (audit H3).
+        needs_review: t.effective_needs_review(),
     }
+}
+
+/// Per-column notes reconstructed from a captured table's own plan (its ticked
+/// options and type warnings), in stable (column, kind) order.  The two
+/// captures share one plan (enforced by [`plan_difference`]), so one side
+/// yields the notes (H2 / decision 23).
+fn captured_column_notes(cap: &CapturedTable) -> Vec<ColumnNote> {
+    let mut notes = Vec::new();
+    for (i, cname) in cap.columns.iter().enumerate() {
+        let m = ColumnMapping {
+            old_name: cname.clone(),
+            new_name: cname.clone(),
+            old_type: cap.column_types[i].clone(),
+            new_type: cap.column_types[i].clone(),
+            options: cap.options[i].clone(),
+            control_total: cap.control_columns.contains(cname),
+        };
+        if let Ok(cp) = plan_column(&m) {
+            notes.extend(crate::results::column_notes(cname, &cp.flags));
+        }
+    }
+    notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    notes
 }
 
 fn captured_pair(name: &str, o: &CapturedTable, n: &CapturedTable, mapping_hash: &str) -> Evidence {
@@ -189,6 +223,7 @@ fn captured_pair(name: &str, o: &CapturedTable, n: &CapturedTable, mapping_hash:
     e.columns_covered = Some(o.columns.clone());
     e.notes.push(NO_LIVE.into());
     e.spot = Spot::NotRun("no live database".into());
+    e.column_notes = captured_column_notes(o);
     if o.columns != n.columns {
         let oc: BTreeSet<&String> = o.columns.iter().collect();
         let nc: BTreeSet<&String> = n.columns.iter().collect();
@@ -260,12 +295,45 @@ pub async fn compare_file_to_live(
             .warnings
             .push("the live database is SQL_ASCII (P19)".into());
     }
+    // The capture file's SHA-256 and the live side's connection-safety record
+    // reach page 1 of the report (audit M1 / M5).
+    if file_side == Side::Old && !file.sha256.is_empty() {
+        b.results.capture_sha256_old = Some(file.sha256.clone());
+    }
+    if file_side == Side::New && !file.sha256.is_empty() {
+        b.results.capture_sha256_new = Some(file.sha256.clone());
+    }
+    let file_side_name = match file_side {
+        Side::Old => "old",
+        Side::New => "new",
+    };
+    b.results
+        .warnings
+        .extend(file.tool_version_warning(file_side_name));
+    let live_conn = connection_info(
+        live_profile,
+        &info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    let (old_conn, new_conn) = match file_side {
+        Side::Old => (ConnectionInfo::default(), live_conn),
+        Side::New => (live_conn, ConnectionInfo::default()),
+    };
+    connection_warnings(&mut b.results, &old_conn, &new_conn);
+    b.results.connections = Connections {
+        old: old_conn,
+        new: new_conn,
+    };
     b.results.wal_start_lsn = wal(&mut s, info.version_num).await;
     let epoch_start = epoch(&mut s).await;
 
     let live_inv = inventory(&mut s).await;
     checkpoint(config)?;
     let live_inv = live_inv?;
+    // Change-detection availability on the live side (M3): when `track_counts`
+    // is off the counters never move, and foreign tables have no counters.
+    let live_track_counts = track_counts_on(&mut s).await;
+    let live_foreign = foreign_tables_set(&mut s).await?;
     // Structure: the captured inventory against the live one, oriented.
     match file_side {
         Side::Old => file_structure(&mut b, file.inventory.as_deref(), Some(&live_inv), mapping),
@@ -285,6 +353,38 @@ pub async fn compare_file_to_live(
         .iter()
         .map(|t| (t.old_qualified.as_str(), t))
         .collect();
+    // L4: a level, column-option or ignore key that names no table or column on
+    // either side is a configuration error, never a silent no-op.
+    let mut known_tables: BTreeSet<String> = live.clone();
+    let mut known_columns: BTreeSet<String> = BTreeSet::new();
+    for sc in &live_inv.schemas {
+        for t in &sc.tables {
+            for c in &t.columns {
+                known_columns.insert(format!("{}.{}.{}", sc.name, t.name, c.name));
+            }
+        }
+    }
+    for t in &file.tables {
+        known_tables.insert(t.old_qualified.clone());
+        for c in &t.columns {
+            known_columns.insert(format!("{}.{}", t.old_qualified, c));
+        }
+    }
+    let unknown = unknown_keys(
+        &config.levels,
+        &config.column_options,
+        &mapping.ignored,
+        &known_tables,
+        &known_columns,
+        &known_tables,
+        &known_columns,
+    );
+    if !unknown.is_empty() {
+        return Err(RunError::Config(format!(
+            "unknown paths in the run definition or mapping: {}",
+            unknown.join(", ")
+        )));
+    }
     let table_ignores: BTreeMap<&str, &str> = mapping
         .ignored
         .iter()
@@ -299,6 +399,7 @@ pub async fn compare_file_to_live(
     // (old path, captured table, live (schema, table)).
     let mut pairs: Vec<(String, &CapturedTable, (String, String))> = Vec::new();
     let mut targets = BTreeSet::new();
+    let mut mapped: Vec<(String, String)> = Vec::new();
     let old_names: Vec<String> = match file_side {
         Side::Old => captured.keys().map(|k| k.to_string()).collect(),
         Side::New => live.iter().cloned().collect(),
@@ -312,6 +413,7 @@ pub async fn compare_file_to_live(
             b.ignore_table(old_path, reason);
             continue;
         }
+        mapped.push((old_path.clone(), new_path.clone()));
         let (cap, live_name) = match file_side {
             Side::Old => (
                 captured.get(old_path.as_str()).copied(),
@@ -331,6 +433,36 @@ pub async fn compare_file_to_live(
                 Outcome::MissingOnNew,
             )),
         }
+    }
+    // M2: refuse two old tables mapping to one new table (the mapping does not
+    // say which old table the new one is, so neither may PASS against it).
+    let duplicates = crate::mapping::duplicate_table_targets(&mapped);
+    if !duplicates.is_empty() {
+        let mapped_by_old: BTreeMap<&str, &str> = mapped
+            .iter()
+            .map(|(o, n)| (o.as_str(), n.as_str()))
+            .collect();
+        let mut kept = Vec::with_capacity(pairs.len());
+        for (old_path, c, l) in pairs {
+            let dup = mapped_by_old
+                .get(old_path.as_str())
+                .and_then(|np| duplicates.get(*np));
+            if let Some(olds) = dup {
+                b.record(Evidence::new(
+                    &old_path,
+                    c.level,
+                    Outcome::Fault(format!(
+                        "{} old tables ({}) map to new table {}",
+                        if olds.len() == 2 { "two" } else { "multiple" },
+                        olds.join(", "),
+                        mapped_by_old[old_path.as_str()]
+                    )),
+                ));
+            } else {
+                kept.push((old_path, c, l));
+            }
+        }
+        pairs = kept;
     }
     let new_only: Vec<String> = match file_side {
         Side::Old => live
@@ -378,6 +510,20 @@ pub async fn compare_file_to_live(
         .await;
         // A stop during the scans is never recorded as the table's result.
         checkpoint(config)?;
+        // Change detection unavailable on the live side (track_counts off or a
+        // foreign table): floor the table at NEEDS_REVIEW (M3).  The file side
+        // is a frozen capture, so only the live side's counters are in question.
+        let live_cd = SideChangeDetection::of(
+            live_track_counts,
+            live_foreign.contains(&format!("{ls}.{lt}")),
+        );
+        let cd_floor = match file_side {
+            Side::Old => change_detection_floor(SideChangeDetection::Ok, live_cd),
+            Side::New => change_detection_floor(live_cd, SideChangeDetection::Ok),
+        };
+        if let Some((floor, reason)) = cd_floor {
+            e.floors.push((floor, reason));
+        }
         let d = replica_outcome(&r_before, &replica(&mut s, info.version_num).await);
         note_paused(&mut b.results, live_side, &d);
         apply_replica(&mut e, live_side, &d);
@@ -477,6 +623,10 @@ async fn file_live_pair(
             estimated_rows: 0,
         },
     );
+    // M2: two old columns pairing with the same new column is refused.
+    if let Some(dup) = crate::plan::duplicate_column_target(&spec) {
+        return fault(dup.to_string());
+    }
     let mut e = Evidence::new(path, level, Outcome::Fault(String::new()));
     e.dropped = spec.dropped.clone();
     e.added = spec.added.clone();
@@ -546,9 +696,13 @@ async fn file_live_pair(
         .map(|(i, _)| i)
         .collect();
     let mut plans = Vec::with_capacity(cols.len());
-    for c in &cols {
+    let mut column_notes = Vec::with_capacity(cols.len());
+    for (c, cname) in cols.iter().zip(cap.columns.iter()) {
         match plan_column(c) {
-            Ok(p) => plans.push(p),
+            Ok(p) => {
+                column_notes.extend(crate::results::column_notes(cname, &p.flags));
+                plans.push(p);
+            }
             Err(err) => {
                 e.outcome =
                     Outcome::Fault(format!("column {} cannot be planned: {err}", c.old_name));
@@ -556,6 +710,8 @@ async fn file_live_pair(
             }
         }
     }
+    column_notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    e.column_notes = column_notes;
     let controls: Vec<String> = plans.iter().filter_map(|p| p.old_control.clone()).collect();
     let src = Source::Table {
         schema: live_schema.to_string(),
@@ -646,7 +802,8 @@ mod tests {
     fn file(tables: Vec<CapturedTable>) -> FingerprintFile {
         FingerprintFile {
             format_version: FINGERPRINT_VERSION,
-            tool_version: "t".into(),
+            tool_version: crate::version().into(),
+            normalise_rules_version: Some(crate::core::normalise::NORMALISE_RULES_VERSION),
             mapping_hash: crate::mapping::Mapping::new().mapping_hash,
             server: CapturedServer {
                 version_num: 170000,
@@ -815,6 +972,94 @@ mod tests {
             .structure_findings
             .iter()
             .any(|f| f.object == "database.large_objects"));
+    }
+
+    /// Audit H3: a table with an `Unknown` type whose `needs_review` was edited
+    /// to `false` (hash recomputed) must never PASS file-against-file.
+    #[test]
+    fn a_forged_needs_review_false_never_passes() {
+        let forged = || {
+            let mut t = table("s.a", 3);
+            t.column_types[1] = PgType::Unknown("public.geometry".into());
+            t.needs_review = false;
+            t
+        };
+        // Through the parser, as a real attack would arrive: refused.
+        let bytes = file(vec![forged()]).to_json().unwrap();
+        let parsed = FingerprintFile::from_bytes(&bytes);
+        assert!(matches!(
+            parsed,
+            Err(crate::fingerprint_file::FingerprintFileError::NeedsReviewCleared { .. })
+        ));
+        // Built in memory and handed straight to the compare: refused too.
+        let r = compare_two_files(&file(vec![forged()]), &file(vec![forged()]));
+        assert!(
+            matches!(&r, Err(RunError::Config(m)) if m.contains("needs no review")),
+            "{r:?}"
+        );
+        // Honestly flagged, the same pair is NEEDS_REVIEW, never PASS.
+        let mut honest = forged();
+        honest.needs_review = true;
+        let out = compare_two_files(&file(vec![honest.clone()]), &file(vec![honest])).unwrap();
+        assert_eq!(out.results.tables["s.a"].verdict, Verdict::NeedsReview);
+        assert_ne!(out.results.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn the_captured_fingerprint_uses_the_recomputed_flag() {
+        let mut t = table("s.a", 3);
+        t.column_types[1] = PgType::Unknown("x".into());
+        t.needs_review = false;
+        assert!(captured_fp(&t, "m").needs_review);
+        assert!(!captured_fp(&table("s.a", 3), "m").needs_review);
+    }
+
+    #[test]
+    fn captures_from_other_or_missing_rules_versions_are_refused() {
+        let mut other = file(vec![table("s.a", 3)]);
+        other.normalise_rules_version = Some(crate::core::normalise::NORMALISE_RULES_VERSION + 1);
+        for (o, n) in [
+            (other.clone(), file(vec![table("s.a", 3)])),
+            (file(vec![table("s.a", 3)]), other),
+        ] {
+            let r = compare_two_files(&o, &n);
+            assert!(
+                matches!(&r, Err(RunError::Config(m)) if m.contains("normalisation rules version")),
+                "{r:?}"
+            );
+        }
+        let mut missing = file(vec![table("s.a", 3)]);
+        missing.normalise_rules_version = None;
+        let r = compare_two_files(&missing, &file(vec![table("s.a", 3)]));
+        assert!(
+            matches!(&r, Err(RunError::Config(m)) if m.contains("does not record its normalisation rules version")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_different_tool_version_is_a_run_warning() {
+        let mut old = file(vec![table("s.a", 3)]);
+        old.tool_version = "0.0.1".into();
+        let out = compare_two_files(&old, &file(vec![table("s.a", 3)])).unwrap();
+        let w: Vec<&String> = out
+            .results
+            .warnings
+            .iter()
+            .filter(|w| w.contains("capture was made by Dmux"))
+            .collect();
+        assert_eq!(w.len(), 1, "{:?}", out.results.warnings);
+        assert!(w[0].contains("old capture was made by Dmux 0.0.1"));
+        // The rules match, so the data still compares (decision 23: a
+        // different tool version alone is recorded, not refused).
+        assert_eq!(out.results.tables["s.a"].verdict, Verdict::Pass);
+        // The same tool version gives no such warning.
+        let same = run(vec![table("s.a", 3)], vec![table("s.a", 3)]);
+        assert!(!same
+            .results
+            .warnings
+            .iter()
+            .any(|w| w.contains("capture was made by Dmux")));
     }
 
     #[test]

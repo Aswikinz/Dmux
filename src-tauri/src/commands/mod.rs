@@ -7,7 +7,10 @@
 //!   collect inventories, diff them, and build/export/import the mapping.
 //! - [`data`]: the data-half engine operations — build a check plan, run,
 //!   poll progress, pause/cancel, and fetch results (PLAN.md 4.4-4.7).
+//! - [`report`]: export the finished run's PDF or Excel report through a
+//!   native save dialog (PLAN.md 4.7).
 
 pub mod data;
 pub mod gateway;
 pub mod profiles;
+pub mod report;

@@ -21,6 +21,8 @@ export interface ConnectionProfile {
   tlsFingerprint?: string;
   /** Recorded reason for an unencrypted connection (encryption === 'allow-plaintext'). */
   plaintextReason?: string;
+  /** Path to a private-CA PEM bundle (a bank's internal CA), used with 'verify'. */
+  caFile?: string;
   /** Stored in the OS keychain, never in UI state. */
   passwordFromKeychain?: boolean;
 }
@@ -42,12 +44,23 @@ export interface ServerInfo {
   tls: TlsState;
   /** Free-form warning text for the user, e.g. superuser refusal. */
   warning?: string;
+  /** True when the machine has no system keychain and Dmux keeps this
+   *  password in memory until the app closes.  The UI never holds it. */
+  sessionPassword?: boolean;
 }
 
 export interface ConnectionTestResult {
   ok: boolean;
   info?: ServerInfo;
   error?: string;
+  /** The login is a superuser and Dmux refused it (no override yet). */
+  superuserRefused?: boolean;
+}
+
+/** A user's explicit, recorded decision to allow a superuser login (PLAN 6.2).
+ *  The reason is sent to the backend and written into the results. */
+export interface SuperuserOverride {
+  reason: string;
 }
 
 /** What `save_profile` returns: the stored profile plus, when the password could
@@ -189,6 +202,15 @@ export interface DrillDownRow {
   differingColumns?: string[];
 }
 
+/** A per-column note: a ticked option or a type-change flag (H2 / decision 23). */
+export interface ColumnNote {
+  column: string;
+  /** Stable identifier, e.g. "option", "type_changed". */
+  kind: string;
+  /** Plain-language note shown in the report. */
+  note: string;
+}
+
 export interface TableResult {
   tableId: string;
   schemaName: string;
@@ -197,6 +219,7 @@ export interface TableResult {
   level: CheckLevel;
   checked: boolean;
   drillDown?: DrillDownRow[];
+  columnNotes?: ColumnNote[];
 }
 
 export interface CoverageSummary {
@@ -215,23 +238,32 @@ export interface Results {
   ignored: IgnoreItem[];
   failures: FailureCard[];
   tableResults: TableResult[];
+  /** Whether any column option was applied: shows "PASS (with options)". */
+  optionsApplied: boolean;
+  /** Whether the results file recorded per-column options (schema >= 3).  When
+   *  false the UI shows "options not recorded", never a bare PASS. */
+  optionsRecorded: boolean;
+  /** Run-level warnings (can-write, superuser, row-level security, ...). */
+  warnings: string[];
 }
 
 export type ReportFormat = 'pdf' | 'excel';
 
 export interface ReportRequest {
+  /** The finished run to report on.  The backend renders from its own copy of
+   *  that run's results; the UI never sends results or a destination path. */
+  runId: string;
   format: ReportFormat;
   /** Include row keys in the exported report (off by default). */
   includeKeys: boolean;
-  /** Destination chosen by the user (Tauri dialog, T024/T040). Optional until
-   *  the picker exists: no temp-path default is used, and the engine is free to
-   *  choose a safe, user-triggered location. */
-  filePath?: string;
 }
 
 export interface ReportResult {
   ok: boolean;
+  /** Where the report was saved (chosen in the native save dialog). */
   filePath?: string;
+  /** The user dismissed the save dialog; nothing was written. */
+  cancelled?: boolean;
   error?: string;
 }
 

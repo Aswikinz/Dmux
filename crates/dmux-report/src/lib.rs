@@ -8,7 +8,7 @@
 //!   ignored item with its reason, failures first, structure findings, the
 //!   run/tool/mapping identity, the SHA-256 of the results file, the "what a PASS
 //!   does not prove" paragraph, the md5 threat-model sentence, the
-//!   tamper-evident-not-proof sentence, the hook custom checks and their script
+//!   hash-integrity sentence (audit M1 / decision 23), the hook custom checks and their script
 //!   hashes, and a sign-off block.  Per-table sections follow.
 //! - an Excel detail workbook (`xlsx`): sheets Summary, Tables, Differences,
 //!   Structure Findings, Ignored, Warnings Flags, Custom Checks and Run log;
@@ -79,6 +79,24 @@ pub enum ReportError {
     Log(#[from] log::LogError),
 }
 
+/// Write `bytes` to `path` with owner-only permissions on Unix (audit L3: a
+/// report is a confidential artefact, so it must never be world-readable).
+/// On non-Unix platforms the mode defaults to the OS and the umask.
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.open(path)?.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +123,7 @@ mod tests {
                 extra_rows: Some(0),
                 changed_rows: Some(0),
                 reasons: vec!["row counts differ".into(), "12 rows missing".into()],
+                column_notes: vec![],
             },
         );
         tables.insert(
@@ -123,6 +142,7 @@ mod tests {
                 extra_rows: Some(3),
                 changed_rows: Some(0),
                 reasons: vec!["3 duplicate rows on the new side".into()],
+                column_notes: vec![],
             },
         );
         tables.insert(
@@ -144,6 +164,7 @@ mod tests {
                     "bucket summaries differ".into(),
                     "control totals differ".into(),
                 ],
+                column_notes: vec![],
             },
         );
         tables.insert(
@@ -162,6 +183,7 @@ mod tests {
                 extra_rows: Some(0),
                 changed_rows: Some(0),
                 reasons: vec![],
+                column_notes: vec![],
             },
         );
 
@@ -302,6 +324,26 @@ mod tests {
         let l1 = log::text_log(&results, None, &options);
         let l2 = log::text_log(&results, None, &options);
         assert_eq!(l1, l2, "log must be deterministic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_artefacts_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let results = golden_results();
+        let verification = verify::verify_results(&results).unwrap();
+        let dir = temp_dir();
+        let pdf_path = dir.join("report.pdf");
+        let xlsx_path = dir.join("report.xlsx");
+        let log_path = dir.join("report.txt");
+        let options = ReportOptions {
+            include_keys: false,
+        };
+        render_all(&verification, &options, &pdf_path, &xlsx_path, &log_path).unwrap();
+        for p in [&pdf_path, &xlsx_path, &log_path] {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{:?} must be owner-only", p);
+        }
     }
 
     #[test]

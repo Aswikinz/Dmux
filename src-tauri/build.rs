@@ -23,6 +23,7 @@ fn main() {
             "set_run_paused",
             "cancel_run",
             "get_results",
+            "export_report",
         ]),
     ))
     .expect("failed to run tauri build script");

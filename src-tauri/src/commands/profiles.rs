@@ -9,12 +9,19 @@
 //! password in the same call, the old keychain entry is deleted, so the next
 //! use asks for the password again rather than reusing it against new (possibly
 //! attacker-controlled) details.
+//!
+//! On a machine with no usable keychain, a typed password is kept in the
+//! in-memory session cache instead ([`crate::secrets::SessionPasswords`]),
+//! bound to the profile's connection fields.  The same rule applies to it: a
+//! connection-field change or a delete forgets it.
 
 use serde::Serialize;
 use tauri::State;
 
 use crate::error::CommandError;
-use crate::secrets::{NOT_SAVED_MESSAGE, PASSWORD_REMOVED_MESSAGE};
+use crate::secrets::{
+    stored_fields_hash, NOT_SAVED_MESSAGE, PASSWORD_REMOVED_MESSAGE, SESSION_PASSWORD_MESSAGE,
+};
 use crate::state::AppState;
 use crate::store::StoredProfile;
 use crate::types::ProfileInput;
@@ -49,6 +56,7 @@ fn as_stored(profile: &ProfileInput) -> StoredProfile {
         encryption: profile.encryption.clone(),
         tls_fingerprint: profile.tls_fingerprint.clone(),
         plaintext_reason: profile.plaintext_reason.clone(),
+        ca_file: profile.ca_file.clone(),
     }
 }
 
@@ -63,6 +71,7 @@ fn connection_fields_differ(existing: &StoredProfile, incoming: &StoredProfile) 
         || existing.encryption != incoming.encryption
         || existing.tls_fingerprint != incoming.tls_fingerprint
         || existing.plaintext_reason != incoming.plaintext_reason
+        || existing.ca_file != incoming.ca_file
 }
 
 /// Save (insert or update) a profile, applying the saved-password safety rule.
@@ -89,6 +98,8 @@ pub fn do_save_profile(
     // existing id keeps the password untouched.
     let must_clear = !is_update || fields_changed;
     if must_clear {
+        // The session password belongs to the old fields too.
+        state.session_passwords()?.forget(&incoming.id);
         state
             .keychain()?
             .delete(&incoming.id)
@@ -102,13 +113,19 @@ pub fn do_save_profile(
 
     let stored = state.store()?.save(&incoming)?;
 
-    // A supplied password goes to the keychain (never SQLite).  A failure is
-    // surfaced as a warning, never as a silent drop.
+    // A supplied password goes to the keychain (never SQLite).  With no usable
+    // keychain it is kept in memory for this session, bound to the saved
+    // fields, and the user is told so.  Any other failure is surfaced as a
+    // warning, never as a silent drop.
     if let Some(password) = password {
-        match state.keychain()?.set(&stored.id, &password) {
-            Ok(()) => {}
+        let stored_result = state.keychain()?.set(&stored.id, &password);
+        match stored_result {
+            Ok(()) => state.session_passwords()?.forget(&stored.id),
             Err(e) if e.to_string().contains(NOT_SAVED_MESSAGE) => {
-                warning = Some(NOT_SAVED_MESSAGE.to_string());
+                state
+                    .session_passwords()?
+                    .put(&stored.id, stored_fields_hash(&stored), &password);
+                warning = Some(SESSION_PASSWORD_MESSAGE.to_string());
             }
             Err(e) => warning = Some(e.to_string()),
         }
@@ -141,6 +158,7 @@ pub fn do_delete_profile(id: &str, state: &AppState) -> Result<bool, CommandErro
         Some(_) => {}
         None => return Ok(false),
     }
+    state.session_passwords()?.forget(id);
     state
         .keychain()?
         .delete(id)
@@ -235,6 +253,7 @@ mod tests {
             encryption: "verify".to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         };
         overrides(&mut p);
         p
@@ -330,6 +349,29 @@ mod tests {
                 p.encryption = "trust".to_string();
                 p.tls_fingerprint = Some("deadbeef".to_string());
             }),
+            None,
+            &s,
+        )
+        .unwrap();
+        assert!(res
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("password removed")));
+        assert!(matches!(
+            saved_password(&s, "prod"),
+            Err(CommandError::PasswordMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn ca_file_change_without_a_password_removes_the_saved_password() {
+        let s = test_state();
+        do_save_profile(profile(|_| {}), Some(test_secret()), &s).unwrap();
+
+        // Changing which CA bundle is trusted is a connection-detail change:
+        // the saved password must not silently follow it.
+        let res = do_save_profile(
+            profile(|p| p.ca_file = Some("/etc/bank/ca.pem".to_string())),
             None,
             &s,
         )
@@ -578,14 +620,12 @@ mod tests {
             Err(CommandError::PasswordMissing { .. })
         ));
 
-        // The "password not saved" warning is surfaced.
-        assert!(
-            res.warning
-                .as_deref()
-                .is_some_and(|w| w.contains("asked each run")),
-            "expected a password-not-saved warning, got {:?}",
-            res.warning
-        );
+        // T055: the keychain refused the new password, so it is kept for this
+        // session only, bound to the NEW fields, and the user is told so.
+        assert_eq!(res.warning.as_deref(), Some(SESSION_PASSWORD_MESSAGE));
+        let sessions = s.session_passwords().unwrap();
+        assert!(sessions.contains("prod", &stored_fields_hash(&stored)));
+        assert!(!sessions.contains("prod", &stored_fields_hash(&seeded)));
     }
 
     #[test]
