@@ -824,5 +824,55 @@ describe('ReportScreen', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
     expect(await screen.findByText('Export failed')).toBeDefined();
+    expect(screen.getByText('disk full')).toBeDefined();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('shows the exact saved path and asks for this run', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/home/u/dmux-run-pass.pdf' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
+    expect(
+      await screen.findByText('PDF report saved to /home/u/dmux-run-pass.pdf'),
+    ).toBeDefined();
+    expect(exportReport).toHaveBeenCalledWith({
+      runId: 'run-pass',
+      format: 'pdf',
+      includeKeys: false,
+    });
+  });
+
+  it('says cancelled, not saved or failed, when the dialog is dismissed', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      exportReport: async () => ({ ok: false, cancelled: true }),
+    };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    expect(await screen.findByText('Excel export cancelled. Nothing was saved.')).toBeDefined();
+    expect(screen.queryByText('Export failed')).toBeNull();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('sends the key choice only when the user ticks it', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.xlsx' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await screen.findByText(/report saved/);
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(2));
+    expect(exportReport.mock.calls.map((c) => (c as unknown[])[0])).toEqual([
+      { runId: 'run-pass', format: 'excel', includeKeys: false },
+      { runId: 'run-pass', format: 'excel', includeKeys: true },
+    ]);
   });
 });

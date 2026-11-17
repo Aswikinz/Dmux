@@ -26,6 +26,9 @@ fn main() {
     );
 
     tauri::Builder::default()
+        // The save dialog for report export is opened from Rust only; the
+        // webview has no dialog permission (see capabilities/default.json).
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::profiles::list_profiles,
             commands::profiles::save_profile,
@@ -45,6 +48,7 @@ fn main() {
             commands::data::set_run_paused,
             commands::data::cancel_run,
             commands::data::get_results,
+            commands::report::export_report,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());

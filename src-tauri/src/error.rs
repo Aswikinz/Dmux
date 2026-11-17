@@ -106,6 +106,10 @@ pub enum CommandError {
     #[error("{message}")]
     RunState { message: String },
 
+    /// A report could not be rendered or written (T059).
+    #[error("{message}")]
+    Report { message: String },
+
     /// Something unexpected went wrong (no sensitive detail).
     #[error("{message}")]
     Internal { message: String },
