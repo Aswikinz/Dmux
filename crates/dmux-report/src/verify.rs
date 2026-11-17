@@ -14,14 +14,10 @@
 //! - a plain [`RunResults`] JSON (from `dmux compare` / `dmux run`); verify the
 //!   `results_sha256` field against the canonical form;
 //! - an envelope `{ results, hooks: { custom_checks, scripts, warnings },
-//!   envelope_sha256 }` (written by `dmux run --hooks`, T027): verify
-//!   `envelope_sha256`, the SHA-256 of the whole envelope with its own
-//!   `envelope_sha256` key removed.  The nested results must ALSO pass
-//!   `sha256_of`, so a forged finding or a forged results field is caught.
-//!
-//! The envelope integrity check is [*TODO(T027)*](verify_envelope_bytes): once
-//! `dmux-hooks` merges, switch this to `dmux_hooks::verify_envelope` so the
-//! document keeps one source of truth for the envelope algorithm.
+//!   envelope_sha256 }` (written by `dmux run --hooks`, T027): the envelope's
+//!   own digest is checked by [`dmux_hooks::verify_envelope`], and the nested
+//!   results must ALSO pass [`sha256_of`], so a forged finding or a forged
+//!   results field is caught.
 
 use std::path::Path;
 
@@ -160,32 +156,10 @@ fn verify_envelope(value: &serde_json::Value) -> Result<Verification, VerifyErro
     })
 }
 
-/// Verify an envelope's own `envelope_sha256`.
-///
-/// [*TODO(T027)*] — this is an adapter that keeps `dmux-report` from depending on
-/// the not-yet-merged `dmux-hooks` crate.  Once T027 lands, replace this body
-/// with `dmux_hooks::verify_envelope(value)` so there is one source of truth for
-/// the algorithm.  The algorithm here matches `dmux_hooks::envelope_sha256`:
-/// remove the top-level `envelope_sha256` key from a copy, serialise the rest
-/// canonically (serde_json → stable ordering), SHA-256 hex.
+/// Verify an envelope's own `envelope_sha256`, delegating to the single source of
+/// truth in `dmux-hooks` so the report and the writer can never drift apart.
 pub fn verify_envelope_bytes(value: &serde_json::Value) -> Result<(), String> {
-    let stored = value
-        .get("envelope_sha256")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "envelope has no envelope_sha256".to_string())?;
-    if stored.is_empty() {
-        return Err("envelope has no envelope_sha256".to_string());
-    }
-    let mut clone = value.clone();
-    if let Some(obj) = clone.as_object_mut() {
-        obj.remove("envelope_sha256");
-    }
-    let canonical = serde_json::to_string(&clone).unwrap_or_default();
-    let actual = sha256_hex(canonical.as_bytes());
-    if actual != stored {
-        return Err("envelope_sha256 mismatch: file was modified after running".to_string());
-    }
-    Ok(())
+    dmux_hooks::verify_envelope(value)
 }
 
 fn check_digest(recorded: &str, recomputed: &str) -> Result<(), VerifyError> {
@@ -243,11 +217,6 @@ fn is_envelope(value: &serde_json::Value) -> bool {
     value
         .as_object()
         .is_some_and(|o| o.contains_key("results") && o.contains_key("envelope_sha256"))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 fn parse_hook_evidence(hooks: Option<&serde_json::Value>) -> HookEvidence {
@@ -431,11 +400,10 @@ mod tests {
                 "warnings": [],
             }),
         );
-        let digest = sha256_hex(
-            serde_json::to_string(&serde_json::Value::Object(env.clone()))
-                .unwrap()
-                .as_bytes(),
-        );
+        // Stamp the digest with the same function the writer uses, so the test
+        // exercises the real `dmux_hooks` algorithm end to end.
+        let envelope_value = serde_json::Value::Object(env.clone());
+        let digest = dmux_hooks::envelope_sha256(&envelope_value);
         env.insert("envelope_sha256".into(), serde_json::json!(digest));
         serde_json::Value::Object(env)
     }

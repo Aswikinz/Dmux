@@ -14,9 +14,10 @@ use dmux_engine::db::{probe_server, ConnProfile, DbError, ReadOnlySession, TlsMo
 use dmux_engine::fingerprint_file::FingerprintFile;
 use dmux_engine::inventory::collect_inventory;
 use dmux_engine::mapping::{from_json as mapping_from_json, Mapping};
-use dmux_engine::results::CheckLevel;
+use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
+use dmux_hooks::{Finding, HookSpec, Severity};
 use dmux_report::verify::verify_results_file;
 
 /// PLAN.md 4.8 exit codes.
@@ -48,6 +49,8 @@ enum Command {
     Run(RunArgs),
     /// Render the PDF summary, Excel detail and run log from a results file.
     Report(ReportArgs),
+    /// Run Python hooks over a results JSON file and print their findings.
+    Hook(HookArgs),
 }
 
 /// Shared connection arguments for the commands that talk to a database.
@@ -71,21 +74,51 @@ struct ConnArgs {
     allow_superuser: bool,
 }
 
+/// A connection-configuration error that carries **no secret-derived data**: each
+/// variant names only a field or an error kind, and [`ConfigError::message`]
+/// renders a fixed string.  A caller that prints the message can therefore never
+/// leak a password or any other user-supplied value (CodeQL rust/cleartext-logging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigError {
+    /// `--password-env <VAR>` names an environment variable that is not set.
+    PasswordEnvUnset,
+    /// `--tls disable` without a `--reason`.
+    TlsDisableNeedsReason,
+    /// `--tls disable` with an empty `--reason`.
+    TlsReasonEmpty,
+    /// `--tls fingerprint:<hex>` with an empty hex value.
+    TlsFingerprintEmpty,
+    /// An unrecognised `--tls` value.
+    TlsUnknown,
+    /// `--allow-superuser` without a non-empty `--reason`.
+    SuperuserNeedsReason,
+}
+
+impl ConfigError {
+    fn message(self) -> &'static str {
+        match self {
+            ConfigError::PasswordEnvUnset => "password environment variable is not set",
+            ConfigError::TlsDisableNeedsReason => "--reason <text> is required for --tls disable",
+            ConfigError::TlsReasonEmpty => "--reason <text> may not be empty",
+            ConfigError::TlsFingerprintEmpty => "--tls fingerprint:<hex> is missing the hex value",
+            ConfigError::TlsUnknown => {
+                "unknown --tls value (expected verify, fingerprint:<hex>, or disable)"
+            }
+            ConfigError::SuperuserNeedsReason => "--allow-superuser requires --reason <text>",
+        }
+    }
+}
+
 impl ConnArgs {
-    fn profile(&self) -> Result<ConnProfile, String> {
+    fn profile(&self) -> Result<ConnProfile, ConfigError> {
         let tls_mode = parse_tls_mode(&self.tls, &self.reason)?;
         let password = match self.password_env.as_deref().map(std::env::var) {
             Some(Ok(p)) => p,
-            Some(Err(_)) => {
-                return Err(format!(
-                    "password environment variable {} is not set",
-                    self.password_env.as_deref().unwrap_or_default()
-                ))
-            }
+            Some(Err(_)) => return Err(ConfigError::PasswordEnvUnset),
             None => String::new(),
         };
         if self.allow_superuser && !allow_superuser_requires_reason(&self.reason) {
-            return Err("--allow-superuser requires --reason <text>".to_string());
+            return Err(ConfigError::SuperuserNeedsReason);
         }
         Ok(ConnProfile::new(
             self.host.clone(),
@@ -158,6 +191,31 @@ struct RunArgs {
     /// Write the results JSON to this path (stdout by default).
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
+    /// Run every Python hook in this directory after the run (off by default).
+    #[arg(long, value_name = "DIR")]
+    hooks: Option<PathBuf>,
+    /// Hook time limit in seconds (default 60).
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    hook_timeout: u64,
+    /// Python interpreter to run hooks with (default: auto-discover python3/python).
+    #[arg(long, value_name = "PATH")]
+    python: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct HookArgs {
+    /// The run's results JSON file (`-` reads stdin).
+    #[arg(value_name = "RESULTS")]
+    results: String,
+    /// A directory of Python hook scripts, or a single script.
+    #[arg(value_name = "HOOKS")]
+    hooks: PathBuf,
+    /// Hook time limit in seconds (default 60).
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    timeout: u64,
+    /// Python interpreter (default: auto-discover python3/python).
+    #[arg(long, value_name = "PATH")]
+    python: Option<PathBuf>,
 }
 
 /// Report arguments: render artefacts from a results file (PLAN.md 4.7).
@@ -180,29 +238,29 @@ struct ReportArgs {
     include_keys: bool,
 }
 
-/// Parse the `--tls` mode string into a [`TlsMode`].
-fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, String> {
+/// Parse the `--tls` mode string into a [`TlsMode`].  Errors are a
+/// [`ConfigError`] kind — never the raw value — so a caller never logs a
+/// user-controlled string.
+fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, ConfigError> {
     match tls {
         "verify" => Ok(TlsMode::VerifyFull),
         "disable" => {
             let reason = reason
                 .as_deref()
-                .ok_or("--reason <text> is required for --tls disable")?;
+                .ok_or(ConfigError::TlsDisableNeedsReason)?;
             if reason.trim().is_empty() {
-                return Err("--reason <text> may not be empty".to_string());
+                return Err(ConfigError::TlsReasonEmpty);
             }
             Ok(TlsMode::Disable(reason.to_string()))
         }
         _ => {
             if let Some(hex) = tls.strip_prefix("fingerprint:") {
                 if hex.is_empty() {
-                    return Err("--tls fingerprint:<hex> is missing the hex value".to_string());
+                    return Err(ConfigError::TlsFingerprintEmpty);
                 }
                 Ok(TlsMode::TrustFingerprint(hex.to_string()))
             } else {
-                Err(format!(
-                    "unknown --tls value: {tls} (expected verify, fingerprint:<hex>, or disable)"
-                ))
+                Err(ConfigError::TlsUnknown)
             }
         }
     }
@@ -232,6 +290,7 @@ async fn main() -> ExitCode {
         Command::Compare(args) => run_compare(args).await,
         Command::Run(args) => run_run(args).await,
         Command::Report(args) => run_report(args),
+        Command::Hook(args) => run_hook(args).await,
     }
 }
 
@@ -239,7 +298,7 @@ async fn run_probe(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -287,7 +346,7 @@ async fn run_inventory(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -353,7 +412,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     let profile = match args.conn.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -366,7 +425,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     };
     let mapping = match args.mapping.as_ref() {
         Some(path) => {
-            let bytes = match fs::read(path) {
+            let bytes = match tokio::fs::read(path).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("dmux capture failed: {e}");
@@ -401,7 +460,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
         }
     };
 
-    if let Err(e) = write_fingerprint_file(&args.out, &file) {
+    if let Err(e) = write_fingerprint_file(&args.out, &file).await {
         eprintln!("dmux capture failed: {e}");
         return ExitCode::from(EXIT_FAIL);
     }
@@ -413,9 +472,15 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     ExitCode::from(EXIT_PASS)
 }
 
-fn write_fingerprint_file(path: &std::path::Path, file: &FingerprintFile) -> Result<(), String> {
+/// Write a fingerprint file without blocking the async runtime (Sonar S7493).
+async fn write_fingerprint_file(
+    path: &std::path::Path,
+    file: &FingerprintFile,
+) -> Result<(), String> {
     let bytes = file.clone().to_json().map_err(|e| e.to_string())?;
-    fs::write(path, bytes).map_err(|e| e.to_string())
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn run_compare(args: CompareArgs) -> ExitCode {
@@ -508,6 +573,206 @@ fn emit_results(path: Option<&std::path::Path>, results: &dmux_engine::results::
     }
 }
 
+fn emit_json_value(path: Option<&std::path::Path>, value: &serde_json::Value) {
+    let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
+    match path {
+        Some(p) => {
+            if let Err(e) = fs::write(p, &json) {
+                eprintln!("dmux: failed to write results: {e}");
+            }
+        }
+        None => println!("{json}"),
+    }
+}
+
+/// Run the `dmux hook` command: read a results file (or stdin), run the given
+/// hook script(s), and print their findings as JSON marked `custom_checks`.
+async fn run_hook(args: HookArgs) -> ExitCode {
+    let results_value = match read_results_json(&args.results) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let mut specs = match discover_hook_specs(&args.hooks, args.timeout, args.python.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+    for spec in &mut specs {
+        if let Some(p) = args.python.as_deref() {
+            spec.interpreter = Some(p.to_path_buf());
+        }
+    }
+
+    let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dmux hook failed: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let envelope = envelope_results(&results_value, &specs, &hook_results);
+    emit_json_value(None, &envelope);
+
+    if hook_causes_non_pass(&hook_results) {
+        ExitCode::from(EXIT_FAIL)
+    } else if hook_results.iter().any(|r| !r.warnings.is_empty()) {
+        ExitCode::from(EXIT_WARN)
+    } else {
+        ExitCode::from(EXIT_PASS)
+    }
+}
+
+/// Read a results JSON value from a path, or stdin for `-`.
+fn read_results_json(path: &str) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let text = if path == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| e.to_string())?;
+        buf
+    } else {
+        fs::read_to_string(path).map_err(|e| e.to_string())?
+    };
+    serde_json::from_str(&text).map_err(|e| format!("results are not valid JSON: {e}"))
+}
+
+/// Collect one [`HookSpec`] per `.py` file in a directory, or a single script.
+fn discover_hook_specs(
+    path: &std::path::Path,
+    timeout_secs: u64,
+    interpreter: Option<&std::path::Path>,
+) -> Result<Vec<HookSpec>, String> {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(path)
+            .map_err(|e| format!("cannot read hooks dir {}: {e}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "py"))
+            .collect();
+        entries.sort();
+        entries
+    } else if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        return Err(format!("hooks path not found: {}", path.display()));
+    };
+
+    if files.is_empty() {
+        return Err(format!("no Python hooks found in {}", path.display()));
+    }
+
+    let mut specs = Vec::with_capacity(files.len());
+    for f in files {
+        specs.push(HookSpec {
+            script: f,
+            interpreter: interpreter.map(PathBuf::from),
+            timeout: std::time::Duration::from_secs(timeout_secs),
+        });
+    }
+    Ok(specs)
+}
+
+/// Build the JSON envelope a hook-enabled `run` / `hook` emits: the results
+/// plus each script's hash and its findings, marked `custom_checks`.
+fn envelope_results(
+    results: &serde_json::Value,
+    specs: &[HookSpec],
+    hook_results: &[dmux_hooks::HookResult],
+) -> serde_json::Value {
+    let mut custom_checks: Vec<serde_json::Value> = Vec::new();
+    let mut scripts: Vec<serde_json::Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for (spec, res) in specs.iter().zip(hook_results.iter()) {
+        let script_name = spec
+            .script
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec.script.display().to_string());
+        for w in &res.warnings {
+            warnings.push(format!("{script_name}: {w}"));
+        }
+        scripts.push(serde_json::json!({
+            "script": script_name,
+            "sha256": res.script_hash,
+            "findings": res.findings.iter().map(finding_json).collect::<Vec<_>>(),
+        }));
+        for f in &res.findings {
+            custom_checks.push(finding_json(f));
+        }
+    }
+
+    let mut envelope = serde_json::json!({
+        "results": results,
+        "hooks": {
+            "custom_checks": custom_checks,
+            "scripts": scripts,
+            "warnings": warnings,
+        }
+    });
+
+    // A self-verifying SHA-256 over the whole envelope, so a reader can detect
+    // tampering with either the results or the hook evidence (script hashes,
+    // findings).  The digest covers everything except the field itself.
+    let envelope_sha256 = dmux_hooks::envelope_sha256(&envelope);
+    envelope["envelope_sha256"] = serde_json::Value::String(envelope_sha256);
+    envelope
+}
+
+fn finding_json(f: &Finding) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": f.id,
+        "severity": severity_str(f.severity),
+        "message": f.message,
+        "source": "custom_checks"
+    });
+    if let Some(t) = &f.table {
+        v["table"] = serde_json::Value::String(t.clone());
+    }
+    v
+}
+
+fn severity_str(s: Severity) -> &'static str {
+    match s {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Fail => "fail",
+    }
+}
+
+/// True when any `fail` finding means the overall verdict must not be PASS
+/// (PLAN 4.9: a `fail` finding forces the verdict off PASS; info/warning do not,
+/// and findings can never raise a non-PASS to PASS).
+fn hook_causes_non_pass(results: &[dmux_hooks::HookResult]) -> bool {
+    results
+        .iter()
+        .any(|r| r.findings.iter().any(|f| f.severity == Severity::Fail))
+}
+
+/// Compute the exit code a hook-enabled run should return.
+///
+/// A custom-check `fail` finding ⇒ FAIL (exit 1), taking precedence over any
+/// hook warning.  A hook timeout / crash / invalid output is a warning that
+/// lifts a clean PASS to exit 2, but never overrides an existing non-PASS
+/// verdict from the comparison itself.
+fn hook_exit_code(has_fail: bool, has_warning: bool, base: u8) -> u8 {
+    if has_fail {
+        EXIT_FAIL
+    } else if has_warning && base == EXIT_PASS {
+        EXIT_WARN
+    } else {
+        base
+    }
+}
+
 async fn run_run(args: RunArgs) -> ExitCode {
     let mut config = match load_definition(&args.definition) {
         Ok(c) => c,
@@ -527,8 +792,98 @@ async fn run_run(args: RunArgs) -> ExitCode {
         }
     };
 
-    emit_results(args.out.as_deref(), &outcome.results);
-    ExitCode::from(outcome.exit_code)
+    let mut exit_code = outcome.exit_code;
+
+    // Hooks are opt-in and off by default (PLAN 4.9).
+    if let Some(dir) = args.hooks.as_deref() {
+        let mut specs = match discover_hook_specs(dir, args.hook_timeout, args.python.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("dmux run: hooks: {e}");
+                return ExitCode::from(EXIT_FAIL);
+            }
+        };
+        for spec in &mut specs {
+            if let Some(p) = args.python.as_deref() {
+                spec.interpreter = Some(p.to_path_buf());
+            }
+        }
+
+        let results_value = serde_json::to_value(&outcome.results).unwrap_or_default();
+        let hook_results = match dmux_hooks::run_hooks(&specs, &results_value) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("dmux run: hooks: {e}");
+                return ExitCode::from(EXIT_FAIL);
+            }
+        };
+
+        // The written verdict must match the exit code.  A fail finding ⇒
+        // verdict FAIL; a hook warning (timeout / crash / invalid / uncollected
+        // output) on an otherwise-PASS run ⇒ verdict WARNING with a recorded
+        // reason.  Neither may ever raise a non-PASS verdict back to PASS.
+        let has_fail = hook_causes_non_pass(&hook_results);
+        let has_warning = hook_results.iter().any(|r| !r.warnings.is_empty());
+        exit_code = hook_exit_code(has_fail, has_warning, exit_code);
+
+        // Mutate a typed copy of the results (so results_sha256 is recomputed
+        // over exactly what is written) and re-serialise.
+        let mut typed = outcome.results.clone();
+        apply_hook_verdict(&mut typed, has_fail, has_warning, &hook_results);
+
+        // Recompute the results-level self-hash over the mutated content, then
+        // wrap everything in the envelope with its own SHA-256 so the hook
+        // evidence (script hashes, findings) is tamper-covered too.
+        typed.results_sha256 = dmux_engine::results::sha256_of(&typed);
+        let results_value = serde_json::to_value(&typed).unwrap_or_default();
+        let envelope = envelope_results(&results_value, &specs, &hook_results);
+        emit_json_value(args.out.as_deref(), &envelope);
+    } else {
+        emit_results(args.out.as_deref(), &outcome.results);
+    }
+
+    ExitCode::from(exit_code)
+}
+
+/// Fold the hook outcome into the typed results so the written verdict matches
+/// the exit code.
+///
+/// - A `fail` finding turns a PASS or an ENGINE-produced WARNING into FAIL with
+///   reason "custom check <id> failed" recorded per finding; a hook fail is
+///   more severe than a warning, so WARNING is treated like PASS here.
+/// - A hook warning (timeout / crash / invalid / uncollected output) without a
+///   fail finding turns a PASS into WARNING with a recorded reason.
+/// - A fail finding never lowers an existing graver verdict (FAIL, TOOL_FAULT,
+///   CHANGED_DURING_CHECK, NEEDS_REVIEW, WIDELY_DIFFERENT) back toward PASS, and
+///   a warning never lowers a FAIL: the hook can only force the verdict off
+///   PASS, never mask a data or tool problem.
+fn apply_hook_verdict(
+    results: &mut RunResults,
+    has_fail: bool,
+    has_warning: bool,
+    hook_results: &[dmux_hooks::HookResult],
+) {
+    if has_fail {
+        // A hook `fail` must demote both a clean PASS and an engine WARNING; it
+        // must never raise a graver verdict.  Treat WARNING like PASS.
+        if matches!(results.verdict, Verdict::Pass | Verdict::Warning) {
+            results.verdict = Verdict::Fail;
+        }
+        let fail_ids: Vec<String> = hook_results
+            .iter()
+            .flat_map(|r| r.findings.iter())
+            .filter(|f| f.severity == Severity::Fail)
+            .map(|f| f.id.clone())
+            .collect();
+        for id in fail_ids {
+            results.warnings.push(format!("custom check {id} failed"));
+        }
+    } else if has_warning && results.verdict == Verdict::Pass {
+        results.verdict = Verdict::Warning;
+        results
+            .warnings
+            .push("a custom check hook reported a problem; see hooks.warnings".to_string());
+    }
 }
 
 /// The on-disk run definition (TOML or JSON).  This is the shape `dmux run`
@@ -631,11 +986,11 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     };
 
     let conn_def_to_profile = |c: &ConnDef| -> Result<ConnProfile, String> {
-        let tls_mode = parse_tls_mode(&c.tls, &c.reason)?;
+        let tls_mode = parse_tls_mode(&c.tls, &c.reason).map_err(|e| e.message().to_string())?;
         let password = match (&c.password, &c.password_env) {
             (Some(p), _) => p.clone(),
             (None, Some(var)) => std::env::var(var)
-                .map_err(|_| format!("password environment variable {var} is not set"))?,
+                .map_err(|_| "password environment variable is not set".to_string())?,
             (None, None) => String::new(),
         };
         Ok(ConnProfile::new(
@@ -717,15 +1072,26 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     })
 }
 
+/// Minimal `RunResults` for the `apply_hook_verdict` tests (the real engine
+/// type; built via `Default` so it stays correct as the results schema grows).
+#[cfg(test)]
+fn minimal_run_results(verdict: Verdict) -> RunResults {
+    RunResults {
+        verdict,
+        ..RunResults::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_superuser_requires_reason, load_definition, parse_level, parse_tls_mode, Cli,
-        Command, DiffArgs, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        allow_superuser_requires_reason, apply_hook_verdict, hook_causes_non_pass, hook_exit_code,
+        load_definition, minimal_run_results, parse_level, parse_tls_mode, Cli, Command,
+        ConfigError, ConnArgs, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
-    use dmux_engine::results::CheckLevel;
+    use dmux_engine::results::{CheckLevel, Verdict};
 
     #[test]
     fn exit_codes_match_the_plan() {
@@ -823,6 +1189,37 @@ mod tests {
     }
 
     #[test]
+    fn config_error_never_leaks_a_password_or_user_value() {
+        // A live password lives in the environment while an unrelated config
+        // error is triggered.  The rendered message must be a fixed ConfigError
+        // string — never the password sentinel and never the user-supplied tls
+        // value (CodeQL rust/cleartext-logging).
+        const SENTINEL: &str = "SENTINEL-PASSWORD-982134";
+        std::env::set_var("DMUX_TEST_SENTINEL_PW", SENTINEL);
+        let args = ConnArgs {
+            host: "h".into(),
+            port: 5433,
+            db: "d".into(),
+            user: "u".into(),
+            password_env: Some("DMUX_TEST_SENTINEL_PW".into()),
+            tls: "SENTINEL-TLS-VALUE".into(),
+            reason: None,
+            allow_superuser: false,
+        };
+        let err = args.profile().unwrap_err();
+        assert_eq!(err, ConfigError::TlsUnknown);
+        let message = err.message();
+        assert!(
+            !message.contains(SENTINEL),
+            "password leaked into the error message: {message}"
+        );
+        assert!(
+            !message.contains("SENTINEL-TLS-VALUE"),
+            "user value leaked into the error message: {message}"
+        );
+    }
+
+    #[test]
     fn diff_args_shape() {
         let cmd = Cli::try_parse_from(["dmux", "diff", "--old", "a.json", "--new", "b.json"])
             .expect("parse");
@@ -833,6 +1230,289 @@ mod tests {
             }
             _ => panic!("expected diff"),
         }
+    }
+
+    #[test]
+    fn run_args_accept_hooks_opt_in() {
+        // Hooks are opt-in: without `--hooks` the field is None.
+        let cmd = Cli::try_parse_from(["dmux", "run", "def.toml"]).expect("parse");
+        match cmd.command {
+            Command::Run(args) => {
+                assert!(args.hooks.is_none());
+                assert_eq!(args.hook_timeout, 60);
+                assert!(args.python.is_none());
+            }
+            _ => panic!("expected run"),
+        }
+
+        let cmd = Cli::try_parse_from([
+            "dmux",
+            "run",
+            "def.toml",
+            "--hooks",
+            "hooks/",
+            "--hook-timeout",
+            "30",
+            "--python",
+            "/usr/bin/python3",
+        ])
+        .expect("parse");
+        match cmd.command {
+            Command::Run(args) => {
+                assert_eq!(args.hooks, Some(std::path::PathBuf::from("hooks/")));
+                assert_eq!(args.hook_timeout, 30);
+                assert_eq!(
+                    args.python,
+                    Some(std::path::PathBuf::from("/usr/bin/python3"))
+                );
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn hook_args_shape() {
+        let cmd = Cli::try_parse_from(["dmux", "hook", "results.json", "hooks/"]).expect("parse");
+        match cmd.command {
+            Command::Hook(args) => {
+                assert_eq!(args.results, "results.json");
+                assert_eq!(args.hooks, std::path::PathBuf::from("hooks/"));
+                assert_eq!(args.timeout, 60);
+            }
+            _ => panic!("expected hook"),
+        }
+    }
+
+    #[test]
+    fn hook_cause_non_pass_only_on_fail() {
+        use dmux_hooks::Finding;
+        let info = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "a".into(),
+                severity: Severity::Info,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        assert!(!hook_causes_non_pass(&[info]));
+
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "a".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        assert!(hook_causes_non_pass(&[fail]));
+    }
+
+    #[test]
+    fn custom_fail_forces_verdict_fail_in_written_results() {
+        use dmux_hooks::Finding;
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over threshold".into(),
+            }],
+            warnings: vec![],
+        };
+
+        // A PASS verdict must flip to FAIL with the reason recorded.
+        let mut pass_results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut pass_results, true, false, std::slice::from_ref(&fail));
+        assert_eq!(pass_results.verdict, Verdict::Fail);
+        assert!(
+            pass_results
+                .warnings
+                .iter()
+                .any(|w| w == "custom check custom.total failed"),
+            "reason not recorded: {:?}",
+            pass_results.warnings
+        );
+
+        // An already-FAIL verdict must never be raised back to PASS.
+        let mut fail_results = minimal_run_results(Verdict::Fail);
+        apply_hook_verdict(&mut fail_results, true, false, std::slice::from_ref(&fail));
+        assert_eq!(fail_results.verdict, Verdict::Fail);
+
+        // A non-PASS, non-FAIL verdict stays as-is (never lowered to PASS).
+        let mut tf = minimal_run_results(Verdict::ToolFault);
+        apply_hook_verdict(&mut tf, true, false, &[fail]);
+        assert_eq!(tf.verdict, Verdict::ToolFault);
+    }
+
+    #[test]
+    fn engine_warning_plus_custom_fail_yields_verdict_fail_and_exit_1() {
+        // Starting from a results file whose ENGINE verdict is WARNING (e.g. a
+        // SQL_ASCII flag), a custom-check fail must turn it into FAIL and exit 1,
+        // not stay WARNING / exit 2.
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec![],
+        };
+        let engine_warning = minimal_run_results(Verdict::Warning);
+        let mut results = engine_warning.clone();
+        apply_hook_verdict(&mut results, true, false, std::slice::from_ref(&fail));
+
+        // File verdict: WARNING ⇒ FAIL.
+        assert_eq!(results.verdict, Verdict::Fail);
+        assert!(
+            results
+                .warnings
+                .iter()
+                .any(|w| w == "custom check custom.total failed"),
+            "reason not recorded: {:?}",
+            results.warnings
+        );
+
+        // Exit code: a base WARNING (2) plus a fail finding ⇒ FAIL (1).
+        assert_eq!(hook_exit_code(true, false, EXIT_WARN), EXIT_FAIL);
+
+        // The results hash must be recomputed over the mutated file and change.
+        results.results_sha256 = dmux_engine::results::sha256_of(&results);
+        assert_ne!(
+            dmux_engine::results::sha256_of(&engine_warning),
+            results.results_sha256,
+            "the mutated file must carry a different digest"
+        );
+        assert_eq!(
+            dmux_engine::results::sha256_of(&results),
+            results.results_sha256
+        );
+    }
+
+    #[test]
+    fn warning_plus_fail_yields_verdict_fail() {
+        use dmux_hooks::Finding;
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec!["timed out".into()],
+        };
+
+        // WARNING + fail ⇒ file verdict FAIL (fail takes precedence); a warning
+        // must never lower a FAIL.
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut results, true, true, &[fail]);
+        assert_eq!(results.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn hook_warning_on_pass_yields_verdict_warning() {
+        // A hook that timed out / crashed / produced invalid or uncollected
+        // output on an otherwise-PASS run ⇒ file verdict WARNING with a reason.
+        let warn = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![],
+            warnings: vec!["hook timed out after 1000 ms".into()],
+        };
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut results, false, true, &[warn]);
+        assert_eq!(results.verdict, Verdict::Warning);
+        assert!(
+            results
+                .warnings
+                .iter()
+                .any(|w| w.contains("custom check hook reported a problem")),
+            "warning reason not recorded: {:?}",
+            results.warnings
+        );
+
+        // A hook warning never downgrades an existing non-PASS verdict.
+        let warn2 = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![],
+            warnings: vec!["timed out".into()],
+        };
+        let mut fail = minimal_run_results(Verdict::Fail);
+        apply_hook_verdict(&mut fail, false, true, &[warn2]);
+        assert_eq!(fail.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn custom_fail_with_no_fail_findings_is_a_noop() {
+        let mut results = minimal_run_results(Verdict::Pass);
+        let info = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "a".into(),
+                severity: Severity::Info,
+                table: None,
+                message: "m".into(),
+            }],
+            warnings: vec![],
+        };
+        apply_hook_verdict(&mut results, false, false, &[info]);
+        assert_eq!(results.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn warning_plus_fail_is_fail_not_warning() {
+        // A fail finding must yield FAIL (1), even when warnings are present:
+        // fail takes precedence over warning.
+        assert_eq!(hook_exit_code(true, true, EXIT_PASS), EXIT_FAIL);
+        // Fail alone ⇒ FAIL.
+        assert_eq!(hook_exit_code(true, false, EXIT_PASS), EXIT_FAIL);
+        // Warning alone on a clean PASS ⇒ WARN (2).
+        assert_eq!(hook_exit_code(false, true, EXIT_PASS), EXIT_WARN);
+        // No hook signal leaves the base code untouched.
+        assert_eq!(hook_exit_code(false, false, EXIT_PASS), EXIT_PASS);
+        assert_eq!(hook_exit_code(false, false, EXIT_FAIL), EXIT_FAIL);
+        // A warning never overrides an existing non-PASS verdict.
+        assert_eq!(hook_exit_code(false, true, EXIT_FAIL), EXIT_FAIL);
+    }
+
+    #[test]
+    fn custom_fail_recomputes_the_results_hash() {
+        // The mutated results must carry a results_sha256 that matches the
+        // actual (mutated) content — the whole point of fix 1.
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec![],
+        };
+        let mut results = minimal_run_results(Verdict::Pass);
+        apply_hook_verdict(&mut results, true, false, &[fail]);
+        // Recompute exactly as run_run does before writing.
+        results.results_sha256 = dmux_engine::results::sha256_of(&results);
+
+        // A FAIL→PASS edit must fail verification.
+        let mut edited = results.clone();
+        edited.verdict = Verdict::Pass;
+        assert_ne!(
+            dmux_engine::results::sha256_of(&edited),
+            results.results_sha256,
+            "editing FAIL back to PASS must change the digest"
+        );
+        // The untouched content still matches.
+        assert_eq!(
+            dmux_engine::results::sha256_of(&results),
+            results.results_sha256
+        );
     }
 
     fn definition(name: &str, body: &str) -> Result<dmux_engine::run::RunConfig, String> {

@@ -453,7 +453,11 @@ fn shared_strings(bytes: &[u8]) -> Result<String, XlsxError> {
         let mut file = archive
             .by_index(i)
             .map_err(|e| XlsxError::Io(std::io::Error::other(e)))?;
-        if file.name() == "xl/sharedStrings.xml" || file.name().starts_with("xl/worksheets/") {
+        let name = file
+            .name()
+            .map_err(|e| XlsxError::Io(std::io::Error::other(e)))?
+            .into_owned();
+        if name == "xl/sharedStrings.xml" || name.starts_with("xl/worksheets/") {
             file.read_to_string(&mut out)?;
         }
     }

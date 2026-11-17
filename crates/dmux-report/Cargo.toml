@@ -8,10 +8,16 @@ publish = false
 
 [dependencies]
 dmux-engine = { path = "../dmux-engine" }
+dmux-hooks = { path = "../dmux-hooks" }
 # PDF summary is generated entirely in Rust (PLAN.md 5): no browser printing.
-# genpdf is pure Rust (printpdf + rusttype), Apache-2.0 OR MIT; it embeds the
+# printpdf is MIT, actively maintained; >=0.11 fixes RUSTSEC-2026-0187 (lopdf
+# 0.26 stack-overflow DoS) by moving to lopdf >=0.44, dropping the unmaintained
+# genpdf/rusttype/stb_truetype/stdweb/lzw/encoding chain entirely. It embeds the
 # bundled Liberation fonts (OFL-1.1, permissive — see fonts/OFL-1.1.txt).
-genpdf = "0.2.0"
+# `html` (the default feature) drags in the whole azul layout tree and, via
+# hyphenation, the unmaintained bincode crate. We only draw text with embedded
+# fonts, so use no default features: text goes through the font's own cmap.
+printpdf = { version = "0.12.9", default-features = false }
 # Excel detail via rust_xlsxwriter (MIT OR Apache-2.0), the same library the
 # plan names. Lists longer than 1,048,576 rows overflow to CSV.
 rust_xlsxwriter = "0.102.0"
@@ -24,4 +30,7 @@ thiserror = "2.0.21"
 [dev-dependencies]
 # Read a generated .xlsx back (it is a ZIP) to assert keys/row-values never leak.
 # rust_xlsxwriter itself cannot parse; zip + a string scan is sufficient.
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+# Pinned >=9.0.0: v2.x carries RUSTSEC-2026-0429 (ZipArchive::extract abort on a
+# malicious symlink entry); 9.0.0 fixes it. This is dev-only (tests read the
+# generated .xlsx back to assert nothing leaks).
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }

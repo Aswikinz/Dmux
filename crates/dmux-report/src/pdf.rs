@@ -1,23 +1,29 @@
 //! The PDF summary (PLAN.md 4.7, 1, 2.4 and 5).
 //!
-//! Generated entirely in Rust with `genpdf` — no browser printing.  Liberation
+//! Generated entirely in Rust with `printpdf` — no browser printing.  Liberation
 //! Sans (regular and bold) is embedded from the bundled files under `fonts/`;
 //! their permissive licence is `fonts/OFL-1.1.txt`.
 //!
 //! Page 1 carries the overall verdict (a word, never colour alone), the coverage
-//! line, every ignored item with its reason, failures first, the run identity
-//! (run ID, tool version, mapping hash, results SHA-256), the "what a PASS does
-//! not prove" paragraph, the md5 threat-model sentence (decision 10), the
-//! tamper-evident-not-proof sentence, and a sign-off block.  Per-table sections
-//! follow (verdict, level, counts, differences summary).
+//! line, every failure, every ignored item with its reason, structure findings,
+//! the run identity (run ID, tool version, mapping hash, results SHA-256,
+//! definition hash), the "what a PASS does not prove" paragraph, the md5
+//! threat-model sentence (decision 10), the tamper-evident-not-proof sentence,
+//! the hook custom checks with script hashes, and a sign-off block.  Per-table
+//! sections follow (verdict, level, counts, differences summary).  Text wraps at
+//! word boundaries and pages automatically.
+//!
+//! The output is byte-deterministic for a given results file: the Info
+//! dictionary's wall-clock dates and the trailer's random document ID are
+//! neutralised, so the golden/hash tests remain stable.
 
 use std::path::Path;
 
 use dmux_engine::results::RunResults;
-use genpdf::elements::{LinearLayout, Paragraph};
-use genpdf::fonts::{FontData, FontFamily};
-use genpdf::style;
-use genpdf::{Document, Element, SimplePageDecorator};
+use printpdf::{
+    Color, Mm, Op, ParsedFont, PdfDocument, PdfFontHandle, PdfFontParseWarning, PdfSaveOptions, Pt,
+    Rgb, TextItem,
+};
 
 use crate::layout::{self, Layout, ReportOptions};
 use crate::verify::HookEvidence;
@@ -25,23 +31,26 @@ use crate::verify::HookEvidence;
 const FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
 
+/// A4 in millimetres.
+const PAGE_W_MM: f32 = 210.0;
+const PAGE_H_MM: f32 = 297.0;
+/// Body text size and leading.
+const BODY_PT: f32 = 10.0;
+const LEADING_PT: f32 = 14.0;
+const MARGIN_MM: f32 = 18.0;
+/// Em-based char-width estimate for wrapping (Liberation Sans ≈ 0.5 em average).
+const CHAR_W_FACTOR: f32 = 0.5;
+
 /// Errors rendering the PDF.
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
     #[error("cannot write PDF: {0}")]
     Io(#[from] std::io::Error),
-    #[error("cannot embed the bundled font: {0}")]
-    Font(String),
-    #[error("PDF render failed: {0}")]
-    Render(String),
+    #[error("cannot parse the bundled font")]
+    Font,
 }
 
 /// Write the PDF summary for verified results to `path`.
-///
-/// `results_sha256` is the verified digest of the results file (PLAN 2.4); it is
-/// printed on page 1 so a later edit is detectable.  `hooks`, when present,
-/// contributes the custom-check section and (via [`layout::build`]) folds into
-/// the displayed verdict.
 pub fn write_summary(
     results: &RunResults,
     hooks: Option<&HookEvidence>,
@@ -53,8 +62,7 @@ pub fn write_summary(
     write_summary_layout(&layout, results_sha256, path)
 }
 
-/// Write a pre-built layout to disk (used by the shared `render_all` path so the
-/// displayed-verdict fold happens once, in the caller).
+/// Write a pre-built layout to disk.
 pub fn write_summary_layout(
     layout: &Layout,
     results_sha256: &str,
@@ -66,31 +74,368 @@ pub fn write_summary_layout(
 }
 
 /// Render a [`Layout`] to in-memory PDF bytes (the test entry point).
-///
-/// The bytes have the Info-dictionary creation/modification dates neutralised so
-/// a fixed results file renders byte-identically (PLAN 4.7 deterministic output;
-/// the sign-off carries the run ID and SHA-256, not a wall-clock time).
 pub fn render_bytes(layout: &Layout, results_sha256: &str) -> Result<Vec<u8>, PdfError> {
     let doc = build_document(layout, results_sha256)?;
-    let mut buf = Vec::new();
-    doc.render(&mut buf)
-        .map_err(|e| PdfError::Render(e.to_string()))?;
-    Ok(neutralise_volatile(buf))
+    Ok(neutralise_volatile(save_bytes(doc)?))
+}
+
+fn save_bytes(doc: PdfDocument) -> Result<Vec<u8>, PdfError> {
+    let bytes = doc.save(&PdfSaveOptions::default(), &mut Vec::new());
+    if bytes.is_empty() {
+        return Err(PdfError::Font);
+    }
+    Ok(bytes)
+}
+
+/// A styled line of text, reduced to (font-kind, text) for the flow renderer.
+enum Run {
+    Heading(String),
+    Body(String),
+    Bold(String),
+    Title(String),
+}
+
+/// Build the printpdf document from a layout.
+pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<PdfDocument, PdfError> {
+    let mut warnings_w = Vec::<PdfFontParseWarning>::new();
+    let regular = ParsedFont::from_bytes(FONT_REGULAR, 0, &mut warnings_w).ok_or(PdfError::Font)?;
+    let bold = ParsedFont::from_bytes(FONT_BOLD, 0, &mut warnings_w).ok_or(PdfError::Font)?;
+
+    let mut doc = PdfDocument::new("Dmux migration verification report");
+    // Register the fonts under deterministic IDs (FontId::new() is random, which
+    // would leak into /BaseFont and every content stream and defeat the
+    // byte-determinism the golden/hash tests rely on).  FontId is a public newtype
+    // and `resources.fonts.map` is public, so we insert directly.
+    let regular_id = printpdf::FontId("FREGULAR".to_string());
+    let bold_id = printpdf::FontId("FBOLD".to_string());
+    doc.resources
+        .fonts
+        .map
+        .insert(regular_id.clone(), printpdf::PdfFont::new(regular));
+    doc.resources
+        .fonts
+        .map
+        .insert(bold_id.clone(), printpdf::PdfFont::new(bold));
+
+    let mut runs: Vec<Run> = Vec::new();
+    build_runs(layout, results_sha256, &mut runs);
+
+    let pages = flow(runs, &regular_id, &bold_id);
+    doc.with_pages(pages);
+    Ok(doc)
+}
+
+/// Lay the runs out into wrapped, paginated pages.
+fn flow(
+    runs: Vec<Run>,
+    regular: &printpdf::FontId,
+    bold: &printpdf::FontId,
+) -> Vec<printpdf::PdfPage> {
+    let page_w = Mm(PAGE_W_MM);
+    let page_h = Mm(PAGE_H_MM);
+    let text_w_mm = PAGE_W_MM - 2.0 * MARGIN_MM;
+    // y tracks the top of the current text line, measured downward from the TOP
+    // of the page.  printpdf's Point origin is the bottom-left, so the cursor's
+    // y-from-bottom is PAGE_H_MM - y.
+    let usable_h = PAGE_H_MM - 2.0 * MARGIN_MM;
+    let pt_to_mm = |pt: f32| pt * 0.352_778;
+
+    let mut pages: Vec<printpdf::PdfPage> = Vec::new();
+    let mut ops: Vec<Op> = Vec::new();
+    let mut y = MARGIN_MM; // distance from top
+
+    for run in runs {
+        let (font_kind, content) = match run {
+            Run::Heading(s) => (1u8, s),
+            Run::Body(s) => (0u8, s),
+            Run::Bold(s) => (1u8, s),
+            Run::Title(s) => (2u8, s),
+        };
+        let font_size = match font_kind {
+            2 => 20.0,
+            1 => 13.0,
+            _ => BODY_PT,
+        };
+        let leading_pt = match font_kind {
+            2 => 26.0,
+            1 => 17.0,
+            _ => LEADING_PT,
+        };
+        let leading_mm = pt_to_mm(leading_pt);
+        let lines = wrap(&content, text_w_mm, font_size);
+        let use_bold = font_kind == 1 || font_kind == 2;
+        let font_handle = if use_bold {
+            PdfFontHandle::External(bold.clone())
+        } else {
+            PdfFontHandle::External(regular.clone())
+        };
+
+        for line in lines {
+            // Paginate before a line that would fall below the bottom margin.
+            if y + leading_mm > MARGIN_MM + usable_h && !ops.is_empty() {
+                pages.push(printpdf::PdfPage::new(
+                    page_w,
+                    page_h,
+                    std::mem::take(&mut ops),
+                ));
+                y = MARGIN_MM;
+            }
+            ops.push(Op::StartTextSection);
+            ops.push(Op::SetTextCursor {
+                pos: printpdf::Point::new(Mm(MARGIN_MM), Mm(PAGE_H_MM - y)),
+            });
+            ops.push(Op::SetFont {
+                font: font_handle.clone(),
+                size: Pt(font_size),
+            });
+            ops.push(Op::SetLineHeight { lh: Pt(leading_pt) });
+            ops.push(Op::SetFillColor {
+                col: Color::Rgb(Rgb {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    icc_profile: None,
+                }),
+            });
+            ops.push(Op::ShowText {
+                items: vec![TextItem::Text(line)],
+            });
+            ops.push(Op::EndTextSection);
+            y += leading_mm;
+        }
+
+        // A small extra gap after headings.
+        if font_kind == 1 {
+            y += 2.0;
+        }
+    }
+
+    if !ops.is_empty() {
+        pages.push(printpdf::PdfPage::new(page_w, page_h, ops));
+    }
+
+    pages
+}
+
+/// Word-wrap text to `max_w_mm` at `font_size`, breaking on spaces.
+fn wrap(text: &str, max_w_mm: f32, font_size: f32) -> Vec<String> {
+    let char_w_mm = font_size * CHAR_W_FACTOR * 0.352778; // pt → mm
+    let max_chars = ((max_w_mm / char_w_mm).floor() as usize).max(1);
+    let mut out = Vec::new();
+    for hard in text.split('\n') {
+        if hard.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in hard.split_whitespace() {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.chars().count() + 1 + word.chars().count() <= max_chars {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+            // A single over-long word still overflows; hard-break it.
+            while line.chars().count() > max_chars {
+                let mut split_at = max_chars;
+                while split_at > 0 && !line.is_char_boundary(split_at) {
+                    split_at -= 1;
+                }
+                let (head, tail) = line.split_at(split_at);
+                out.push(head.to_string());
+                line = tail.to_string();
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Build the ordered list of runs (the report content).
+fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
+    runs.push(Run::Title("Dmux migration verification report".to_string()));
+
+    // Page 1: overall verdict, a word + text, never colour alone.
+    runs.push(Run::Heading("Overall verdict".to_string()));
+    runs.push(Run::Bold(layout.verdict_word.clone()));
+
+    runs.push(Run::Heading("Coverage".to_string()));
+    runs.push(Run::Body(layout.coverage_line.clone()));
+
+    runs.push(Run::Heading("Failures and findings".to_string()));
+    let failures: Vec<&layout::TableSummary> = layout
+        .tables
+        .iter()
+        .filter(|t| t.verdict_word != "PASS")
+        .collect();
+    if failures.is_empty() {
+        runs.push(Run::Body("None.".to_string()));
+    } else {
+        for t in &failures {
+            runs.push(Run::Body(format!(
+                "{} — {} ({}): {}",
+                t.table,
+                t.verdict_word,
+                t.level,
+                if t.reasons.is_empty() {
+                    "no reason recorded".to_string()
+                } else {
+                    t.reasons.join("; ")
+                }
+            )));
+        }
+    }
+
+    runs.push(Run::Heading("Ignored items".to_string()));
+    if layout.ignored_items.is_empty() {
+        runs.push(Run::Body("None.".to_string()));
+    } else {
+        for i in &layout.ignored_items {
+            runs.push(Run::Body(format!("{} — {}", i.path, i.reason)));
+        }
+    }
+
+    runs.push(Run::Heading("Structure findings".to_string()));
+    if layout.structure_findings.is_empty() {
+        runs.push(Run::Body("None.".to_string()));
+    } else {
+        for f in &layout.structure_findings {
+            runs.push(Run::Body(format!(
+                "{} — {}: {}",
+                f.object, f.verdict, f.message
+            )));
+        }
+    }
+
+    if !layout.suggestions.is_empty() {
+        runs.push(Run::Heading("Suggested matches".to_string()));
+        for s in &layout.suggestions {
+            runs.push(Run::Body(format!(
+                "{} -> {} (confidence {})",
+                s.path, s.candidate, s.confidence
+            )));
+        }
+    }
+
+    runs.push(Run::Heading("Run identity".to_string()));
+    runs.push(labeled_run("Run ID", &layout.run_id));
+    runs.push(labeled_run("Tool version", &layout.tool_version));
+    runs.push(labeled_run("Mapping hash", &layout.mapping_hash));
+    runs.push(labeled_run("Results SHA-256", results_sha256));
+    runs.push(labeled_run(
+        "Results schema version",
+        &layout.results_version,
+    ));
+    if !layout.definition_hash.is_empty() {
+        runs.push(labeled_run("Definition hash", &layout.definition_hash));
+    }
+    if let Some(wls) = &layout.wal_start_lsn {
+        runs.push(labeled_run("Write-ahead log start", wls));
+    }
+    if let Some(wle) = &layout.wal_end_lsn {
+        runs.push(labeled_run("Write-ahead log end", wle));
+    }
+
+    runs.push(Run::Heading("What a PASS does not prove".to_string()));
+    runs.push(Run::Body(layout::WHAT_PASS_DOES_NOT_PROVE.to_string()));
+    runs.push(Run::Heading("Limit of the row hashes".to_string()));
+    runs.push(Run::Body(layout::MD5_THREAT_MODEL.to_string()));
+    runs.push(Run::Heading("Trust and audit".to_string()));
+    runs.push(Run::Body(layout::TAMPER_EVIDENT_NOT_PROOF.to_string()));
+
+    runs.push(Run::Heading("Per-table results".to_string()));
+    for t in &layout.tables {
+        runs.push(Run::Bold(format!("{} — {}", t.table, t.verdict_word)));
+        runs.push(labeled_run("Level", &t.level));
+        runs.push(labeled_run(
+            "Old rows",
+            t.old_rows.as_deref().unwrap_or("-"),
+        ));
+        runs.push(labeled_run(
+            "New rows",
+            t.new_rows.as_deref().unwrap_or("-"),
+        ));
+        runs.push(labeled_run("Differing buckets", &t.differing_buckets));
+        runs.push(labeled_run("Missing buckets", &t.missing_buckets));
+        runs.push(labeled_run("Extra buckets", &t.extra_buckets));
+        runs.push(labeled_run("Missing rows", &t.missing_rows));
+        runs.push(labeled_run("Extra rows", &t.extra_rows));
+        runs.push(labeled_run("Changed rows", &t.changed_rows));
+        if !t.keys.is_empty() {
+            runs.push(labeled_run("Keys / covered columns", &t.keys.join(", ")));
+        }
+        let reasons = if t.reasons.is_empty() {
+            "none recorded".to_string()
+        } else {
+            t.reasons.join("; ")
+        };
+        runs.push(labeled_run("Reasons", &reasons));
+        if !t.changed_columns.is_empty() {
+            runs.push(labeled_run(
+                "Changed columns",
+                &t.changed_columns.join(", "),
+            ));
+        }
+        for word in &t.plain_words {
+            runs.push(labeled_run("Note", word));
+        }
+        for ct in &t.control_totals {
+            runs.push(labeled_run("Control total", ct));
+        }
+        for key in &t.keyed_rows {
+            runs.push(labeled_run("Key", key));
+        }
+    }
+
+    // Hook custom checks, marked as such, with each script's hash.
+    if !layout.custom_checks.is_empty() || !layout.hook_scripts.is_empty() {
+        runs.push(Run::Heading("Custom checks (Python hooks)".to_string()));
+        for c in &layout.custom_checks {
+            let scope = c
+                .table
+                .as_deref()
+                .map(|t| format!(" ({t})"))
+                .unwrap_or_default();
+            runs.push(Run::Body(format!(
+                "[{}] {}{}: {}",
+                c.id, c.severity, scope, c.message
+            )));
+        }
+        for w in &layout.hook_warnings {
+            runs.push(Run::Body(format!("hook warning: {w}")));
+        }
+        for s in &layout.hook_scripts {
+            runs.push(Run::Body(format!(
+                "script {} — SHA-256 {}",
+                s.script, s.sha256
+            )));
+        }
+    }
+
+    runs.push(Run::Heading("Sign-off".to_string()));
+    for line in layout::sign_off_block() {
+        runs.push(Run::Body(line.to_string()));
+    }
+}
+
+fn labeled_run(label: &str, value: &str) -> Run {
+    Run::Body(format!("{label}: {value}"))
 }
 
 /// Make the rendered bytes deterministic by overwriting the wall-clock values
 /// printpdf writes — the Info dictionary's creation/modification dates and the
-/// trailer's random document ID — with fixed same-length values.  Lengths are
-/// preserved so the cross-reference offsets stay valid.  The date is not a
-/// report claim; the run ID and results SHA-256 are the audit identity.
+/// trailer's random document ID — with fixed same-length values.
 fn neutralise_volatile(mut pdf: Vec<u8>) -> Vec<u8> {
-    // Fixed 23-byte date ("D:" + 14 digits + "+00'00'"), matching printpdf's form.
     let fixed_date: &[u8] = b"D:19700101000000+00'00'";
     for key in [b"/CreationDate(".as_slice(), b"/ModDate(".as_slice()] {
         overwrite_value(&mut pdf, key, fixed_date);
     }
-    // The /ID holds two random 32-hex-char strings; overwrite both with zeros,
-    // keeping the surrounding parentheses intact.
+    // The /ID holds two random 32-char literal strings; overwrite with zeros.
     let mut id_pos = 0;
     while let Some(id) = find_bytes(&pdf, b"/ID", id_pos) {
         id_pos = id + b"/ID".len();
@@ -111,9 +456,6 @@ fn neutralise_volatile(mut pdf: Vec<u8>) -> Vec<u8> {
     pdf
 }
 
-/// Overwrite the `(...)` value that follows each occurrence of `key` (e.g.
-/// `/CreationDate(`) with `fixed`, preserving the value's byte length by
-/// padding/truncating — the cross-reference offsets must not move.
 fn overwrite_value(pdf: &mut [u8], key: &[u8], fixed: &[u8]) {
     let mut start = 0;
     while let Some(p) = find_bytes(pdf, key, start) {
@@ -121,11 +463,9 @@ fn overwrite_value(pdf: &mut [u8], key: &[u8], fixed: &[u8]) {
         let Some(close) = find_bytes(pdf, b")", value_start) else {
             break;
         };
-        let len = close - value_start;
         for (i, b) in pdf.iter_mut().take(close).skip(value_start).enumerate() {
             *b = if i < fixed.len() { fixed[i] } else { b'0' };
         }
-        debug_assert_eq!(len, fixed.len(), "date length changed");
         start = close + 1;
     }
 }
@@ -137,220 +477,6 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| from + p)
 }
 
-/// Build the `genpdf` document from a layout.
-pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<Document, PdfError> {
-    let regular =
-        FontData::new(FONT_REGULAR.to_vec(), None).map_err(|e| PdfError::Font(e.to_string()))?;
-    let bold =
-        FontData::new(FONT_BOLD.to_vec(), None).map_err(|e| PdfError::Font(e.to_string()))?;
-    let sans = FontFamily {
-        regular: regular.clone(),
-        bold,
-        italic: regular.clone(),
-        bold_italic: regular,
-    };
-
-    let mut doc = Document::new(sans);
-    doc.set_title("Dmux migration verification report");
-    doc.set_font_size(11);
-    // Minimal conformance drops the ICC profile and XMP metadata (which carries a
-    // random document UUID and a wall-clock creation date), keeping the summary
-    // deterministic for a given results file — which is what lets tests hash it
-    // (PLAN 4.7 / the deterministic-output requirement).  It also cuts ~3 KiB.
-    doc.set_minimal_conformance();
-    let mut decorator = SimplePageDecorator::new();
-    decorator.set_margins(18);
-    doc.set_page_decorator(decorator);
-
-    let mut body = LinearLayout::vertical();
-
-    // --- Title ---
-    body.push(
-        Paragraph::new("Dmux migration verification report")
-            .styled(style::Style::new().with_font_size(20).bold()),
-    );
-
-    // --- Page 1: overall verdict, a word + text, never colour alone ---
-    body.push(heading("Overall verdict"));
-    body.push(
-        Paragraph::new(layout.verdict_word.clone())
-            .styled(style::Style::new().with_font_size(16).bold()),
-    );
-
-    // Coverage line.
-    body.push(heading("Coverage"));
-    body.push(plain(&layout.coverage_line));
-
-    // Failures first.
-    body.push(heading("Failures and findings"));
-    let failures: Vec<&layout::TableSummary> = layout
-        .tables
-        .iter()
-        .filter(|t| t.verdict_word != "PASS")
-        .collect();
-    if failures.is_empty() {
-        body.push(plain("None."));
-    } else {
-        for t in &failures {
-            body.push(plain(&format!(
-                "{} — {} ({}): {}",
-                t.table,
-                t.verdict_word,
-                t.level,
-                if t.reasons.is_empty() {
-                    "no reason recorded".to_string()
-                } else {
-                    t.reasons.join("; ")
-                }
-            )));
-        }
-    }
-
-    // Every ignored item with its reason.
-    body.push(heading("Ignored items"));
-    if layout.ignored_items.is_empty() {
-        body.push(plain("None."));
-    } else {
-        for i in &layout.ignored_items {
-            body.push(plain(&format!("{} — {}", i.path, i.reason)));
-        }
-    }
-
-    // Structure (inventory) findings, after the mapping is applied.
-    body.push(heading("Structure findings"));
-    if layout.structure_findings.is_empty() {
-        body.push(plain("None."));
-    } else {
-        for f in &layout.structure_findings {
-            body.push(plain(&format!(
-                "{} — {}: {}",
-                f.object, f.verdict, f.message
-            )));
-        }
-    }
-
-    // Suggested matches for unmapped objects (a person must tick them).
-    if !layout.suggestions.is_empty() {
-        body.push(heading("Suggested matches"));
-        for s in &layout.suggestions {
-            body.push(plain(&format!(
-                "{} -> {} (confidence {})",
-                s.path, s.candidate, s.confidence
-            )));
-        }
-    }
-
-    // Run identity.
-    body.push(heading("Run identity"));
-    body.push(labeled("Run ID", &layout.run_id));
-    body.push(labeled("Tool version", &layout.tool_version));
-    body.push(labeled("Mapping hash", &layout.mapping_hash));
-    body.push(labeled("Results SHA-256", results_sha256));
-    body.push(labeled("Results schema version", &layout.results_version));
-    if !layout.definition_hash.is_empty() {
-        body.push(labeled("Definition hash", &layout.definition_hash));
-    }
-    if let Some(wls) = &layout.wal_start_lsn {
-        body.push(labeled("Write-ahead log start", wls));
-    }
-    if let Some(wle) = &layout.wal_end_lsn {
-        body.push(labeled("Write-ahead log end", wle));
-    }
-
-    // Mandatory prose.
-    body.push(heading("What a PASS does not prove"));
-    body.push(plain(layout::WHAT_PASS_DOES_NOT_PROVE));
-    body.push(heading("Limit of the row hashes"));
-    body.push(plain(layout::MD5_THREAT_MODEL));
-    body.push(heading("Trust and audit"));
-    body.push(plain(layout::TAMPER_EVIDENT_NOT_PROOF));
-
-    // Per-table sections.
-    body.push(heading("Per-table results"));
-    for t in &layout.tables {
-        body.push(
-            Paragraph::new(format!("{} — {}", t.table, t.verdict_word))
-                .styled(style::Style::new().with_font_size(12).bold()),
-        );
-        body.push(labeled("Level", &t.level));
-        body.push(labeled("Old rows", t.old_rows.as_deref().unwrap_or("-")));
-        body.push(labeled("New rows", t.new_rows.as_deref().unwrap_or("-")));
-        body.push(labeled("Differing buckets", &t.differing_buckets));
-        body.push(labeled("Missing buckets", &t.missing_buckets));
-        body.push(labeled("Extra buckets", &t.extra_buckets));
-        body.push(labeled("Missing rows", &t.missing_rows));
-        body.push(labeled("Extra rows", &t.extra_rows));
-        body.push(labeled("Changed rows", &t.changed_rows));
-        if !t.keys.is_empty() {
-            body.push(labeled("Keys / covered columns", &t.keys.join(", ")));
-        }
-        let reasons = if t.reasons.is_empty() {
-            "none recorded".to_string()
-        } else {
-            t.reasons.join("; ")
-        };
-        body.push(labeled("Reasons", &reasons));
-        if !t.changed_columns.is_empty() {
-            body.push(labeled("Changed columns", &t.changed_columns.join(", ")));
-        }
-        for word in &t.plain_words {
-            body.push(labeled("Note", word));
-        }
-        for ct in &t.control_totals {
-            body.push(labeled("Control total", ct));
-        }
-        for key in &t.keyed_rows {
-            body.push(labeled("Key", key));
-        }
-    }
-
-    // Hook custom checks (PLAN 4.9), marked as such, with each script's hash.
-    if !layout.custom_checks.is_empty() || !layout.hook_scripts.is_empty() {
-        body.push(heading("Custom checks (Python hooks)"));
-        for c in &layout.custom_checks {
-            let scope = c
-                .table
-                .as_deref()
-                .map(|t| format!(" ({t})"))
-                .unwrap_or_default();
-            body.push(plain(&format!(
-                "[{}] {}{}: {}",
-                c.id, c.severity, scope, c.message
-            )));
-        }
-        for w in &layout.hook_warnings {
-            body.push(plain(&format!("hook warning: {w}")));
-        }
-        for s in &layout.hook_scripts {
-            body.push(plain(&format!(
-                "script {} — SHA-256 {}",
-                s.script, s.sha256
-            )));
-        }
-    }
-
-    // Sign-off block.
-    body.push(heading("Sign-off"));
-    for line in layout::sign_off_block() {
-        body.push(plain(line));
-    }
-
-    doc.push(body);
-    Ok(doc)
-}
-
-fn heading(title: &str) -> genpdf::elements::StyledElement<Paragraph> {
-    Paragraph::new(title).styled(style::Style::new().with_font_size(14).bold())
-}
-
-fn plain(text: &str) -> Paragraph {
-    Paragraph::new(text)
-}
-
-fn labeled(label: &str, value: &str) -> Paragraph {
-    Paragraph::new(format!("{label}: {value}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +485,7 @@ mod tests {
         finalise, ChangedRowExport, CheckLevel, RunResults, TableDetail, TableResult, Verdict,
         RESULTS_VERSION,
     };
+    use printpdf::PdfParseOptions;
     use std::collections::BTreeMap;
 
     const SENTINEL: &str = "SECRET-ROW-VALUE-999";
@@ -383,7 +510,6 @@ mod tests {
                 reasons: vec!["row counts differ".into()],
             },
         );
-        // Drill-down key sentinels live in the typed `details` field.
         let details = BTreeMap::from([(
             "demo_bank.accounts".into(),
             TableDetail {
@@ -416,198 +542,17 @@ mod tests {
         finalise(r)
     }
 
-    /// Reconstruct the report's text from a rendered PDF: decode each font's
-    /// ToUnicode CMap and every content stream's glyph codes.  One decode per
-    /// font is returned; a sentinel must appear in none of them.
+    /// Read all the text back out of a rendered PDF using printpdf's own parser,
+    /// so the assertions match exactly what a real reader (and pdftotext) would
+    /// recover from the ToUnicode CMaps.
     fn extract_texts(pdf: &[u8]) -> Vec<String> {
-        let streams = content_streams(pdf);
-        to_unicode_maps(pdf)
+        let mut warnings = Vec::new();
+        let doc = PdfDocument::parse(pdf, &PdfParseOptions::default(), &mut warnings)
+            .expect("rendered PDF must parse");
+        doc.extract_text()
             .into_iter()
-            .map(|map| {
-                let mut text = String::new();
-                for stream in &streams {
-                    text.push_str(&decode_content(stream, &map));
-                    text.push('\n');
-                }
-                text
-            })
+            .map(|page| page.join("\n"))
             .collect()
-    }
-
-    /// Parse every font's ToUnicode CMap (`beginbfchar` blocks) into a
-    /// glyph-id -> char map.  The streams are uncompressed (printpdf writes no
-    /// FlateDecode), so the entries are plain text.
-    fn to_unicode_maps(pdf: &[u8]) -> Vec<std::collections::HashMap<u16, char>> {
-        let mut maps = Vec::new();
-        // Each font's ToUnicode object: `/ToUnicode N 0 R`.
-        let mut i = 0;
-        while let Some(p) = find(pdf, b"/ToUnicode", i) {
-            // Skip past `/ToUnicode` and any whitespace to the object number.
-            let mut after = p + b"/ToUnicode".len();
-            while after < pdf.len() && pdf[after].is_ascii_whitespace() {
-                after += 1;
-            }
-            i = after;
-            let num = read_number(&pdf[after..]).unwrap_or(u32::MAX);
-            if num == u32::MAX {
-                continue;
-            }
-            let needle = format!("{} 0 obj", num);
-            let (_obj, stream_bytes) = stream_for_obj(pdf, needle.as_bytes());
-            let mut map = std::collections::HashMap::new();
-            parse_bfchar(stream_bytes, &mut map);
-            if !map.is_empty() {
-                maps.push(map);
-            }
-        }
-        maps
-    }
-
-    fn stream_for_obj<'a>(pdf: &'a [u8], needle: &[u8]) -> (usize, &'a [u8]) {
-        match find(pdf, needle, 0) {
-            None => (0, &[]),
-            Some(start) => {
-                let s = find(pdf, b"stream", start).unwrap_or(start);
-                let body_start = s + b"stream".len();
-                let body_start = skip_crlf(pdf, body_start);
-                let e = find(pdf, b"endstream", body_start).unwrap_or(pdf.len());
-                (start, &pdf[body_start..e])
-            }
-        }
-    }
-
-    fn content_streams(pdf: &[u8]) -> Vec<&[u8]> {
-        let mut out = Vec::new();
-        // Page content streams are referenced from the page dict as
-        // `/Contents N 0 R`; read each referenced object's stream directly,
-        // rather than scanning every `stream` (the font binaries would be
-        // misread as content otherwise).
-        let mut i = 0;
-        while let Some(p) = find(pdf, b"/Contents", i) {
-            let mut after = p + b"/Contents".len();
-            while after < pdf.len() && pdf[after].is_ascii_whitespace() {
-                after += 1;
-            }
-            i = after;
-            let num = read_number(&pdf[after..]).unwrap_or(u32::MAX);
-            if num == u32::MAX {
-                continue;
-            }
-            let needle = format!("{} 0 obj", num);
-            let (_obj, stream) = stream_for_obj(pdf, needle.as_bytes());
-            if !stream.is_empty() {
-                out.push(stream);
-            }
-        }
-        out
-    }
-
-    fn parse_bfchar(stream: &[u8], map: &mut std::collections::HashMap<u16, char>) {
-        let mut idx = 0;
-        while let Some(p) = find(stream, b"beginbfchar", idx) {
-            idx = p + 1;
-            // The count precedes `beginbfchar` (e.g. "100 beginbfchar"): skip
-            // the separating whitespace, then read the digits backwards.
-            let mut k = p;
-            while k > 0 && stream[k - 1].is_ascii_whitespace() {
-                k -= 1;
-            }
-            let mut n = 0usize;
-            let mut mult = 1usize;
-            let mut have = false;
-            while k > 0 && stream[k - 1].is_ascii_digit() {
-                have = true;
-                n += (stream[k - 1] - b'0') as usize * mult;
-                mult *= 10;
-                k -= 1;
-            }
-            if !have {
-                continue;
-            }
-            // Skip to after `beginbfchar`, then read n `<gid> <uni>` lines.
-            let mut pos = p + b"beginbfchar".len();
-            for _ in 0..n {
-                let Some(gid_hex) = angle_hex(stream, &mut pos) else {
-                    break;
-                };
-                let Some(uni_hex) = angle_hex(stream, &mut pos) else {
-                    break;
-                };
-                let gid = u16::from_str_radix(&gid_hex, 16).unwrap_or(0);
-                let uni = u32::from_str_radix(&uni_hex, 16).unwrap_or(0);
-                if let Some(c) = char::from_u32(uni) {
-                    map.insert(gid, c);
-                }
-            }
-        }
-    }
-
-    /// Read the next `<hex>` token at/after `pos`, advancing `pos` past it.
-    fn angle_hex(buf: &[u8], pos: &mut usize) -> Option<String> {
-        let open = find(buf, b"<", *pos)?;
-        let close = find(buf, b">", open + 1)?;
-        let inner = &buf[open + 1..close];
-        let hex: String = String::from_utf8_lossy(inner).trim().to_string();
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            *pos = close + 1;
-            return None;
-        }
-        *pos = close + 1;
-        Some(hex)
-    }
-
-    /// Decode one content stream against one font's glyph map.
-    fn decode_content(stream: &[u8], map: &std::collections::HashMap<u16, char>) -> String {
-        let mut out = String::new();
-        let mut i = 0;
-        while i < stream.len() {
-            let b = stream[i];
-            if b == b'(' {
-                // Literal string: read to the matching ')', unescaping nothing.
-                let Some(close) = find(stream, b")", i + 1) else {
-                    break;
-                };
-                out.push_str(&String::from_utf8_lossy(&stream[i + 1..close]));
-                i = close + 1;
-            } else if b == b'<' && i + 1 < stream.len() && stream[i + 1] != b'<' {
-                // Hex glyph code `<XXXX>`.
-                let Some(close) = find(stream, b">", i + 1) else {
-                    break;
-                };
-                let hex = &stream[i + 1..close];
-                if let Ok(gid) = u16::from_str_radix(String::from_utf8_lossy(hex).trim(), 16) {
-                    if let Some(c) = map.get(&gid) {
-                        out.push(*c);
-                    }
-                }
-                i = close + 1;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-        hay[from..]
-            .windows(needle.len())
-            .position(|w| w == needle)
-            .map(|p| from + p)
-    }
-
-    fn skip_crlf(buf: &[u8], mut i: usize) -> usize {
-        while i < buf.len() && (buf[i] == b'\r' || buf[i] == b'\n') {
-            i += 1;
-        }
-        i
-    }
-
-    fn read_number(buf: &[u8]) -> Option<u32> {
-        let end = buf.iter().position(|b| !b.is_ascii_digit())?;
-        if end == 0 {
-            return None;
-        }
-        String::from_utf8_lossy(&buf[..end]).parse().ok()
     }
 
     fn any_contains(texts: &[String], needle: &str) -> bool {
@@ -705,5 +650,13 @@ mod tests {
         assert!(any_contains(&texts, "hook.py"), "{texts:?}");
         let joined = texts.concat();
         assert!(joined.contains(&"ab".repeat(32)), "script hash present");
+    }
+
+    #[test]
+    fn pdf_output_is_deterministic() {
+        let layout = build(&fixture(), None, &ReportOptions::default());
+        let a = render_bytes(&layout, "abc").unwrap();
+        let b = render_bytes(&layout, "abc").unwrap();
+        assert_eq!(a, b, "PDF must be byte-deterministic");
     }
 }
