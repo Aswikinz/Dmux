@@ -7,7 +7,7 @@ use super::drilldown::{changed_detail, classify, fetch_rows};
 use super::fingerprint::tests::{accounts_plan, mapping, reference_select};
 use super::fingerprint::{fingerprint, parse_summary, Fingerprint, Side, Source, TablePlan};
 use super::model;
-use super::normalise::{plan_column, ColumnMapping, PgType};
+use super::normalise::{plan_column, resolve_type, ColumnMapping, Geo, PgType};
 use super::{text_rows, CoreError};
 use tokio_postgres::{Client, IsolationLevel, NoTls, Transaction};
 
@@ -22,6 +22,10 @@ async fn both() -> Option<(Client, Client)> {
     let old = connect("DMUX_TEST_OLD_URL").await;
     let new = connect("DMUX_TEST_NEW_URL").await;
     if old.is_none() || new.is_none() {
+        assert!(
+            std::env::var("CI").as_deref() != Ok("true"),
+            "CI=true but DMUX_TEST_OLD_URL / DMUX_TEST_NEW_URL are not set: the live cross-check must run in CI"
+        );
         eprintln!("skipped: DMUX_TEST_OLD_URL / DMUX_TEST_NEW_URL not set");
     }
     Some((old?, new?))
@@ -299,6 +303,19 @@ async fn refuses_to_run_outside_the_read_only_session() {
         CoreError::UnsafeSession("search_path")
     );
     t.rollback().await.unwrap();
+    // Timeouts switched off (P17).
+    for setting in ["statement_timeout", "lock_timeout"] {
+        let t = session(&mut oc).await;
+        t.batch_execute(&format!("SET LOCAL {setting} = 0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fingerprint(&t, &plan, Side::Old, &src, "m")
+                .await
+                .unwrap_err(),
+            CoreError::UnsafeSession(setting)
+        );
+    }
     // A database error keeps only the SQLSTATE.
     let t = session(&mut oc).await;
     let bad = Source::Table {
@@ -311,4 +328,174 @@ async fn refuses_to_run_outside_the_read_only_session() {
             .unwrap_err(),
         CoreError::Db("42P01".into())
     );
+}
+
+/// Plan `id integer` (key) + `v` of the given type on both sides.
+fn one_col_plan(v: PgType) -> TablePlan {
+    let m = ColumnMapping {
+        old_type: v.clone(),
+        new_type: v,
+        ..mapping("v", "integer")
+    };
+    let cols = vec![
+        plan_column(&mapping("id", "integer")).unwrap(),
+        plan_column(&m).unwrap(),
+    ];
+    TablePlan::new(cols, vec![0], 3).unwrap()
+}
+
+/// `old` and `new` print alike under extra_float_digits = 0, yet must differ.
+async fn must_catch(plan: &TablePlan, old: &'static str, new: &'static str, printed: &str) {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        // The trap is real: the printed forms are identical.
+        let r = text_rows(&t, printed).await.unwrap();
+        assert_eq!(r[0][0].as_deref(), Some("t"), "{printed}");
+        let a = fp(&t, plan, Side::Old, old).await;
+        let b = fp(&t, plan, Side::New, new).await;
+        assert!(compare(SideOutcome::Ok(&a), SideOutcome::Ok(&a.clone()))
+            .unwrap()
+            .is_pass());
+        assert_eq!(
+            compare(SideOutcome::Ok(&a), SideOutcome::Ok(&b))
+                .unwrap()
+                .verdict,
+            Verdict::Fail
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_ulp_inside_a_float8_array_is_caught() {
+    must_catch(
+        &one_col_plan(PgType::parse("double precision[]")),
+        "(VALUES (1, ARRAY[0.1::float8, 2])) AS t(id, v)",
+        "(VALUES (1, ARRAY['0.10000000000000002'::float8, 2])) AS t(id, v)",
+        "SELECT ARRAY[0.1::float8]::text = ARRAY['0.10000000000000002'::float8]::text",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_ulp_inside_a_point_is_caught() {
+    must_catch(
+        &one_col_plan(PgType::Geometric(Geo::Point)),
+        "(VALUES (1, point(0.1, 1))) AS t(id, v)",
+        "(VALUES (1, point('0.10000000000000002'::float8, 1))) AS t(id, v)",
+        "SELECT point(0.1, 1)::text = point('0.10000000000000002'::float8, 1)::text",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resolver_reads_the_catalog() {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        let oid = |name: &'static str| {
+            let t = &t;
+            async move {
+                let r = t
+                    .query_one("SELECT $1::text::regtype::oid", &[&name])
+                    .await
+                    .unwrap();
+                r.get::<_, u32>(0)
+            }
+        };
+        let r = |o, m| resolve_type(&t, o, m);
+        assert_eq!(
+            r(oid("float8[]").await, -1).await.unwrap(),
+            PgType::Array(Box::new(PgType::Float8))
+        );
+        assert_eq!(
+            r(oid("numeric").await, (10 << 16) + 2 + 4).await.unwrap(),
+            PgType::Numeric(Some((10, 2)))
+        );
+        assert_eq!(
+            r(oid("polygon").await, -1).await.unwrap(),
+            PgType::Geometric(Geo::Polygon)
+        );
+        let dom = r(oid("information_schema.cardinal_number").await, -1)
+            .await
+            .unwrap();
+        assert_eq!(dom.base(), &PgType::Int4);
+        assert!(matches!(dom, PgType::Domain { .. }));
+        let rng = r(oid("int4range").await, -1).await.unwrap();
+        assert!(matches!(rng, PgType::Range { ref sub, .. } if **sub == PgType::Int4));
+        // pg_class's row type holds reltuples real: printed form is not exact.
+        let comp = r(oid("pg_class").await, -1).await.unwrap();
+        let PgType::Composite { ref fields, .. } = comp else {
+            panic!("composite expected");
+        };
+        assert!(fields.contains(&PgType::Float4));
+        assert!(one_col_plan(comp.clone()).needs_review());
+        assert!(matches!(
+            r(oid("anyelement").await, -1).await.unwrap(),
+            PgType::Unknown(_)
+        ));
+        assert_eq!(
+            r(0, -1).await.unwrap_err(),
+            CoreError::Malformed("type not found")
+        );
+    }
+}
+
+#[tokio::test]
+async fn domain_columns_use_the_base_rule_live() {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    const OLD: &str = "(VALUES (1, 5::information_schema.cardinal_number)) AS t(id, v)";
+    const NEW: &str = "(VALUES (1, 6::information_schema.cardinal_number)) AS t(id, v)";
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        let o: u32 = t
+            .query_one(
+                "SELECT 'information_schema.cardinal_number'::regtype::oid",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let plan = one_col_plan(resolve_type(&t, o, -1).await.unwrap());
+        assert!(!plan.needs_review());
+        let a = fp(&t, &plan, Side::Old, OLD).await;
+        let b = fp(&t, &plan, Side::New, NEW).await;
+        assert!(!compare(SideOutcome::Ok(&a), SideOutcome::Ok(&b))
+            .unwrap()
+            .is_pass());
+        // A domain over float8, if the test database provides one (no DDL here).
+        let found = t
+            .query_opt(
+                "SELECT t.oid, format_type(t.oid, NULL) FROM pg_type t \
+                 WHERE t.typtype = 'd' AND t.typbasetype = 'float8'::regtype LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        let Some(row) = found else {
+            eprintln!(
+                "notice: no domain over float8 in the test database; 1-ULP domain case not run"
+            );
+            continue;
+        };
+        let (doid, dname): (u32, String) = (row.get(0), row.get(1));
+        let plan = one_col_plan(resolve_type(&t, doid, -1).await.unwrap());
+        let old: &'static str =
+            Box::leak(format!("(VALUES (1, 0.1::float8::{dname})) AS t(id, v)").into_boxed_str());
+        let new: &'static str = Box::leak(
+            format!("(VALUES (1, '0.10000000000000002'::float8::{dname})) AS t(id, v)")
+                .into_boxed_str(),
+        );
+        let a = fp(&t, &plan, Side::Old, old).await;
+        let b = fp(&t, &plan, Side::New, new).await;
+        assert!(!compare(SideOutcome::Ok(&a), SideOutcome::Ok(&b))
+            .unwrap()
+            .is_pass());
+    }
 }

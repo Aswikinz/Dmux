@@ -121,6 +121,11 @@ impl TablePlan {
             .collect()
     }
 
+    /// Some column is compared by a printed form that is not provably exact.
+    pub fn needs_review(&self) -> bool {
+        self.columns.iter().any(ColumnPlan::needs_review)
+    }
+
     pub fn control_count(&self) -> usize {
         self.controls(Side::Old).len()
     }
@@ -287,6 +292,8 @@ pub struct Fingerprint {
     pub control_totals: Vec<Decimal>,
     /// Set when the bucket list is known to be incomplete; never PASSes.
     pub truncated: bool,
+    /// Some column needs a person's review; never a clean PASS.
+    pub needs_review: bool,
 }
 
 /// Strict unsigned integer: ASCII digits only, no sign, no spaces.
@@ -367,6 +374,7 @@ pub async fn fingerprint(
         buckets,
         control_totals,
         truncated: false,
+        needs_review: plan.needs_review(),
     })
 }
 
@@ -641,6 +649,7 @@ pub(crate) mod tests {
             }],
             control_totals: vec![Decimal::parse("-12.50").unwrap()],
             truncated: false,
+            needs_review: true,
         };
         let text = serde_json::to_string(&fp).unwrap();
         let back: Fingerprint = serde_json::from_str(&text).unwrap();

@@ -62,6 +62,9 @@ const REQUIRED_SETTINGS: &[(&str, &str)] = &[
     ("xmloption", "document"),
 ];
 
+/// Settings that must be set to something other than 0 (off) (P17).
+const NONZERO_SETTINGS: &[&str] = &["statement_timeout", "lock_timeout"];
+
 /// Run one statement with the simple protocol and return every value as text.
 pub(crate) async fn text_rows(
     client: &impl GenericClient,
@@ -83,15 +86,27 @@ pub(crate) async fn text_rows(
 /// Refuse to scan unless the session is read-only, repeatable read and has
 /// the canonical settings that the normalisation rules rely on.
 pub async fn check_session(client: &impl GenericClient) -> Result<(), CoreError> {
-    let cols: Vec<String> = REQUIRED_SETTINGS
+    let names = REQUIRED_SETTINGS
         .iter()
-        .map(|(name, _)| format!("current_setting('{name}')"))
+        .map(|(name, _)| *name)
+        .chain(NONZERO_SETTINGS.iter().copied());
+    let cols: Vec<String> = names
+        .map(|name| format!("current_setting('{name}')"))
         .collect();
     let rows = text_rows(client, &format!("SELECT {}", cols.join(", "))).await?;
     let row = rows.first().ok_or(CoreError::Malformed("settings check"))?;
     for (i, (name, want)) in REQUIRED_SETTINGS.iter().enumerate() {
         if row.get(i).and_then(|v| v.as_deref()) != Some(*want) {
             return Err(CoreError::UnsafeSession(name));
+        }
+    }
+    for (i, name) in NONZERO_SETTINGS.iter().enumerate() {
+        match row
+            .get(REQUIRED_SETTINGS.len() + i)
+            .and_then(|v| v.as_deref())
+        {
+            Some(v) if v != "0" => {}
+            _ => return Err(CoreError::UnsafeSession(name)),
         }
     }
     Ok(())

@@ -7,6 +7,9 @@ use super::fingerprint::{BucketSummary, Fingerprint};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The stop rule needs at least this many differing buckets (decision 17).
+pub const WIDE_MIN_BUCKETS: usize = 64;
+
 /// Buckets drilled into as a sample when a table is widely different.
 pub const WIDE_SAMPLE_BUCKETS: usize = 16;
 
@@ -16,6 +19,9 @@ pub enum Verdict {
     Fail,
     /// More than 10% of buckets differ; full drill-down is skipped.
     WidelyDifferent,
+    /// The data matched, but a column was compared by a printed form that is
+    /// not provably exact; a person must review it. Never a PASS.
+    NeedsReview,
     /// No decision possible (a side errored or is incomplete). Never a PASS.
     Error,
 }
@@ -27,6 +33,7 @@ pub enum NotPassReason {
     CountsDiffer,
     BucketsDiffer,
     ControlTotalsDiffer,
+    NeedsReview,
 }
 
 /// One side's outcome: a fingerprint, or a scan that failed.
@@ -167,12 +174,17 @@ pub fn compare(old: SideOutcome<'_>, new: SideOutcome<'_>) -> Result<Comparison,
     if o.control_totals != n.control_totals {
         reasons.push(NotPassReason::ControlTotalsDiffer);
     }
+    if o.needs_review || n.needs_review {
+        reasons.push(NotPassReason::NeedsReview);
+    }
     let verdict = if reasons.contains(&NotPassReason::Truncated) {
         Verdict::Error
-    } else if non_equal * 10 > equal + non_equal {
+    } else if non_equal >= WIDE_MIN_BUCKETS && non_equal * 10 > equal + non_equal {
         Verdict::WidelyDifferent
     } else if reasons.is_empty() {
         Verdict::Pass
+    } else if reasons == [NotPassReason::NeedsReview] {
+        Verdict::NeedsReview
     } else {
         Verdict::Fail
     };
@@ -211,6 +223,7 @@ mod tests {
             buckets,
             control_totals: vec![],
             truncated: false,
+            needs_review: false,
         }
     }
 
@@ -251,20 +264,42 @@ mod tests {
 
     #[test]
     fn widely_different_stop_rule() {
+        // Decision 17: more than 10% AND at least 64 differing buckets.
         let o = fp(many(100));
         let mut nb = many(100);
-        for x in nb.iter_mut().take(10) {
+        for x in nb.iter_mut().take(63) {
             x.s[1] = 1;
         }
-        assert_eq!(cmp(&o, &fp(nb.clone())).verdict, Verdict::Fail); // exactly 10%
-        nb[10].s[1] = 1;
-        assert_eq!(cmp(&o, &fp(nb.clone())).verdict, Verdict::WidelyDifferent);
-        for x in nb.iter_mut().take(30) {
-            x.s[1] = 1;
-        }
+        let c = cmp(&o, &fp(nb.clone()));
+        assert_eq!(c.verdict, Verdict::Fail); // 63% but only 63 buckets
+        assert_eq!(c.drilldown_buckets().len(), 63); // full drill-down
+        nb[63].s[1] = 1;
         let c = cmp(&o, &fp(nb));
-        assert_eq!(c.verdict, Verdict::WidelyDifferent);
+        assert_eq!(c.verdict, Verdict::WidelyDifferent); // 64
         assert_eq!(c.drilldown_buckets().len(), WIDE_SAMPLE_BUCKETS);
+        // 64 differing but exactly 10% of 640 buckets: not widely different.
+        let o = fp(many(640));
+        let mut nb = many(640);
+        for x in nb.iter_mut().take(64) {
+            x.s[1] = 1;
+        }
+        assert_eq!(cmp(&o, &fp(nb.clone())).verdict, Verdict::Fail);
+        nb[64].s[1] = 1;
+        assert_eq!(cmp(&o, &fp(nb)).verdict, Verdict::WidelyDifferent);
+    }
+
+    #[test]
+    fn needs_review_is_never_a_pass() {
+        let a = fp(many(5));
+        let mut r = a.clone();
+        r.needs_review = true;
+        let c = cmp(&a, &r);
+        assert_eq!(c.verdict, Verdict::NeedsReview);
+        assert_eq!(c.reasons, vec![NotPassReason::NeedsReview]);
+        assert_eq!(cmp(&r, &a).verdict, Verdict::NeedsReview);
+        let mut d = r.clone();
+        d.buckets[0].s[0] += 1;
+        assert_eq!(cmp(&r, &d).verdict, Verdict::Fail);
     }
 
     #[test]
