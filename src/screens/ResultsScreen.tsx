@@ -41,6 +41,28 @@ function IgnoredList({ ignored }: { ignored: IgnoreItem[] }) {
   );
 }
 
+/** Every ticked option is listed, in table.column: option form (H2 / decision 23). */
+function OptionsAppliedList({ results }: { results: Results }) {
+  const lines: string[] = results.tableResults.flatMap((t) =>
+    (t.columnNotes ?? [])
+      .filter((n) => n.kind === 'option')
+      .map((n) => `${t.schemaName}.${t.tableName}.${n.column}: ${n.note}`),
+  );
+  if (lines.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-3">
+      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Options applied</h3>
+      <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
+        {lines.map((line) => (
+          <li key={line}>{line}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /**
  * A drill-down row is a data difference between the old and new database, so
  * every kind renders as a FAIL-class badge. It is never labelled
@@ -138,6 +160,21 @@ export function ResultsScreen({
         header: 'Verdict',
         cell: ({ getValue }) => <StatusBadge status={getValue() as TableResult['verdict']} />,
       }),
+      col.display({
+        id: 'notes',
+        header: 'Notes',
+        cell: ({ row }) => {
+          const notes = row.original.columnNotes ?? [];
+          if (notes.length === 0) {
+            return null;
+          }
+          return (
+            <span className="text-xs text-slate-500">
+              {notes.map((n) => `${n.column}: ${n.note}`).join('; ')}
+            </span>
+          );
+        },
+      }),
     ] as ColumnDef<TableResult>[];
   }, []);
 
@@ -164,9 +201,15 @@ export function ResultsScreen({
       <Panel>
         <div className="flex flex-wrap items-center gap-4">
           <StatusBadge status={results.verdict} className="text-base" />
+          {results.verdict === 'PASS' && results.optionsApplied && (
+            <span className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+              PASS (with options)
+            </span>
+          )}
           <p className="text-sm text-slate-700 dark:text-slate-300">{coverageLabel(results.coverage)}</p>
         </div>
         <IgnoredList ignored={results.ignored} />
+        <OptionsAppliedList results={results} />
         <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">
           A PASS means every in-scope table passed at its chosen level, nothing was skipped without a
           recorded reason, and no table changed during the check.

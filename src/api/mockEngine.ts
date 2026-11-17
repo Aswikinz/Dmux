@@ -451,6 +451,7 @@ const makeResults = (fixture: string): Results => {
     ignored: makeIgnored(coverage.ignoredTables),
     failures,
     tableResults,
+    optionsApplied: false,
   };
 };
 

@@ -66,7 +66,8 @@ pub fn write_detail_layout(
     // envelope this is the envelope digest, not the nested results' own hash).
     layout.results_sha256 = results_sha256.to_string();
     let mut built = build_workbook(&layout, EXCEL_MAX_ROWS)?;
-    built.workbook.save(path)?;
+    let bytes = built.workbook.save_to_buffer()?;
+    crate::write_private(path, &bytes)?;
 
     for overflow in &built.overflow {
         let csv_path = csv_path_for(path, &overflow.sheet_name);
@@ -98,7 +99,7 @@ fn write_csv(path: &std::path::Path, overflow: &Overflow) -> Result<(), XlsxErro
         csv.push_str(&escaped.join(","));
         csv.push('\n');
     }
-    std::fs::write(path, csv)?;
+    crate::write_private(path, csv.as_bytes())?;
     Ok(())
 }
 
@@ -141,7 +142,10 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
         summary.write_string(row, 1, "Value")?;
         row += 1;
         let pairs: Vec<(String, String)> = vec![
-            ("Verdict".into(), layout.verdict_word.clone()),
+            (
+                "Verdict".into(),
+                layout::verdict_display(&layout.verdict_word, layout.options_applied),
+            ),
             ("Coverage".into(), layout.coverage_line.clone()),
             ("Fully checked".into(), layout.fully_checked.to_string()),
             ("Counts only".into(), layout.counts_only.to_string()),
@@ -161,6 +165,31 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
         for (k, v) in pairs {
             summary.write_string(row, 0, &k)?;
             summary.write_string(row, 1, &v)?;
+            row += 1;
+        }
+        if let Some(old) = &layout.capture_sha256_old {
+            summary.write_string(row, 0, "Old capture SHA-256")?;
+            summary.write_string(row, 1, old)?;
+            row += 1;
+        }
+        if let Some(new) = &layout.capture_sha256_new {
+            summary.write_string(row, 0, "New capture SHA-256")?;
+            summary.write_string(row, 1, new)?;
+            row += 1;
+        }
+        if layout.options_applied {
+            summary.write_string(row, 0, "Options applied")?;
+            summary.write_string(row, 1, "yes")?;
+            row += 1;
+        }
+        for line in &layout.options_applied_lines {
+            summary.write_string(row, 0, "Option applied")?;
+            summary.write_string(row, 1, line)?;
+            row += 1;
+        }
+        for line in &layout.connections {
+            summary.write_string(row, 0, "Connection")?;
+            summary.write_string(row, 1, line)?;
             row += 1;
         }
     }
@@ -184,6 +213,7 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
             "Reasons",
             "Changed columns",
             "Control totals",
+            "Column notes",
             "Notes",
             "Keyed rows",
         ];
@@ -204,6 +234,7 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
                 t.reasons.join("; "),
                 t.changed_columns.join(", "),
                 t.control_totals.join("; "),
+                t.column_notes.join("; "),
                 t.plain_words.join("; "),
                 t.keyed_rows.join("; "),
             ]);
@@ -494,6 +525,7 @@ mod tests {
             changed_columns: vec!["balance".into()],
             plain_words: vec!["one value changed".into()],
             control_totals: vec!["balance: 100.00 -> 99.99".into()],
+            column_notes: vec![],
             keyed_rows: if include_keys {
                 vec!["keyed 123".into()]
             } else {
@@ -530,6 +562,11 @@ mod tests {
             structure_findings: vec![],
             suggestions: vec![],
             definition_hash: String::new(),
+            options_applied: false,
+            options_applied_lines: vec![],
+            capture_sha256_old: None,
+            capture_sha256_new: None,
+            connections: vec![],
             custom_checks: vec![],
             hook_scripts: vec![],
             hook_warnings: vec![],
@@ -635,6 +672,24 @@ mod tests {
         assert_eq!(csv_escape_cell("=1+1,2"), "'\"=1+1,2\"");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn csv_overflow_output_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dmux-xlsx-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overflow.csv");
+        let overflow = Overflow {
+            sheet_name: "Tables".into(),
+            header: vec!["a".into()],
+            rows: vec![vec!["1".into()]],
+        };
+        write_csv(&path, &overflow).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "CSV overflow must be owner-only");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn workbook_omits_drilldown_keys_at_rendered_level() {
         // A full build through `build` (typed) with drill-down key sentinels:
@@ -659,6 +714,7 @@ mod tests {
                 extra_rows: Some(0),
                 changed_rows: Some(1),
                 reasons: vec![],
+                column_notes: vec![],
             },
         );
         let mut details = std::collections::BTreeMap::new();
@@ -729,6 +785,7 @@ mod tests {
                 extra_rows: None,
                 changed_rows: None,
                 reasons: vec!["\u{202E}looks benign".to_string()],
+                column_notes: vec![],
             },
         );
         let results = RunResults {

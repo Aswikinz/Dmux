@@ -414,6 +414,7 @@ describe('RunScreen', () => {
         ignored: [],
         failures: [],
         tableResults: [],
+        optionsApplied: false,
       }),
       exportReport: async () => ({ ok: true, filePath: '/tmp/r.pdf' }),
       getVersion: async () => 'mock',
@@ -571,6 +572,35 @@ describe('ResultsScreen', () => {
     expect(screen.getAllByText('Needs review').length).toBeGreaterThan(0);
     expect(screen.getByText(/manual review/)).toBeDefined();
   });
+
+  it('shows "PASS (with options)" and the options list when options were applied', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      getResults: async () => ({
+        runId: 'run-pass-options',
+        verdict: 'PASS',
+        coverage: { totalTables: 1, fullValuesTables: 1, countsTables: 0, structureTables: 0, ignoredTables: 0 },
+        ignored: [],
+        failures: [],
+        tableResults: [
+          {
+            tableId: 'demo_bank.accounts',
+            schemaName: 'demo_bank',
+            tableName: 'accounts',
+            verdict: 'PASS',
+            level: 'full-values',
+            checked: true,
+            columnNotes: [{ column: 'balance', kind: 'option', note: 'round to 2 decimals' }],
+          },
+        ],
+        optionsApplied: true,
+      }),
+    };
+    wrap(<ResultsHarness engine={engine} runId="run-pass-options" />);
+    expect(await screen.findByText('PASS (with options)')).toBeDefined();
+    expect(screen.getByText('Options applied')).toBeDefined();
+    expect(screen.getAllByText(/round to 2 decimals/).length).toBeGreaterThan(0);
+  });
 });
 
 describe('ReportScreen', () => {
@@ -585,6 +615,7 @@ describe('ReportScreen', () => {
     ],
     failures: [],
     tableResults: [],
+    optionsApplied: false,
   };
 
   it('exports a PDF and shows the saved path', async () => {

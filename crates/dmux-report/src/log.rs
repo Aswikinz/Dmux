@@ -140,10 +140,10 @@ pub fn write_run_log(
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         let log = build_log(results, hooks, options);
         let bytes = serde_json::to_vec_pretty(&log)?;
-        std::fs::write(path, bytes)?;
+        crate::write_private(path, &bytes)?;
     } else {
         let text = text_log(results, hooks, options);
-        std::fs::write(path, text)?;
+        crate::write_private(path, text.as_bytes())?;
     }
     Ok(())
 }

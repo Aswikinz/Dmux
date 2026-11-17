@@ -624,6 +624,42 @@ describe('data half is wired to the backend', () => {
     }
   });
 
+  it('getResults maps options_applied and per-column notes', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-1',
+      verdict: 'PASS',
+      options_applied: true,
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [
+        {
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          verdict: 'PASS',
+          level: 'full_values',
+          checked: true,
+          drill_down: null,
+          column_notes: [{ column: 'balance', kind: 'option', note: 'round to 2 decimals' }],
+        },
+      ],
+    });
+
+    const results = await engine.getResults('run-1');
+    expect(results.optionsApplied).toBe(true);
+    expect(results.tableResults[0].columnNotes).toEqual([
+      { column: 'balance', kind: 'option', note: 'round to 2 decimals' },
+    ]);
+  });
+
   it('pollRun / setRunPaused / cancelRun invoke their commands', async () => {
     const engine = createTauriEngine();
     const progress = {

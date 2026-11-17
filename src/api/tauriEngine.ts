@@ -266,6 +266,13 @@ interface RawDrillDownRow {
   differing_columns: string[] | null;
 }
 
+/** `get_results` -> `ColumnNoteDto`. */
+interface RawColumnNote {
+  column: string;
+  kind: string;
+  note: string;
+}
+
 interface RawFailureCard {
   id: string;
   table_id: string;
@@ -285,6 +292,7 @@ interface RawTableResult {
   level: EngineLevel;
   checked: boolean;
   drill_down: RawDrillDownRow[] | null;
+  column_notes: RawColumnNote[];
 }
 
 interface RawIgnored {
@@ -308,6 +316,7 @@ interface RawResults {
   ignored: RawIgnored[];
   failures: RawFailureCard[];
   table_results: RawTableResult[];
+  options_applied: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +769,11 @@ function translateResults(raw: RawResults): Results {
       kind: mapDrillKind(d.kind),
       differingColumns: d.differing_columns ?? undefined,
     })),
+    columnNotes: (t.column_notes ?? []).map((n) => ({
+      column: n.column,
+      kind: n.kind,
+      note: n.note,
+    })),
   }));
 
   return {
@@ -769,6 +783,7 @@ function translateResults(raw: RawResults): Results {
     ignored,
     failures,
     tableResults,
+    optionsApplied: raw.options_applied ?? false,
   };
 }
 

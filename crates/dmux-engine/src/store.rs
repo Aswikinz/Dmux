@@ -395,6 +395,7 @@ mod tests {
                 extra_rows: Some(0),
                 changed_rows: Some(0),
                 reasons: vec!["row counts differ".into()],
+                column_notes: vec![],
             },
             old: mark(),
             new: SideMark {
