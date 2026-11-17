@@ -155,18 +155,22 @@ into the LATIN1 old database and the UTF-8 new one. The data set mixes NULLs, em
 strings and trailing spaces on purpose.
 
 ```
-testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434)
+testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434), planted
+testdata/demo_bank/build.sh --no-plant      # identical data on both sides (verify.sh's build)
 testdata/demo_bank/build.sh 5435 5437       # old 9.4 -> new 18, other local ports
-testdata/demo_bank/verify.sh                # old vs new, plus per-table digests
+testdata/demo_bank/verify.sh                # --no-plant build: old vs new, per-table digests
 testdata/demo_bank/verify.sh --baseline /tmp/demo_bank.digest   # + same data every run
+testdata/demo_bank/check_key.sh             # planted build: prove expected_diffs.json
 ```
 
 `build.sh` drops and recreates the database **`demo_bank`** on the old server
 (LATIN1, C sort order), loads `schema.sql` then `data.sql`, dumps it with
 `pg_dump -Fc`, drops and recreates `demo_bank` on the new server (UTF-8), restores
-with `pg_restore`, and `ANALYZE`s both sides. It prints each server's version,
-encoding and collation, and a table/row summary. It only ever touches the database
-named `demo_bank` (plus the `postgres` maintenance database used to create it) and
+with `pg_restore`, and `ANALYZE`s both sides. It then applies `plant.sql` to the
+**new** database only (the PLAN.md 8.2 differences); `--no-plant` skips that step
+and keeps the two sides identical. It prints each server's version, encoding and
+collation, and a table/row summary. It only ever touches the database named
+`demo_bank` (plus the `postgres` maintenance database used to create it) and
 guards all four URLs with `phase0/guard.sh` — it can never reach the `bank`
 databases or anything that is not a local mock.
 
@@ -180,16 +184,78 @@ that old and new agree on every table and that both sides have the same table se
 With `--baseline FILE` it also compares against an earlier run's digests, which is
 how "two builds produce the same data" is proved; the file is written on first use.
 It exits non-zero on any mismatch. The same digests come out of the 9.4 → 18 pair,
-so the data set is identical across versions too.
+so the data set is identical across versions too. Run it on a `--no-plant` build:
+the planted build is meant to differ.
 
-Checked: build + verify green on 9.6 → 17 and on 9.4 → 18; two consecutive builds
-gave identical digests; a planted 0.01 `money` change, a NULL → empty-string change
-and a trailing-space change were each reported, while a reversed physical row order
-stayed quiet. After T016 plants the PLAN.md 8.2 differences in the new database,
-`verify.sh` is expected to fail — it is the identical-data proof, run before the
-differences are planted.
+Checked: build + verify green on 9.6 → 17 and on 9.4 → 18; two consecutive
+builds gave identical digests; a planted 0.01 `money` change, a NULL → empty-string
+change and a trailing-space change were each reported, while a reversed physical row
+order stayed quiet.
+
+### Answer key (T016)
+
+`expected_diffs.json` is the answer key of PLAN.md section 8.2: one versioned file
+(`version: 1`, `dataset: "demo_bank-small"`) with three lists.
+
+| List | Entries | Meaning |
+|---|---|---|
+| `must_report` | 15 (`m01`–`m15`) | every planted difference, with exact counts, keys, values and types |
+| `must_stay_quiet` | 6 (`q01`–`q06`) | identical data a naive tool would report; `q06` also expects an amber type change |
+| `runtime` | 1 (`r01`) | the one case that cannot be static: a row updated while the check runs |
+
+Every entry has `id`, `plan_ref` (`"8.2 row 1"`…`"8.2 row 13"`; the quiet rows are
+`"8.2 quiet row 1"`…), `object` (`schema.table[.column]`), `kind`, `expected` and
+`level` (`structure`, `counts` or `full_values`). The `expected` values are read
+straight from the planted databases and are exact — they use only invented
+`demo_bank` data, never a real name or a real row (decision 11).
+
+`plant.sql` plants them, in the new database only, after `build.sh`'s copy:
+
+| PLAN.md 8.2 | Planted change |
+|---|---|
+| row 1 | 12 rows deleted from `transactions` (ids listed in `m01`) |
+| row 2 | 3 duplicate rows added to the keyless `audit_log` |
+| row 3 | `accounts.balance` +0.01 on account 4999 (the audit trigger disabled for the one update) |
+| row 4 | one character changed in `transactions.narration` (19997) |
+| row 5 | an empty `transactions.narration` (7) turned into NULL |
+| row 6 | time of day dropped from `transactions.value_timestamp` (20000) |
+| row 7 | `user_roles.granted_by` dropped; `loans.settlement_ref` added |
+| row 8 | table `limits` → `product_limits`; column `fees.fee_name` → `fee_label` |
+| row 9 | `branches.city` widened from `varchar(60)` to `varchar(120)` (same amber class as the plan's 50 → 100) |
+| row 10 | `seq_gl_entry` set back to 7975 (old next value 8001, new 7976) |
+| row 11 | `ix_transactions_posted` dropped; `ck_transactions_fee` dropped and re-added `NOT VALID` |
+| row 12 | large object 7654321 removed (row 1 of `customer_documents` still points at it) |
+| row 13 | runtime only: see below |
+
+The stay-quiet cases: `balances_daily` becomes a declaratively partitioned table on
+the new side (three partitions, same name, same constraint and index names), the
+columns of `holidays` are reordered, and `kyc_checks.result` moves from `char(1)` to
+`varchar(1)`. The LATIN1 → UTF-8 accents, the C vs `en_US.utf8` sort order and the
+9.6 vs 17 float print need no planting: they are the old/new server difference
+itself, and `check_key.sh` proves they are present.
+
+`check_key.sh` is the database half of the answer-key test. It reads
+`expected_diffs.json`, repeats every claim as a read-only query against the two
+databases (guarded URLs, canonical settings block), and also re-runs `verify.sh`'s
+per-table digest for every table, mapping `limits` → `product_limits` and reading the
+partitioned `balances_daily` through its parent. It proves the key is true before the
+engine is graded against it, checks that every key entry is covered by a check, and
+exits non-zero on any mismatch. For `transactions`, `audit_log` and `accounts` it
+also proves that only the planted rows moved.
+
+The runtime case cannot be a static plant. `concurrent_update.sh 60` updates one
+invented `notes` row (note 1500) in the new database in a loop for 60 seconds, one
+committed transaction per update. The engine test harness starts it just after the
+first table's counts are read; the run must end as **changed during check** (amber),
+never PASS. It writes on purpose; it is harness code, guarded to local mocks.
+
+The whole answer-key build is one command:
+
+```
+testdata/demo_bank/build.sh        # build, copy, plant
+testdata/demo_bank/check_key.sh    # 129 checks, exit 0 only when the key is true
+```
 
 ## Still to build (Nina, Phase 1)
 
 - `demo_bank/`: the `full` and `large` sizes (PLAN.md 8.1); `small` exists (T015)
-- `expected_diffs.json`: the answer key (PLAN.md section 8.2, T016)

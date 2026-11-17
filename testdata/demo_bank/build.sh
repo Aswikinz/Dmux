@@ -2,7 +2,8 @@
 # demo_bank: ONE command that builds the public test database on both mocks.
 #
 # Usage:
-#   testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434)
+#   testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434), planted
+#   testdata/demo_bank/build.sh --no-plant      # identical data on both sides
 #   testdata/demo_bank/build.sh 5435 5437       # old 9.4 -> new 18, other local ports
 #   OLD_URL=... NEW_URL=... testdata/demo_bank/build.sh
 #
@@ -12,11 +13,15 @@
 #   2. pg_dump -Fc the old database;
 #   3. drops and recreates database demo_bank on the NEW server (UTF-8) and
 #      pg_restore's the dump into it, so both sides hold exactly the same data;
-#   4. ANALYZE on both sides and prints a table/row summary.
+#   4. ANALYZE on both sides and prints a table/row summary;
+#   5. plants the PLAN.md 8.2 differences with demo_bank/plant.sql in the NEW
+#      database only (--no-plant skips this and keeps the two sides identical).
 #
-# This is the "identical data" baseline. testdata/demo_bank/verify.sh proves the
-# copy is complete and that two builds produce the same digests; T016 then plants
-# the PLAN.md 8.2 differences in the new database only.
+# With planting on (the default) this is the answer-key build:
+# testdata/demo_bank/check_key.sh then proves every planted difference against
+# testdata/expected_diffs.json. With --no-plant this is the identical-data
+# baseline: testdata/demo_bank/verify.sh proves the copy is complete and that two
+# builds produce the same digests.
 #
 # WARNING: this script WRITES and DROPS a database. It touches only the database
 # named demo_bank (plus the "postgres" maintenance database used to create it),
@@ -39,8 +44,27 @@ DB=demo_bank
 # With no settings, use the mock databases from testdata/compose.yml. Two
 # optional arguments pick other local ports, for the version matrix:
 #   testdata/demo_bank/build.sh 5435 5437     # old = 9.4, new = 18
-OLD_URL="${OLD_URL:-postgres://dmux_dev:dmux_dev_only@127.0.0.1:${1:-5433}/$DB}"
-NEW_URL="${NEW_URL:-postgres://dmux_dev:dmux_dev_only@127.0.0.1:${2:-5434}/$DB}"
+# --plant is the default (the answer-key build); --no-plant keeps the two sides
+# identical, which is what verify.sh is designed to prove.
+PLANT=1
+PORTS=()
+for arg in "$@"; do
+  case "$arg" in
+    --plant)    PLANT=1 ;;
+    --no-plant) PLANT=0 ;;
+    -h|--help)
+      sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --*) echo "build.sh: unknown option: $arg" >&2; exit 2 ;;
+    *) PORTS+=("$arg") ;;
+  esac
+done
+if [ "${#PORTS[@]}" -gt 2 ]; then
+  echo "build.sh: at most two ports (old, new)" >&2
+  exit 2
+fi
+OLD_URL="${OLD_URL:-postgres://dmux_dev:dmux_dev_only@127.0.0.1:${PORTS[0]:-5433}/$DB}"
+NEW_URL="${NEW_URL:-postgres://dmux_dev:dmux_dev_only@127.0.0.1:${PORTS[1]:-5434}/$DB}"
 # Maintenance connections: same server and credentials, the "postgres" database.
 # The guard forbids query strings, so the database name is the last path segment.
 OLD_ADMIN="${OLD_URL%/*}/postgres"
@@ -113,7 +137,22 @@ q "$OLD_URL" "ANALYZE"
 q "$NEW_URL" "ANALYZE"
 echo "  analysed both sides"
 
-echo "Summary:"
+echo "Summary (before planting):"
 printf '  old  %s\n' "$(table_counts "$OLD_URL")"
 printf '  new  %s\n' "$(table_counts "$NEW_URL")"
-echo "Next: testdata/demo_bank/verify.sh proves the two sides are identical."
+
+if [ "$PLANT" -eq 1 ]; then
+  echo "Planting the PLAN.md 8.2 differences in the new database only:"
+  if [ ! -f "$HERE/plant.sql" ]; then
+    echo "  plant.sql is missing" >&2
+    exit 1
+  fi
+  # NEW only. The old database stays the untouched "before" picture.
+  psql -X -q -v ON_ERROR_STOP=1 "$NEW_URL" -f "$HERE/plant.sql" >/dev/null
+  echo "  plant.sql applied (old side untouched)"
+  echo "Next: testdata/demo_bank/check_key.sh grades expected_diffs.json against these databases."
+else
+  echo "No planting (--no-plant): both sides hold identical data."
+  echo "Next: testdata/demo_bank/verify.sh proves the two sides are identical."
+fi
+
