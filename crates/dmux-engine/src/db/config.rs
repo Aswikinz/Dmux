@@ -41,6 +41,10 @@ pub struct ConnProfile {
     pub user: String,
     pub password: String,
     pub tls_mode: TlsMode,
+    /// Optional path to a PEM bundle of private-CA certificates, appended to the
+    /// bundled public roots when `tls_mode` is [`TlsMode::VerifyFull`].  A bank's
+    /// internal CA lives here.  Hostname verification is still enforced.
+    pub ca_file: Option<String>,
 }
 
 impl ConnProfile {
@@ -60,7 +64,15 @@ impl ConnProfile {
             user: user.into(),
             password: password.into(),
             tls_mode,
+            ca_file: None,
         }
+    }
+
+    /// Attach a private-CA PEM bundle path.  Builder form keeps `new` stable for
+    /// the many callers that do not need a CA file.
+    pub fn with_ca_file(mut self, path: impl Into<String>) -> Self {
+        self.ca_file = Some(path.into());
+        self
     }
 }
 
@@ -73,6 +85,7 @@ impl fmt::Debug for ConnProfile {
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .field("tls_mode", &self.tls_mode)
+            .field("ca_file", &self.ca_file)
             .finish()
     }
 }
@@ -151,5 +164,21 @@ mod tests {
         );
         let text = format!("{p:?}");
         assert!(text.contains("test-network"));
+    }
+
+    #[test]
+    fn ca_file_defaults_to_none_and_is_settable() {
+        let p = ConnProfile::new(
+            "db.example.com",
+            5432,
+            "bank",
+            "dmux_reader",
+            test_secret(),
+            TlsMode::VerifyFull,
+        );
+        assert_eq!(p.ca_file, None);
+
+        let with_ca = p.with_ca_file("/etc/bank/ca-bundle.pem");
+        assert_eq!(with_ca.ca_file.as_deref(), Some("/etc/bank/ca-bundle.pem"));
     }
 }

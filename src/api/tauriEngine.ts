@@ -209,6 +209,7 @@ interface BackendProfile {
   encryption: EncryptionField;
   tls_fingerprint: string | null;
   plaintext_reason: string | null;
+  ca_file: string | null;
 }
 
 /** Shape `save_profile` returns: the stored profile plus an optional warning. */
@@ -553,6 +554,7 @@ function toBackendProfile(profile: ConnectionProfile): BackendProfile {
     encryption,
     tls_fingerprint: profile.tlsFingerprint ?? null,
     plaintext_reason: profile.plaintextReason ?? null,
+    ca_file: profile.caFile ?? null,
   };
 }
 

@@ -52,6 +52,12 @@ describe('mockEngine', () => {
     expect(res.info?.tls).toHaveProperty('fingerprint');
   });
 
+  it('accepts a private-CA file on a verify profile', async () => {
+    const res = await mockEngine.testConnection(profile({ caFile: '/tmp/bank-ca.pem' }));
+    expect(res.ok).toBe(true);
+    expect(res.info?.tls).toEqual({ state: 'encrypted', verified: true });
+  });
+
   it('saveProfile stores the password in its (mock) keychain and profileHasPassword reports it', async () => {
     const engine = createMockEngine();
     await engine.saveProfile(profile(), 'hunter2');

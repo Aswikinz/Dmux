@@ -24,6 +24,11 @@ pub struct ProfileInput {
     pub encryption: String,
     pub tls_fingerprint: Option<String>,
     pub plaintext_reason: Option<String>,
+    /// Optional path to a private-CA PEM bundle, appended to the public roots
+    /// when `encryption == "verify"` (a bank's internal CA).  Optional so older
+    /// frontends and test fixtures that omit it still deserialise.
+    #[serde(default)]
+    pub ca_file: Option<String>,
 }
 
 /// The shape a command receives when it must connect: a profile plus, where the
@@ -92,14 +97,23 @@ pub fn build_profile(
     password: String,
     tls: TlsMode,
 ) -> dmux_engine::db::ConnProfile {
-    dmux_engine::db::ConnProfile::new(
+    let mut profile = dmux_engine::db::ConnProfile::new(
         input.host.trim(),
         input.port,
         input.database.trim(),
         input.user.trim(),
         password,
         tls,
-    )
+    );
+    if let Some(ca) = input
+        .ca_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        profile = profile.with_ca_file(ca);
+    }
+    profile
 }
 
 #[cfg(test)]
@@ -117,6 +131,7 @@ mod tests {
             encryption: encryption.to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         }
     }
 
@@ -150,6 +165,26 @@ mod tests {
             TlsMode::Disable(reason) => assert_eq!(reason, "test network"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_profile_carries_the_ca_file() {
+        let mut p = input("verify");
+        assert_eq!(
+            build_profile(&p, String::new(), TlsMode::VerifyFull).ca_file,
+            None
+        );
+
+        p.ca_file = Some("/etc/bank/ca.pem".to_string());
+        let profile = build_profile(&p, String::new(), TlsMode::VerifyFull);
+        assert_eq!(profile.ca_file.as_deref(), Some("/etc/bank/ca.pem"));
+
+        // A blank CA file is treated as absent, not as a broken path.
+        p.ca_file = Some("   ".to_string());
+        assert_eq!(
+            build_profile(&p, String::new(), TlsMode::VerifyFull).ca_file,
+            None
+        );
     }
 
     #[test]

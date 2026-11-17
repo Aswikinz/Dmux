@@ -36,8 +36,9 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::consistency::{
-    read_counters, read_replica_state, read_server_epoch, read_wal_position, replica_decision,
-    ChangeCounters, ReplicaDecision, ReplicaState, ServerEpoch,
+    change_detection_floor, read_counters, read_replica_state, read_server_epoch,
+    read_track_counts, read_wal_position, replica_decision, ChangeCounters, ReplicaDecision,
+    ReplicaState, ServerEpoch, SideChangeDetection,
 };
 use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerdict};
 use crate::core::drilldown::{classify, fetch_rows};
@@ -596,6 +597,36 @@ pub(crate) async fn wal(s: &mut ReadOnlySession, version_num: i32) -> Option<Str
     .and_then(|w| w.lsn)
 }
 
+/// Whether `track_counts` is on for a live side; an unreadable setting is
+/// treated as off (fail-closed: change detection cannot vouch).
+pub(crate) async fn track_counts_on(s: &mut ReadOnlySession) -> bool {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_track_counts(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The `schema.table` paths of every foreign table on a live side.  A failed
+/// lookup is an error, never "no foreign tables" (fail closed, M3).
+pub(crate) async fn foreign_tables_set(
+    s: &mut ReadOnlySession,
+) -> Result<BTreeSet<String>, RunError> {
+    s.with_read_only("30s", |to| {
+        Box::pin(async move {
+            crate::plan::foreign_tables(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(RunError::from)
+}
+
 pub(crate) async fn scan_fingerprint(
     s: &mut ReadOnlySession,
     plan: &TablePlan,
@@ -918,6 +949,11 @@ async fn run_live(
     // What the counters are relative to (see `crate::consistency`).
     let epoch_old = epoch(&mut old_s).await;
     let epoch_new = epoch(&mut new_s).await;
+    // Change-detection availability (M3): when `track_counts` is off on a side
+    // the counters never move, so every data-level table on that side is
+    // floored at NEEDS_REVIEW and a stored result cannot be reused.
+    let old_track_counts = track_counts_on(&mut old_s).await;
+    let new_track_counts = track_counts_on(&mut new_s).await;
 
     // Structure: both inventories, compared after the mapping is applied.
     checkpoint(config)?;
@@ -926,6 +962,24 @@ async fn run_live(
     let new_inv = inventory(&mut new_s).await;
     checkpoint(config)?;
     let (old_inv, new_inv) = (old_inv?, new_inv?);
+    // L4: a level, column-option or ignore key that names no table or column is
+    // a configuration error, never a silent no-op.
+    let unknown = crate::plan::unknown_paths(
+        &old_inv,
+        &new_inv,
+        &config.levels,
+        &config.column_options,
+        &config.mapping.ignored,
+    );
+    if !unknown.is_empty() {
+        return Err(RunError::Config(format!(
+            "unknown paths in the run definition or mapping: {}",
+            unknown.join(", ")
+        )));
+    }
+    // Foreign tables have no change counters (M3).
+    let old_foreign = foreign_tables_set(&mut old_s).await?;
+    let new_foreign = foreign_tables_set(&mut new_s).await?;
     let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
 
     // Pair every old table with its mapped new table.
@@ -944,6 +998,7 @@ async fn run_live(
     }
     let mut targets = BTreeSet::new();
     let mut pairs: Vec<Pair> = Vec::new();
+    let mut mapped: Vec<(String, String)> = Vec::new();
     for s in &old_inv.schemas {
         for t in &s.tables {
             let path = format!("{}.{}", s.name, t.name);
@@ -954,6 +1009,7 @@ async fn run_live(
                 b.ignore_table(&path, reason);
                 continue;
             }
+            mapped.push((path.clone(), new_path.clone()));
             let level = level_for(config, &path);
             match new_tables.get(&new_path) {
                 None => b.record(Evidence::new(&path, level, Outcome::MissingOnNew)),
@@ -973,6 +1029,29 @@ async fn run_live(
                 }),
             }
         }
+    }
+    // M2: refuse two old tables mapping to one new table (the mapping does not
+    // say which old table the new one is, so neither may PASS against it).
+    let duplicates = crate::mapping::duplicate_table_targets(&mapped);
+    if !duplicates.is_empty() {
+        let mut kept = Vec::with_capacity(pairs.len());
+        for p in pairs {
+            let np = p.new_path();
+            if let Some(olds) = duplicates.get(&np) {
+                b.record(Evidence::new(
+                    &p.path,
+                    p.level,
+                    Outcome::Fault(format!(
+                        "{} old tables ({}) map to new table {np}",
+                        if olds.len() == 2 { "two" } else { "multiple" },
+                        olds.join(", ")
+                    )),
+                ));
+            } else {
+                kept.push(p);
+            }
+        }
+        pairs = kept;
     }
     for (new_path, _) in new_tables.iter().filter(|(p, _)| !targets.contains(*p)) {
         if let Some(reason) = table_ignores.get(new_path) {
@@ -1019,6 +1098,14 @@ async fn run_live(
             continue;
         };
 
+        // Change-detection availability for this table (M3).
+        let old_cd = SideChangeDetection::of(
+            old_track_counts,
+            old_foreign.contains(&format!("{}.{}", p.old.0, p.old.1)),
+        );
+        let new_cd = SideChangeDetection::of(new_track_counts, new_foreign.contains(&p.new_path()));
+        let cd_floor = change_detection_floor(old_cd, new_cd);
+
         let ro = replica(&mut old_s, old_info.version_num).await;
         let rn = replica(&mut new_s, new_info.version_num).await;
 
@@ -1031,11 +1118,13 @@ async fn run_live(
                     counters: bo.clone(),
                     epoch: epoch_old.clone().unwrap_or_default(),
                     replica: ro.clone(),
+                    change_detection_ok: old_cd.ok(),
                 };
                 let now_new = SideMark {
                     counters: bn.clone(),
                     epoch: epoch_new.clone().unwrap_or_default(),
                     replica: rn.clone(),
+                    change_detection_ok: new_cd.ok(),
                 };
                 if st.rescan_reason(p.level, &now_old, &now_new).is_none() {
                     b.record_resumed(st.result.clone());
@@ -1056,6 +1145,11 @@ async fn run_live(
         // A stop during the last query (which the server cancelled) must
         // never be recorded or stored as this table's result.
         checkpoint(config)?;
+        // Change detection unavailable (track_counts off or a foreign table):
+        // floor the table at NEEDS_REVIEW, never a clean PASS (M3).
+        if let Some((floor, reason)) = cd_floor {
+            e.floors.push((floor, reason));
+        }
 
         // Replica replay during this table's scans (counters are blind there).
         let ro_after = replica(&mut old_s, old_info.version_num).await;
@@ -1088,11 +1182,13 @@ async fn run_live(
                             counters: ao,
                             epoch: epoch_old.clone().unwrap_or_default(),
                             replica: ro_after.clone().unwrap_or_default(),
+                            change_detection_ok: old_cd.ok(),
                         },
                         new: SideMark {
                             counters: an,
                             epoch: epoch_new.clone().unwrap_or_default(),
                             replica: rn_after.clone().unwrap_or_default(),
+                            change_detection_ok: new_cd.ok(),
                         },
                         wal_lsn: wal(&mut new_s, new_info.version_num).await,
                     })?;
@@ -1178,6 +1274,10 @@ async fn scan_pair(
             estimated_rows: p.old_rows.max(p.new_rows).max(0) as u64,
         },
     );
+    // M2: two old columns pairing with the same new column is refused.
+    if let Some(dup) = crate::plan::duplicate_column_target(&spec) {
+        return fault(dup.to_string());
+    }
 
     let notes = collect_column_notes(&spec);
     let with_coverage = |e: Result<Evidence, RunError>| {

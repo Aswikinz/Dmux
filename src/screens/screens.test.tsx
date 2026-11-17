@@ -153,6 +153,28 @@ describe('ConnectScreen', () => {
     expect(await screen.findByText('Superuser login')).toBeDefined();
   });
 
+  it('shows and edits the private-CA file field for verify encryption', () => {
+    const engine = createMockEngine();
+    function CaHarness() {
+      const [p, setP] = useState(defaultOldProfile());
+      return (
+        <ConnectScreen
+          engine={engine}
+          oldProfile={p}
+          newProfile={defaultNewProfile()}
+          onChangeOld={setP}
+          onChangeNew={() => {}}
+          onNext={() => {}}
+        />
+      );
+    }
+    wrap(<CaHarness />);
+    const input = screen.getByTestId('Old database-ca-file') as HTMLInputElement;
+    expect(input.value).toBe('');
+    fireEvent.change(input, { target: { value: '/tmp/bank-ca.pem' } });
+    expect(input.value).toBe('/tmp/bank-ca.pem');
+  });
+
   it('starts with empty profiles (no pre-filled host, database or user)', () => {
     expect(defaultOldProfile()).toMatchObject({
       host: '',

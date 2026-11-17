@@ -40,7 +40,7 @@ pub enum StoreError {
 
 /// Store format version, recorded in `run_meta`; a store from another version
 /// is cleared rather than trusted.
-pub const STORE_VERSION: &str = "3";
+pub const STORE_VERSION: &str = "4";
 
 /// What a saved table result was computed against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,18 +52,44 @@ pub struct RunKey {
 }
 
 /// What one side looked like when a table finished (or looks like now).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SideMark {
     pub counters: ChangeCounters,
     pub epoch: ServerEpoch,
     pub replica: ReplicaState,
+    /// Whether change detection could vouch for this side when the mark was
+    /// taken (`track_counts` on and not a foreign table).  A stored result whose
+    /// side could not vouch is never reused (M3).
+    #[serde(default = "default_change_detection_ok")]
+    pub change_detection_ok: bool,
+}
+
+fn default_change_detection_ok() -> bool {
+    true
+}
+
+impl Default for SideMark {
+    fn default() -> Self {
+        SideMark {
+            counters: ChangeCounters::default(),
+            epoch: ServerEpoch::default(),
+            replica: ReplicaState::default(),
+            change_detection_ok: true,
+        }
+    }
 }
 
 impl SideMark {
     /// Why counters read in `self` (stored) and `now` cannot vouch that the
     /// table is unchanged, if they cannot.
     pub fn rescan_reason(&self, now: &SideMark) -> Option<&'static str> {
+        if !self.change_detection_ok {
+            return Some("change detection was unavailable when this result was stored");
+        }
+        if !now.change_detection_ok {
+            return Some("change detection is unavailable now");
+        }
         if !self.epoch.same_as(&now.epoch) {
             return Some("the server restarted or its statistics were reset");
         }
@@ -294,6 +320,7 @@ mod tests {
                 stats_reset: None,
             },
             replica: ReplicaState::default(),
+            change_detection_ok: true,
         }
     }
 
@@ -307,6 +334,26 @@ mod tests {
         assert!(st
             .rescan_reason(CheckLevel::CountsAndTotals, &st.old, &st.new)
             .is_some());
+    }
+
+    #[test]
+    fn change_detection_unavailable_refuses_resume() {
+        // A stored result whose side could not vouch is never reused.
+        let mut st = stored("s.a", Verdict::Pass);
+        st.old.change_detection_ok = false;
+        assert_eq!(
+            st.rescan_reason(CheckLevel::FullValues, &st.old, &st.new),
+            Some("change detection was unavailable when this result was stored")
+        );
+        // A result stored when change detection worked is not reused when change
+        // detection is now unavailable (track_counts off or a foreign table).
+        let st = stored("s.a", Verdict::Pass);
+        let mut now = st.new.clone();
+        now.change_detection_ok = false;
+        assert_eq!(
+            st.rescan_reason(CheckLevel::FullValues, &st.old, &now),
+            Some("change detection is unavailable now")
+        );
     }
 
     #[test]

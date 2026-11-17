@@ -49,6 +49,7 @@ fn as_stored(profile: &ProfileInput) -> StoredProfile {
         encryption: profile.encryption.clone(),
         tls_fingerprint: profile.tls_fingerprint.clone(),
         plaintext_reason: profile.plaintext_reason.clone(),
+        ca_file: profile.ca_file.clone(),
     }
 }
 
@@ -63,6 +64,7 @@ fn connection_fields_differ(existing: &StoredProfile, incoming: &StoredProfile) 
         || existing.encryption != incoming.encryption
         || existing.tls_fingerprint != incoming.tls_fingerprint
         || existing.plaintext_reason != incoming.plaintext_reason
+        || existing.ca_file != incoming.ca_file
 }
 
 /// Save (insert or update) a profile, applying the saved-password safety rule.
@@ -235,6 +237,7 @@ mod tests {
             encryption: "verify".to_string(),
             tls_fingerprint: None,
             plaintext_reason: None,
+            ca_file: None,
         };
         overrides(&mut p);
         p
@@ -330,6 +333,29 @@ mod tests {
                 p.encryption = "trust".to_string();
                 p.tls_fingerprint = Some("deadbeef".to_string());
             }),
+            None,
+            &s,
+        )
+        .unwrap();
+        assert!(res
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("password removed")));
+        assert!(matches!(
+            saved_password(&s, "prod"),
+            Err(CommandError::PasswordMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn ca_file_change_without_a_password_removes_the_saved_password() {
+        let s = test_state();
+        do_save_profile(profile(|_| {}), Some(test_secret()), &s).unwrap();
+
+        // Changing which CA bundle is trusted is a connection-detail change:
+        // the saved password must not silently follow it.
+        let res = do_save_profile(
+            profile(|p| p.ca_file = Some("/etc/bank/ca.pem".to_string())),
             None,
             &s,
         )

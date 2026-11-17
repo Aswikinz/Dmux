@@ -35,3 +35,7 @@ playwright-report/
 
 # Local-only security audit handover (owner decision 22): never tracked
 SECURITY-AUDIT.md
+
+# Local-only agent instructions and handover notes (decision 12): never tracked
+CLAUDE.md
+HANDOVER-CLAUDE-CODE.md
