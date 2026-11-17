@@ -23,10 +23,6 @@
   <a href="https://sonarcloud.io/summary/new_code?id=Aswikinz_Dmux"><img src="https://sonarcloud.io/api/project_badges/measure?project=Aswikinz_Dmux&metric=alert_status" alt="Quality Gate Status" /></a>
 </p>
 
-<p align="center">
-  <img src="docs/screenshots/results.png" alt="The Results screen: a prominent FAIL verdict, the coverage line, ignored tables with reasons, and the failure cards" width="860" />
-</p>
-
 Dmux connects **read-only** to an old and a new PostgreSQL database, compares their
 structure and their data, and produces a report a team can sign. It was started for a
 core banking system upgrade, from Postgres 9.x to a current release, but holds nothing
@@ -90,35 +86,19 @@ and choose **Test connection** on each. Dmux shows **Connected** and what it che
 Passwords go to your system keychain; on a computer without one, Dmux keeps the
 password in memory until you close the app.
 
-<p align="center"><img src="docs/screenshots/connect.png" alt="The Connect screen with both databases connected" width="760" /></p>
-
 **3. Compare structure, then map.** Dmux lists every table, column, index and constraint
 side by side (red is missing, green is added, amber is changed, with the old and new
 type). On **Map**, approve or ignore the few pairings it could not make on its own;
 every ignored item needs a reason, which goes into the report.
-
-<p align="center"><img src="docs/screenshots/compare-structure.png" alt="The Compare structure screen with a changed column type shown as before and after" width="760" /></p>
 
 **4. Choose checks and run.** Pick a preset, or set each table to **Structure only**,
 **Counts and totals**, or **Full values**. Dmux shows how long it expects to take. Start
 the run; you can pause or cancel it at any time, and the verdict appears as soon as it
 ends.
 
-<p align="center">
-  <img src="docs/screenshots/choose-checks.png" alt="The Choose checks screen with presets and per-table levels" width="420" />
-  <img src="docs/screenshots/run.png" alt="The Run screen showing a FAIL verdict as soon as the run ends" width="420" />
-</p>
-
 **5. Read the results and save the report.** The verdict comes first, then the coverage
 line, everything that was ignored and why, and a card for each failing table. On
 **Report**, save a PDF summary to sign and an Excel workbook with the detail.
-
-<p align="center">
-  <img src="docs/screenshots/report.png" alt="The Report screen with Export PDF and Export Excel" width="420" />
-  <img src="docs/screenshots/results-dark.png" alt="The Results screen in dark mode" width="420" />
-</p>
-
-<sub>Screenshots use Dmux's built-in demo data.</sub>
 
 ### What the verdicts mean
 
