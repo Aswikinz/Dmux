@@ -8,8 +8,12 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege: read-only by default for the whole workflow. The build jobs
+# run pnpm install and tauri build, which execute third-party install scripts,
+# so a repo-write token must never be available to them. Only the `release` job
+# below is granted contents: write, because gh release create writes the release.
 permissions:
-  contents: write # gh release create needs to write the release
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +26,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Tag must match tauri.conf.json and package.json
         run: |
@@ -49,6 +55,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Same dependency list as ci.yml's checks job (verified for Tauri 2).
       - name: Install Tauri 2 Linux build dependencies
@@ -126,6 +134,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         id: rust
@@ -202,8 +212,16 @@ jobs:
     needs: [version-guard, build-linux, build-windows]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    # The only job that may write to the repository: gh release create below
+    # publishes the release. Everything before it stays read-only.
+    permissions:
+      contents: write
     steps:
+      # gh authenticates with the GH_TOKEN env below, and nothing here pushes
+      # through git, so the checkout token is not needed in .git/config either.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
