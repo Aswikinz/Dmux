@@ -533,6 +533,22 @@ describe('ResultsScreen', () => {
     expect(await screen.findByText('Changed columns: amount')).toBeDefined();
   });
 
+  it('labels changed-value rows "Changed values", never "Changed during check"', async () => {
+    wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'fail' })} runId="run-fail" />);
+    await screen.findByText('Failures');
+    const showRows = screen.getAllByRole('button', { name: 'Show rows' })[0];
+    fireEvent.click(showRows);
+
+    // The three drill-down kinds render distinct FAIL-class words.
+    expect(await screen.findByText('Missing in new')).toBeDefined();
+    expect(screen.getByText('Extra in new')).toBeDefined();
+    expect(screen.getByText('Changed values')).toBeDefined();
+
+    // A changed-value row is a data difference, not a concurrent modification,
+    // so it must never carry the "Changed during check" label.
+    expect(screen.queryByText('Changed during check')).toBeNull();
+  });
+
   it('lists ignored tables with their required reasons next to the coverage line', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'pass' })} runId="run-pass" />);
     await screen.findByText(/tables fully checked/);

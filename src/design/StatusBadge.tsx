@@ -16,7 +16,10 @@ interface StatusBadgeProps {
     | 'same'
     | 'missing'
     | 'added'
-    | 'changed';
+    | 'changed'
+    | 'missing-in-new'
+    | 'extra-in-new'
+    | 'changed-values';
   className?: string;
 }
 
@@ -43,6 +46,9 @@ const config: Record<
   missing: { icon: XCircle, label: 'Missing', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
   added: { icon: CheckCircle, label: 'Added', classes: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300' },
   changed: { icon: AlertTriangle, label: 'Changed', classes: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300' },
+  'missing-in-new': { icon: XCircle, label: 'Missing in new', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+  'extra-in-new': { icon: XCircle, label: 'Extra in new', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
+  'changed-values': { icon: XCircle, label: 'Changed values', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300' },
   unknown: { icon: Info, label: 'Unknown', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
 };
 

@@ -41,6 +41,18 @@ function IgnoredList({ ignored }: { ignored: IgnoreItem[] }) {
   );
 }
 
+/**
+ * A drill-down row is a data difference between the old and new database, so
+ * every kind renders as a FAIL-class badge. It is never labelled
+ * "Changed during check", which means the table was modified WHILE the check
+ * ran (PLAN 3.4) — a different condition with its own verdict.
+ */
+function drillDownStatus(kind: DrillDownRow['kind']): 'missing-in-new' | 'extra-in-new' | 'changed-values' {
+  if (kind === 'missing') return 'missing-in-new';
+  if (kind === 'extra') return 'extra-in-new';
+  return 'changed-values';
+}
+
 function DrillDown({ rows }: { rows: DrillDownRow[] }) {
   return (
     <div className="mt-2 space-y-2">
@@ -50,7 +62,7 @@ function DrillDown({ rows }: { rows: DrillDownRow[] }) {
           className="rounded-lg border border-slate-200 p-2 text-sm dark:border-slate-700"
         >
           <div className="font-medium text-slate-900 dark:text-slate-100">{row.key}</div>
-          <StatusBadge status={row.kind === 'missing' ? 'FAIL' : row.kind === 'extra' ? 'FAIL' : 'CHANGED_DURING_CHECK'} />
+          <StatusBadge status={drillDownStatus(row.kind)} />
           {row.kind === 'changed' && row.differingColumns && (
             <div className="mt-1 text-slate-600 dark:text-slate-300">
               Changed columns: {row.differingColumns.join(', ')}
