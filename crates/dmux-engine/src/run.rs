@@ -1680,7 +1680,7 @@ mod tests {
             5432,
             "db",
             "u",
-            "p",
+            format!("{:x}", std::process::id() ^ 0x5a5a),
             crate::db::TlsMode::Disable("test network".to_string()),
         );
         let info = ServerInfo {
@@ -1695,6 +1695,9 @@ mod tests {
             pooler_suspected: true,
             md5_available: false,
             sql_ascii: false,
+            rolbypassrls: false,
+            rls_tables: Vec::new(),
+            can_write_reasons: Vec::new(),
         };
         let c = connection_info(&profile, &info, Some("migration needs it"));
         assert_eq!(c.tls, "plaintext");
