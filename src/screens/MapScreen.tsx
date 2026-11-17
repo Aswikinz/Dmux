@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { MappingQueue } from '../components/MappingQueue';
 import { ErrorCard } from '../design/ErrorCard';
@@ -93,7 +94,7 @@ export function MapScreen({
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Map tables and columns</h2>
+      <ScreenHeader title="Map tables and columns" subtitle="Confirm how tables and columns in the old database pair with the new one." />
       {loading && (
         <Panel>
           <div className="py-8 text-center text-slate-600 dark:text-slate-300">Building mapping…</div>
@@ -124,14 +125,14 @@ export function MapScreen({
                   {mapping.ignored.map((item) => (
                     <li key={item.id} className="text-slate-700 dark:text-slate-300">
                       <span className="font-medium">{item.name}</span>
-                      <span className="ml-2 text-slate-500">— {item.reason}</span>
+                      <span className="ml-2 text-slate-500 dark:text-slate-400">— {item.reason}</span>
                     </li>
                   ))}
                 </ul>
               </div>
             )}
           </Panel>
-          <div className="flex justify-between">
+          <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
               Back
             </Button>

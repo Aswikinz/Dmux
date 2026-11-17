@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { StatusBadge } from '../design/StatusBadge';
 import { ErrorCard } from '../design/ErrorCard';
 import { DataTable } from '../components/DataTable';
+import { LEVEL_LABELS, VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
 import type { DrillDownRow, FailureCard, IgnoreItem, Results, TableResult } from '../api/contract';
@@ -28,12 +30,12 @@ function IgnoredList({ ignored }: { ignored: IgnoreItem[] }) {
   }
   return (
     <div className="mt-3">
-      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Ignored</h3>
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Ignored</h3>
       <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
         {ignored.map((item) => (
           <li key={item.id}>
             <span className="font-medium">{item.name}</span>
-            <span className="ml-2 text-slate-500">— {item.reason}</span>
+            <span className="ml-2 text-slate-500 dark:text-slate-400">— {item.reason}</span>
           </li>
         ))}
       </ul>
@@ -46,7 +48,7 @@ function OptionsAppliedList({ results }: { results: Results }) {
   if (!results.optionsRecorded) {
     return (
       <div className="mt-3">
-        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Options applied</h3>
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Options applied</h3>
         <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
           options not recorded (older results file)
         </p>
@@ -63,7 +65,7 @@ function OptionsAppliedList({ results }: { results: Results }) {
   }
   return (
     <div className="mt-3">
-      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Options applied</h3>
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Options applied</h3>
       <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
         {lines.map((line) => (
           <li key={line}>{line}</li>
@@ -80,7 +82,7 @@ function WarningsList({ warnings }: { warnings: string[] }) {
   }
   return (
     <div className="mt-3">
-      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Warnings</h3>
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Warnings</h3>
       <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
         {warnings.map((warning) => (
           <li key={warning}>{warning}</li>
@@ -88,21 +90,6 @@ function WarningsList({ warnings }: { warnings: string[] }) {
       </ul>
     </div>
   );
-}
-
-/** The single, consistent verdict label: a PASS is never bare when the file
- *  cannot vouch for options (H2 / decision 23). */
-function verdictLabel(results: Results): string | undefined {
-  if (results.verdict !== 'PASS') {
-    return undefined;
-  }
-  if (!results.optionsRecorded) {
-    return 'PASS (options not recorded — older results file)';
-  }
-  if (results.optionsApplied) {
-    return 'PASS (with options)';
-  }
-  return undefined;
 }
 
 /**
@@ -197,7 +184,10 @@ export function ResultsScreen({
     return [
       col.accessor('schemaName', { header: 'Schema' }),
       col.accessor('tableName', { header: 'Table' }),
-      col.accessor('level', { header: 'Level' }),
+      col.accessor('level', {
+        header: 'Level',
+        cell: ({ getValue }) => LEVEL_LABELS[getValue() as TableResult['level']] ?? getValue(),
+      }),
       col.accessor('verdict', {
         header: 'Verdict',
         cell: ({ getValue }) => <StatusBadge status={getValue() as TableResult['verdict']} />,
@@ -211,7 +201,7 @@ export function ResultsScreen({
             return null;
           }
           return (
-            <span className="text-xs text-slate-500">
+            <span className="text-xs text-slate-500 dark:text-slate-400">
               {notes.map((n) => `${n.column}: ${n.note}`).join('; ')}
             </span>
           );
@@ -223,7 +213,7 @@ export function ResultsScreen({
   if (!results) {
     return (
       <div className="space-y-6">
-        <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Results</h2>
+        <ScreenHeader title="Results" subtitle="The verdict comes first, then anything that needs your attention." />
         {error && <ErrorCard title="Could not load results">{error}</ErrorCard>}
         {!error && (
           <Panel>
@@ -238,17 +228,13 @@ export function ResultsScreen({
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Results</h2>
+      <ScreenHeader title="Results" subtitle="The verdict comes first, then anything that needs your attention." />
       {error && <ErrorCard title="Could not load results">{error}</ErrorCard>}
       <Panel>
-        <div className="flex flex-wrap items-center gap-4">
-          <StatusBadge
-            status={results.verdict}
-            label={verdictLabel(results)}
-            className="text-base"
-          />
-          <p className="text-sm text-slate-700 dark:text-slate-300">{coverageLabel(results.coverage)}</p>
-        </div>
+        <VerdictBanner verdict={results.verdict} label={qualifiedVerdictLabel(results)} />
+        <p className="mt-3 text-sm text-slate-700 dark:text-slate-300">
+          {coverageLabel(results.coverage)}
+        </p>
         <IgnoredList ignored={results.ignored} />
         <OptionsAppliedList results={results} />
         <WarningsList warnings={results.warnings} />
@@ -260,7 +246,7 @@ export function ResultsScreen({
 
       {results.failures.length > 0 && (
         <Panel>
-          <h3 className="mb-4 text-lg font-semibold text-slate-900 dark:text-slate-100">Failures</h3>
+          <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">Failures</h3>
           <div className="space-y-4">
             {results.failures.map((card) => {
               const expanded = expandedFailures.has(card.id);
@@ -290,7 +276,7 @@ export function ResultsScreen({
       )}
 
       <Panel>
-        <h3 className="mb-4 text-lg font-semibold text-slate-900 dark:text-slate-100">All tables</h3>
+        <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">All tables</h3>
         <DataTable
           data={results.tableResults}
           columns={tableColumns}
@@ -298,7 +284,7 @@ export function ResultsScreen({
         />
       </Panel>
 
-      <div className="flex justify-between">
+      <div className="flex items-center justify-between">
         <Button onClick={onBack} variant="secondary">
           Back
         </Button>

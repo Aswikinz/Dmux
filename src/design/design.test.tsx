@@ -2,7 +2,7 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Button } from './Button';
 import { Panel } from './Panel';
-import { StatusBadge } from './StatusBadge';
+import { StatusBadge, VERDICT_WORDS } from './StatusBadge';
 import { ErrorCard } from './ErrorCard';
 import { Tooltip } from './Tooltip';
 import { Input } from './Input';
@@ -56,14 +56,18 @@ describe('Panel', () => {
 
 describe('StatusBadge', () => {
   const verdictLabels: Record<string, string> = {
-    PASS: 'Pass',
-    FAIL: 'Fail',
-    WIDELY_DIFFERENT: 'Widely different',
-    NEEDS_REVIEW: 'Needs review',
-    CHANGED_DURING_CHECK: 'Changed during check',
-    TOOL_FAULT: 'Tool fault',
-    WARNING: 'Warning',
+    PASS: 'PASS',
+    FAIL: 'FAIL',
+    WIDELY_DIFFERENT: 'WIDELY DIFFERENT',
+    NEEDS_REVIEW: 'NEEDS REVIEW',
+    CHANGED_DURING_CHECK: 'CHANGED DURING CHECK',
+    TOOL_FAULT: 'TOOL FAULT',
+    WARNING: 'WARNING',
   };
+
+  it('uses the one verdict spelling everywhere', () => {
+    expect(VERDICT_WORDS).toEqual(verdictLabels);
+  });
 
   it.each(Object.keys(verdictLabels))('renders a word and icon for %s', (status) => {
     const { container } = render(<StatusBadge status={status as never} />);
@@ -74,7 +78,7 @@ describe('StatusBadge', () => {
   it('renders a neutral Unknown state for an unrecognised status, never Pass or Idle', () => {
     const { container } = render(<StatusBadge status={'bogus' as never} />);
     expect(screen.getByText('Unknown')).toBeDefined();
-    expect(screen.queryByText('Pass')).toBeNull();
+    expect(screen.queryByText('PASS')).toBeNull();
     expect(screen.queryByText('Idle')).toBeNull();
     expect(container.querySelector('svg')).toBeTruthy();
   });

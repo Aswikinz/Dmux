@@ -51,4 +51,28 @@ describe('MappingQueue', () => {
     fireEvent.keyDown(window, { key: 'Enter' });
     expect(onIgnore).toHaveBeenCalledWith('m-1', 'skip');
   });
+
+  it('a mouse user selects an item by clicking it, and the hint names the buttons', () => {
+    const onApprove = vi.fn();
+    render(<MappingQueue queue={queue} onApprove={onApprove} onIgnore={() => {}} />);
+    expect(screen.getByText(/Click an item, then choose Approve or Ignore/)).toBeDefined();
+    expect(document.body.textContent).not.toContain('↑ ↓');
+    fireEvent.click(screen.getByText('account_master'));
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }));
+    expect(onApprove).toHaveBeenCalledWith('m-2');
+  });
+
+  it('Backspace edits the ignore reason instead of being swallowed', () => {
+    const onIgnore = vi.fn();
+    render(<MappingQueue queue={queue} onApprove={() => {}} onIgnore={onIgnore} />);
+    fireEvent.click(screen.getByRole('button', { name: /^ignore$/i }));
+    const input = screen.getByPlaceholderText('Reason for ignoring (required)') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'legacy' } });
+    const ev = new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true });
+    input.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(false);
+    // Enter still submits from the field.
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onIgnore).toHaveBeenCalledWith('m-1', 'legacy');
+  });
 });

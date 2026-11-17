@@ -24,7 +24,7 @@ test('maps the needs-attention queue using only the keyboard', async ({ page }) 
 
   // Approve the first item.
   await page.keyboard.press('Enter');
-  await expect(page.getByText(/items need attention/)).toBeVisible();
+  await expect(page.getByText(/items? needs? attention/)).toBeVisible();
 
   // Ignore the next item, entering a required reason.
   await page.keyboard.press('Delete');

@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { DiffTree } from '../components/DiffTree';
 import { ErrorCard } from '../design/ErrorCard';
 import { Switch } from '../components/Switch';
+import { Info } from 'lucide-react';
 import type { Engine } from '../api/engine';
 import type { ConnectionProfile, Inventory } from '../api/contract';
 
@@ -60,16 +62,17 @@ export function CompareStructureScreen({
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
-          Compare structure
-        </h2>
-        <Switch
-          label="Show only problems"
-          checked={showOnlyProblems}
-          onChange={setShowOnlyProblems}
-        />
-      </div>
+      <ScreenHeader
+        title="Compare structure"
+        subtitle="Every table, column, index and constraint, side by side. Red is missing in the new database, green is added, amber is changed."
+        actions={
+          <Switch
+            label="Show only problems"
+            checked={showOnlyProblems}
+            onChange={setShowOnlyProblems}
+          />
+        }
+      />
       {loading && (
         <Panel>
           <div className="py-8 text-center text-slate-600 dark:text-slate-300">Loading inventory…</div>
@@ -97,9 +100,25 @@ export function CompareStructureScreen({
                 <span className="font-medium">New collation:</span> {inventory.newCollation}
               </div>
             </div>
+            {inventory.oldEncoding !== inventory.newEncoding && (
+              <div
+                role="note"
+                data-testid="encoding-note"
+                className="flex animate-fade-up items-start gap-2.5 rounded-xl border border-accent-200/70 bg-accent-50/70 p-3.5 text-sm text-slate-800 dark:border-accent-500/25 dark:bg-accent-500/10 dark:text-slate-200"
+              >
+                <Info className="mt-0.5 h-4 w-4 shrink-0 text-accent-600 dark:text-accent-300" aria-hidden="true" />
+                <p>
+                  <span className="font-medium">For information: the text encodings differ</span> (
+                  {inventory.oldEncoding} in the old database, {inventory.newEncoding} in the new
+                  one). This is expected when moving to a newer server. Dmux converts every value to
+                  UTF-8 before comparing, so accented names still compare correctly. You do not need
+                  to do anything.
+                </p>
+              </div>
+            )}
             <DiffTree nodes={inventory.schemas} showOnlyProblems={showOnlyProblems} />
           </Panel>
-          <div className="flex justify-between">
+          <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
               Back
             </Button>

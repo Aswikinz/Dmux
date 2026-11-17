@@ -178,18 +178,8 @@ const makeMapping = (inventory: Inventory): Mapping => {
     });
   });
 
-  if (inventory.oldEncoding !== inventory.newEncoding) {
-    needsAttention.push({
-      id: 'm-encoding',
-      oldName: `encoding ${inventory.oldEncoding}`,
-      newName: `encoding ${inventory.newEncoding}`,
-      confidence: 'fuzzy',
-      approved: false,
-    });
-  }
-
   return {
-    rules: ['identity mapping', 'encoding review required'],
+    rules: ['identity mapping'],
     matches,
     needsAttention,
     ignored: [],
@@ -498,12 +488,17 @@ export interface MockEngineOptions {
  */
 export function createMockEngine(options: MockEngineOptions = {}): Engine {
   let currentRunId = 0;
+  let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
   // the backend's "password lives in the keychain, not in the profile" shape so
   // `saveProfile` / `profileHasPassword` behave like the real engine.
   const savedPasswords = new Map<string, string>();
 
   return {
+    setSuperuserOverride(override): void {
+      superuserReason = override?.reason.trim() ? override.reason.trim() : null;
+    },
+
     async testConnection(
       profile: ConnectionProfile,
       // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the mock ignores the one-time password
@@ -513,13 +508,16 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
         return { ok: false, error: 'Could not reach the database server.' };
       }
       if (profile.user === 'superuser') {
+        // Like the real backend: refused unless the user overrode it with a reason.
+        if (!superuserReason) {
+          return { ok: false, error: 'superuser login refused by Dmux', superuserRefused: true };
+        }
         return {
           ok: true,
           info: makeServerInfo({
             isSuperuser: true,
             canWrite: true,
-            warning:
-              'This login is a superuser. Dmux refuses superuser logins by default because a read-only transaction can still do harm.',
+            warning: `Superuser login allowed by you. Reason recorded in the results: ${superuserReason}`,
           }),
         };
       }

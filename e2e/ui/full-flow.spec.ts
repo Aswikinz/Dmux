@@ -17,11 +17,11 @@ test('completes the full 7-step flow and exports a report', async ({ page }) => 
 
   // 4. Choose checks
   await page.getByRole('main').getByRole('button', { name: 'Choose checks' }).click();
-  await expect(page.getByText('Estimate:')).toBeVisible();
+  await expect(page.getByText('Estimated time:')).toBeVisible();
 
   // 5. Run
   await page.getByRole('main').getByRole('button', { name: 'Run' }).click();
-  await expect(page.getByText('Finished')).toBeVisible();
+  await expect(page.getByText('The run has finished.')).toBeVisible();
 
   // 6. Results
   await page.getByRole('main').getByRole('button', { name: 'See results' }).click();

@@ -138,6 +138,7 @@ describe('createTauriEngine', () => {
 
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: null }),
+      allowSuperuser: null,
     });
     expect(result.ok).toBe(true);
     expect(result.info?.version).toBe('17.0');
@@ -424,7 +425,60 @@ describe('profile commands', () => {
     await engine.testConnection(profile(), 'hunter2');
     expect(invoke).toHaveBeenCalledWith('probe_connection', {
       input: expect.objectContaining({ password: 'hunter2' }),
+      allowSuperuser: null,
     });
+  });
+
+  it('a superuser is refused until the user allows it with a reason, which every call then carries', async () => {
+    const engine = createTauriEngine();
+    invoke.mockRejectedValueOnce({ kind: 'superuser_refused' });
+    const refused = await engine.testConnection(profile());
+    expect(refused.ok).toBe(false);
+    expect(refused.superuserRefused).toBe(true);
+
+    // A blank reason is not an override.
+    engine.setSuperuserOverride({ reason: '   ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
+
+    engine.setSuperuserOverride({ reason: ' migration rehearsal on a copy ' });
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, is_superuser: true });
+    const ok = await engine.testConnection(profile());
+    expect(ok.ok).toBe(true);
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Structure and the run carry it too.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'run_inventory') return Promise.resolve(emptyInventory);
+      if (cmd === 'schema_diff') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      return Promise.resolve({});
+    });
+    await engine.compareStructure(profile(), profile());
+    expect(invoke).toHaveBeenCalledWith(
+      'run_inventory',
+      expect.objectContaining({
+        allowSuperuser: { allow: true, reason: 'migration rehearsal on a copy' },
+      }),
+    );
+
+    // Revoking it goes back to refusing.
+    engine.setSuperuserOverride(null);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    await engine.testConnection(profile());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'probe_connection',
+      expect.objectContaining({ allowSuperuser: null }),
+    );
   });
 
   it('testConnection surfaces the ask-for-password prompt on password_missing', async () => {

@@ -46,8 +46,8 @@ function DiffNodeRow({ node, depth, showOnlyProblems }: DiffNodeRowProps) {
     <div role="treeitem" aria-expanded={hasChildren ? expanded : undefined}>
       <div
         className={cn(
-          'flex items-center gap-2 py-1 pr-2 hover:bg-slate-50 dark:hover:bg-slate-800',
-          depth > 0 && 'border-l border-slate-200 dark:border-slate-700',
+          'flex items-center gap-2 py-1.5 pr-3 transition-colors hover:bg-black/[0.025] dark:hover:bg-white/[0.04]',
+          
         )}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
@@ -55,7 +55,7 @@ function DiffNodeRow({ node, depth, showOnlyProblems }: DiffNodeRowProps) {
           <button
             type="button"
             onClick={() => setExpanded((e) => !e)}
-            className="rounded p-0.5 hover:bg-slate-200 dark:hover:bg-slate-700"
+            className="rounded-md p-0.5 text-slate-500 dark:text-slate-400 transition-colors hover:bg-black/[0.06] dark:hover:bg-white/10"
             aria-label={expanded ? 'Collapse' : 'Expand'}
           >
             {expanded ? (
@@ -70,6 +70,15 @@ function DiffNodeRow({ node, depth, showOnlyProblems }: DiffNodeRowProps) {
         <span className={cn('text-sm font-medium', statusColor(node.status))}>
           {node.name}
         </span>
+        {node.status === 'changed' && (node.old || node.new) && (
+          <span className="text-sm text-slate-700 dark:text-slate-300" data-testid="diff-before-after">
+            <span className="sr-only">changed from </span>
+            <code className="rounded bg-slate-100 px-1 dark:bg-slate-800">{node.old ?? '—'}</code>
+            <span aria-hidden="true"> → </span>
+            <span className="sr-only"> to </span>
+            <code className="rounded bg-slate-100 px-1 dark:bg-slate-800">{node.new ?? '—'}</code>
+          </span>
+        )}
         {node.status !== 'same' && <StatusBadge status={node.status} className="ml-auto" />}
       </div>
       {expanded && filteredChildren && filteredChildren.length > 0 && (
@@ -90,7 +99,7 @@ function DiffNodeRow({ node, depth, showOnlyProblems }: DiffNodeRowProps) {
 
 export function DiffTree({ nodes, showOnlyProblems = false, className }: DiffTreeProps) {
   return (
-    <div className={cn('overflow-auto rounded-lg border border-slate-200 dark:border-slate-700', className)} role="tree" tabIndex={0}>
+    <div className={cn('overflow-auto rounded-xl border border-black/[0.06] py-1 dark:border-white/[0.08]', className)} role="tree" tabIndex={0}>
       {nodes.map((node) => (
         <DiffNodeRow
           key={node.id}

@@ -32,12 +32,17 @@ describe('mockEngine', () => {
     expect(res.error).toBeDefined();
   });
 
-  it('flags superuser logins', async () => {
-    const res = await mockEngine.testConnection(profile({ user: 'superuser' }));
+  it('refuses superuser logins until the user allows them with a reason', async () => {
+    const engine = createMockEngine();
+    const refused = await engine.testConnection(profile({ user: 'superuser' }));
+    expect(refused.ok).toBe(false);
+    expect(refused.superuserRefused).toBe(true);
+    engine.setSuperuserOverride({ reason: 'rehearsal copy' });
+    const res = await engine.testConnection(profile({ user: 'superuser' }));
     expect(res.ok).toBe(true);
     expect(res.info?.isSuperuser).toBe(true);
     expect(res.info?.canWrite).toBe(true);
-    expect(res.info?.warning).toBeDefined();
+    expect(res.info?.warning).toContain('rehearsal copy');
   });
 
   it('warns on plaintext connections', async () => {

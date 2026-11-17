@@ -43,11 +43,11 @@ describe('App full flow', () => {
 
       // Map -> Choose checks
       fireEvent.click(cta('Choose checks'));
-      await screen.findByText('Estimate:');
+      await screen.findByText('Estimated time:');
 
       // Choose checks -> Run
       fireEvent.click(cta('Run'));
-      await screen.findByText('Finished');
+      await screen.findByText('The run has finished.');
 
       // Run -> Results
       fireEvent.click(cta('See results'));
@@ -71,9 +71,9 @@ describe('App full flow', () => {
       fireEvent.click(cta('Map tables'));
       await screen.findByText(/No items need attention|items need attention/);
       fireEvent.click(cta('Choose checks'));
-      await screen.findByText('Estimate:');
+      await screen.findByText('Estimated time:');
       fireEvent.click(cta('Run'));
-      await screen.findByText('Finished');
+      await screen.findByText('The run has finished.');
       fireEvent.click(cta('See results'));
       expect(await screen.findByText('Failures')).toBeDefined();
     } finally {

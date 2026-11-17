@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { ThemeProvider, useTheme } from './design/theme';
-import { Panel } from './design/Panel';
+import appIcon from './assets/app-icon.png';
 import { Button } from './design/Button';
 import { StepSidebar, type Step } from './design/StepSidebar';
 import { ConnectScreen, defaultOldProfile, defaultNewProfile } from './screens/ConnectScreen';
@@ -115,55 +115,72 @@ function AppShell() {
 
   return (
     <div
-      className={`flex min-h-screen ${
+      className={`flex min-h-screen text-ink dark:text-slate-100 ${
         reducedEffects
-          ? 'bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100'
-          : 'bg-gradient-to-br from-blue-50 to-indigo-100 text-slate-900 dark:from-slate-950 dark:to-slate-900 dark:text-slate-100'
+          ? 'bg-canvas dark:bg-canvas-dark'
+          : 'bg-[radial-gradient(1200px_600px_at_100%_-10%,rgba(99,87,251,0.10),transparent_60%),radial-gradient(900px_500px_at_-10%_110%,rgba(16,207,174,0.07),transparent_60%)] bg-canvas dark:bg-canvas-dark dark:bg-[radial-gradient(1200px_600px_at_100%_-10%,rgba(99,87,251,0.18),transparent_60%)]'
       }`}
     >
       <aside
-        className={`shrink-0 flex-col gap-4 border-r border-white/30 bg-white/75 p-4 backdrop-blur-[16px] transition-all dark:border-white/10 dark:bg-slate-900/75 ${
-          sidebarOpen ? 'flex w-64' : 'hidden'
-        }`}
+        className={`sticky top-0 h-screen shrink-0 flex-col border-r border-black/[0.06] px-3 py-4 dark:border-white/[0.08] ${
+          reducedEffects ? 'bg-[#ececef] dark:bg-[#1e1e21]' : 'bg-white/60 backdrop-blur-2xl dark:bg-white/[0.04]'
+        } ${sidebarOpen ? 'flex w-60' : 'hidden'}`}
       >
-        <div className="text-xl font-bold">Dmux</div>
+        <div className="mb-5 flex items-center gap-2.5 px-2.5 pt-1">
+          <img
+            src={appIcon}
+            alt=""
+            width={32}
+            height={32}
+            className="h-8 w-8 rounded-[8px] shadow-[0_2px_6px_rgba(42,36,135,0.35)]"
+          />
+          <div className="leading-tight">
+            <div className="text-[15px] font-semibold tracking-[-0.01em]">Dmux</div>
+            <div className="text-[11px] text-ink-secondary dark:text-slate-400">Migration verifier</div>
+          </div>
+        </div>
+        <div className="mb-1 px-2.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">
+          Steps
+        </div>
         <StepSidebar
           steps={stepLabels}
           current={step}
           completed={completed}
           onSelect={goToStep}
         />
-        <div className="mt-auto space-y-2">
-          <div className="flex gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setMode(resolvedMode === 'dark' ? 'light' : 'dark')}
-              aria-label={resolvedMode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            >
-              {resolvedMode === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={toggleReducedEffects}
-              aria-label={reducedEffects ? 'Disable reduced effects' : 'Enable reduced effects'}
-            >
-              {reducedEffects ? <ZapOff className="h-4 w-4" /> : <Zap className="h-4 w-4" />}
-            </Button>
-          </div>
-          <div className="text-xs text-slate-500 dark:text-slate-400">
-            Mode: {mode} • Effects: {reducedEffects ? 'reduced' : 'glass'}
-          </div>
+        <div className="mt-auto flex items-center gap-1 px-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 px-0 text-ink-secondary dark:text-slate-400"
+            onClick={() => setMode(resolvedMode === 'dark' ? 'light' : 'dark')}
+            aria-label={resolvedMode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            title={resolvedMode === 'dark' ? 'Light appearance' : 'Dark appearance'}
+          >
+            {resolvedMode === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 px-0 text-ink-secondary dark:text-slate-400"
+            onClick={toggleReducedEffects}
+            aria-label={reducedEffects ? 'Disable reduced effects' : 'Enable reduced effects'}
+            title={reducedEffects ? 'Reduced effects are on' : 'Reduce visual effects'}
+          >
+            {reducedEffects ? <ZapOff className="h-4 w-4" /> : <Zap className="h-4 w-4" />}
+          </Button>
+          <span className="sr-only">
+            Appearance: {mode}. Effects: {reducedEffects ? 'reduced' : 'full'}.
+          </span>
         </div>
       </aside>
-      <main className="flex flex-1 flex-col p-6">
+      <main className="flex min-w-0 flex-1 flex-col px-8 py-7">
         <div className="mb-4 flex items-center gap-3 lg:hidden">
           <Button variant="ghost" size="sm" onClick={() => setSidebarOpen((s) => !s)} aria-label="Toggle sidebar">
             <Menu className="h-5 w-5" />
           </Button>
         </div>
-        <Panel className="flex-1">
+        <div key={step} className="mx-auto w-full max-w-6xl animate-fade-up">
           {step === 'connect' && (
             <ConnectScreen
               engine={engine}
@@ -245,7 +262,7 @@ function AppShell() {
           {step === 'report' && results && (
             <ReportScreen engine={engine} results={results} onBack={back} onRestart={restart} />
           )}
-        </Panel>
+        </div>
       </main>
     </div>
   );
