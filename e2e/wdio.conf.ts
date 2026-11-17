@@ -52,7 +52,7 @@ export const config: WebdriverIO.Config = {
       },
     ],
   ],
-  logLevel: 'info',
+  logLevel: 'warn',
   bail: 1,
   waitforTimeout: 10000,
   connectionRetryTimeout: 120000,
@@ -67,6 +67,14 @@ export const config: WebdriverIO.Config = {
   // failed real-app run is debuggable from CI (uploaded as an artifact by
   // ci.yml). demo_bank only — the page text is truncated and never contains the
   // typed password (the UI clears it immediately and never renders it).
+  // @wdio/tauri-service 1.5.1 runs a window-focus check before every
+  // findElement/click that calls into its optional Tauri plugin; we do not ship
+  // that plugin, so each check waits ~5 s for an invoke timeout. An explicit
+  // switchToWindow marks the session as "user switched" and turns the check off
+  // (see afterCommand in the service). Dmux has a single window.
+  before: async () => {
+    await browser.switchToWindow(await browser.getWindowHandle());
+  },
   afterTest: async (test, _context, result) => {
     if (!result.error) {
       return;
