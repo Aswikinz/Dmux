@@ -39,3 +39,8 @@ SECURITY-AUDIT.md
 # Local-only agent instructions and handover notes (decision 12): never tracked
 CLAUDE.md
 HANDOVER-CLAUDE-CODE.md
+
+# Windows packaging: the CPython embeddable package is downloaded in CI (pinned
+# version and SHA-256), never committed
+packaging/windows/python/
+packaging/windows/downloads/

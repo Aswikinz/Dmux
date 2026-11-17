@@ -378,12 +378,13 @@ GitHub Actions checks every pull request, runs the heavy tests nightly, and buil
 
 | Platform | Package | Notes |
 | --- | --- | --- |
-| Windows | Setup `.exe` (per user, no admin rights) | Carries the offline WebView2 installer, for PCs with no internet |
+| Windows | Setup `.exe` (per user, no admin rights) | Downloads WebView2 if the PC lacks it. Carries its own Python for custom checks |
+| Windows | Offline setup `.exe` | The same installer with the offline WebView2 installer embedded (about 127 MB larger), for PCs with no internet. A separate file so the normal installer stays small |
 | Windows | `.msi` | For IT teams that deploy centrally |
-| Windows | Portable `.zip` | Runs with no install, for locked-down PCs |
+| Windows | Portable `.zip` | Runs with no install, for locked-down PCs. WebView2 must already be on the PC. Carries its own Python in a `python\` folder |
 | Linux | AppImage | One file; needs FUSE 2 on the machine |
 | Linux | `.deb` and `.rpm` | Ubuntu and Debian; Fedora and RHEL |
-| Linux | Flatpak bundle file | Attached to the release. A Flathub listing comes later, because Flathub requires fully offline builds from source |
+| Linux | Flatpak bundle file | Built from the release `.deb` on the GNOME runtime. Attached to the release. A Flathub listing comes later, because Flathub requires fully offline builds from source |
 | Both | `dmux` command-line binary | Static build, for jump servers |
 
 - Installers are built on GitHub's servers: Ubuntu 22.04 for wide Linux compatibility, and Windows. The Arch laptop builds only the development version.
