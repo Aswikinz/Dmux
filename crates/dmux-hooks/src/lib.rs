@@ -4,22 +4,31 @@
 //! JSON on stdin and writes extra findings, as JSON, on stdout.  The findings
 //! appear in the report marked as custom checks.
 //!
-//! Scripts are **untrusted input** (PLAN.md 6.3 / AGENTS.md rule 2), so this
-//! module treats them as hostile.  It guarantees:
+//! Scripts are **untrusted input** (PLAN.md 6.3 / AGENTS.md rule 2), but Dmux
+//! does **not** sandbox them (decision 23): **a check runs with your full
+//! permissions — only run scripts you trust.** A script can read files, open
+//! network connections and act on the desktop session exactly as the user who
+//! launched the run.  What this module does instead:
 //!
-//! - **No secrets.** The child receives no inherited environment except a tiny
-//!   allow-list (PATH, LANG, LC_ALL, and SYSTEMROOT on Windows).  `PG*`,
-//!   `DMUX_*`, `*PASSWORD*`, `*TOKEN*` and `*SECRET*` are never passed through,
-//!   and the results payload is scrubbed of password/token/connection keys.
+//! - **No secrets in the environment.** The child receives no inherited
+//!   environment except a tiny allow-list (PATH, LANG, LC_ALL, and SYSTEMROOT on
+//!   Windows).  `PG*`, `DMUX_*`, `*PASSWORD*`, `*TOKEN*` and `*SECRET*` are never
+//!   passed through, and the results payload is scrubbed of password/token/
+//!   connection keys.  This limits accidental leakage; it does not stop a
+//!   hostile script from reading those secrets itself.
 //! - **No row data.** The results JSON carries counts, hashes and names only
 //!   (PLAN.md 6.6); the payload writer scrubs any sensitive key as defence in
-//!   depth.
+//!   depth, and drops the `missing_keys` / `extra_keys` key lists even when
+//!   `export_keys` is on.
 //! - **A time limit.** The interpreter is killed when it exceeds the limit
 //!   (default 60 s), along with any children, via a Unix process group (Windows:
 //!   a new process group plus `taskkill /F /T`).
 //! - **Bounded, validated output.** stdout is capped at [`MAX_OUTPUT_BYTES`]
 //!   and parsed against a strict schema with `deny_unknown_fields`; every
 //!   finding's message length and control characters are checked.
+//! - **Refuses unsafe scripts.** A script or hooks directory that is group- or
+//!   world-writable, or not owned by the current user, is refused on Unix (see
+//!   [`check_hook_path_permissions`]).
 //!
 //! A hook *failure* (timeout, garbage output, exit with no findings) is always
 //! a recorded warning, never a crash and never a PASS-affecting verdict by
@@ -142,6 +151,8 @@ pub enum HookError {
     NoInterpreter,
     #[error("hook runtime error: {0}")]
     Runtime(String),
+    #[error("unsafe hook: {0}")]
+    UnsafeScript(String),
 }
 
 /// How a finding folds into the run verdict.  Only `fail` forces off PASS.
@@ -160,12 +171,15 @@ impl VerdictEffect {
     }
 }
 
-/// Serialise the results we hand a hook, scrubbed of any sensitive key.
+/// Serialise the results we hand a hook, scrubbed of any sensitive key and of
+/// the exported key lists.
 ///
 /// The payload is deliberately small and secret-free (PLAN.md 6.6): run id,
 /// tool version, mapping hash, verdict vocabulary, coverage line, per-table
 /// verdicts with counts and reasons — never a password or a row value.  The
-/// scrub pass is defence in depth against a future schema field.
+/// scrub pass is defence in depth against a future schema field, and it also
+/// drops the `missing_keys` / `extra_keys` key lists (row keys are never sent
+/// to a hook, even when `export_keys` is on; audit L10).
 pub fn results_payload(results: &serde_json::Value) -> serde_json::Value {
     fn scrub(value: &mut serde_json::Value) {
         match value {
@@ -201,6 +215,8 @@ fn is_sensitive_key(key: &str) -> bool {
         || upper.contains("DSN")
         || upper.contains("SECRET")
         || upper.contains("CREDENTIAL")
+        || upper == "MISSING_KEYS"
+        || upper == "EXTRA_KEYS"
 }
 
 /// Compute a self-verifying SHA-256 over the *whole* written envelope
@@ -310,6 +326,41 @@ pub fn is_denied_key(key: &str) -> bool {
         || upper.contains("SECRET")
 }
 
+/// Refuse a hook script or hooks directory that is group- or world-writable, or
+/// not owned by the current user (decision 23: with no sandbox in v1.0, a
+/// writable or foreign-owned hook is a privilege boundary Dmux will not cross).
+///
+/// On Windows there is no equivalent cheap check (ACLs are richer and there is
+/// no uid), so this is a no-op there and the honest full-permissions warning
+/// above still applies.
+pub fn check_hook_path_permissions(path: &Path) -> Result<(), HookError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| HookError::ReadScript(path.display().to_string(), e.to_string()))?;
+        if meta.mode() & 0o022 != 0 {
+            return Err(HookError::UnsafeScript(format!(
+                "{} is group- or world-writable; a hook must be writable only by its owner",
+                path.display()
+            )));
+        }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(HookError::UnsafeScript(format!(
+                "{} is not owned by the current user; refusing to run it",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: skipped — see the doc comment above.
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Run one hook and return its findings plus non-fatal warnings.
 ///
 /// Failures inside become warnings on the [`HookResult`] (never an abort of the
@@ -319,6 +370,8 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
     if !spec.script.is_file() {
         return Err(HookError::ScriptNotFound(spec.script.display().to_string()));
     }
+    // Refuse a script we cannot trust before reading or hashing it (decision 23).
+    check_hook_path_permissions(&spec.script)?;
     // Hash the script's bytes first: this digest is the code that actually ran.
     let script_bytes = std::fs::read(&spec.script)
         .map_err(|e| HookError::ReadScript(spec.script.display().to_string(), e.to_string()))?;
@@ -451,8 +504,12 @@ pub fn run_hooks(
 
 fn truncate_for_log(s: &str) -> String {
     const LIMIT: usize = 512;
-    let mut out: String = s.chars().take(LIMIT).collect();
-    if s.chars().count() > LIMIT {
+    // Strip control and format/bidi characters (the same classification as
+    // validate_finding) so untrusted hook stderr cannot inject control
+    // sequences or spoof text in warnings and the report.
+    let cleaned: String = s.chars().filter(|&c| !is_unsafe_char(c)).collect();
+    let mut out: String = cleaned.chars().take(LIMIT).collect();
+    if cleaned.chars().count() > LIMIT {
         out.push('…');
     }
     out
@@ -504,18 +561,27 @@ pub fn contains_control(s: &str) -> bool {
 /// untrusted input).  This covers U+200B–U+200F, U+202A–U+202E, U+2066–U+2069,
 /// U+FEFF and every other `Cf` code point.
 pub fn contains_format_or_bidi(s: &str) -> bool {
-    s.chars().any(|c| {
-        // \u{200B}..\u{200F}: zero-width space, ZW non-joiner/joiner, LRM, RLM.
-        // \u{202A}..\u{202E}: LRE/RLE/PDF/LRO/RLO (bidi embedding/direction).
-        // \u{2066}..\u{2069}: LRI/RLI/FSI/PDI (bidi isolation).
-        // \u{FEFF} and the general category Cf cover the rest (soft hyphen,
-        // zero-width no-break space, tag characters, etc.).
-        matches!(c, '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}')
-            || is_format_category(c)
-    })
+    s.chars().any(is_format_or_bidi_char)
+}
+
+/// True when one character is a Unicode format, bidi or other `Cf` code point.
+/// The ranges mirror the comment on [`contains_format_or_bidi`].
+fn is_format_or_bidi_char(c: char) -> bool {
+    // \u{200B}..\u{200F}: zero-width space, ZW non-joiner/joiner, LRM, RLM.
+    // \u{202A}..\u{202E}: LRE/RLE/PDF/LRO/RLO (bidi embedding/direction).
+    // \u{2066}..\u{2069}: LRI/RLI/FSI/PDI (bidi isolation).
+    matches!(c, '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}')
+        || is_format_category(c)
+}
+
+/// True when a character must be stripped from untrusted text before it reaches
+/// a warning or the report: a C0/C1 control character or a Unicode format/bidi
+/// code point (the same classification [`validate_finding`] rejects).
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || is_format_or_bidi_char(c)
 }
 
 fn is_format_category(c: char) -> bool {
@@ -839,6 +905,8 @@ mod tests {
         assert!(is_sensitive_key("api_token"));
         assert!(is_sensitive_key("dsn"));
         assert!(is_sensitive_key("connection_string"));
+        assert!(is_sensitive_key("missing_keys"));
+        assert!(is_sensitive_key("extra_keys"));
         assert!(!is_sensitive_key("table"));
         assert!(!is_sensitive_key("run_id"));
     }
@@ -877,6 +945,65 @@ mod tests {
         assert_eq!(scrubbed["run_id"], "r");
         assert!(scrubbed["nested"]["password"].is_null());
         assert_eq!(scrubbed["nested"]["keep"], "ok");
+    }
+
+    #[test]
+    fn payload_drops_key_lists_even_with_export_keys_on() {
+        let v = serde_json::json!({
+            "run_id": "r",
+            "export_keys": true,
+            "tables": {
+                "public.accounts": {
+                    "verdict": "FAIL",
+                    "missing_keys": [["137"], ["1902"]],
+                    "extra_keys": [["42"]],
+                    "changed_columns": ["balance"]
+                }
+            }
+        });
+        let scrubbed = results_payload(&v);
+        assert!(scrubbed["tables"]["public.accounts"]["missing_keys"].is_null());
+        assert!(scrubbed["tables"]["public.accounts"]["extra_keys"].is_null());
+        // Non-key detail survives the scrub.
+        assert_eq!(
+            scrubbed["tables"]["public.accounts"]["changed_columns"][0],
+            "balance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_script_is_refused_and_owner_only_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dmux-hooks-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hook.py");
+        std::fs::write(&path, "print('x')\n").unwrap();
+
+        // Group- and world-writable: refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            check_hook_path_permissions(&path).is_err(),
+            "group/world-writable script must be refused"
+        );
+
+        // Owner-only: accepted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_hook_path_permissions(&path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncate_for_log_strips_control_and_bidi() {
+        let dirty = "ok\u{202E}evil\n\u{001B}[31mred";
+        let cleaned = truncate_for_log(dirty);
+        assert!(cleaned.contains("ok"));
+        assert!(cleaned.contains("evil"));
+        assert!(cleaned.contains("red"));
+        assert!(!cleaned.contains('\u{202E}'));
+        assert!(!cleaned.contains('\n'));
+        assert!(!cleaned.contains('\u{001B}'));
     }
 
     #[test]
