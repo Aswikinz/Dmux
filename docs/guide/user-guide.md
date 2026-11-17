@@ -77,8 +77,10 @@ warning for a file whose origin you have not checked.
 
 `dmux` is a single static program with the same engine as the app. Copy it to the jump
 server when the laptop cannot reach the database. It runs `dmux capture`, `dmux compare`
-and `dmux run <definition file>`, and writes a results file that opens in the desktop app
-for review and reporting. Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
+and `dmux run <definition file>`, and writes a results file. Turn that file into the PDF
+and Excel reports with `dmux report --results results.json --pdf report.pdf --xlsx
+report.xlsx`; it checks the file's SHA-256 first and refuses a file that was edited.
+(Opening a results file in the desktop app is planned but not in this version.) Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
 script can act on the result.
 
 A run definition file names the databases and the checks; it never holds a database
