@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, within } from '@testing-library/react';
-import { describe, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import App from './App';
 import type { FixtureName } from './api/mockEngine';
 
@@ -55,7 +55,10 @@ describe('App full flow', () => {
 
       // Results -> Report
       fireEvent.click(cta('Report'));
-      await screen.findByRole('button', { name: /export pdf/i });
+      expect(
+        await screen.findByRole('button', { name: /export pdf/i }),
+      ).toBeDefined();
+      expect(screen.getByRole('button', { name: /export excel/i })).toBeDefined();
     } finally {
       cleanup();
     }
@@ -72,7 +75,7 @@ describe('App full flow', () => {
       fireEvent.click(cta('Run'));
       await screen.findByText('Finished');
       fireEvent.click(cta('See results'));
-      await screen.findByText('Failures');
+      expect(await screen.findByText('Failures')).toBeDefined();
     } finally {
       cleanup();
     }

@@ -112,11 +112,16 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   useEffect(() => {
     if (getInitialReduced()) return;
     let mounted = true;
-    measureBlurPerformance().then((slow) => {
-      if (mounted && slow) {
-        setAutoReduced(true);
-      }
-    });
+    void measureBlurPerformance()
+      .then((slow) => {
+        if (mounted && slow) {
+          setAutoReduced(true);
+        }
+      })
+      .catch(() => {
+        // A failed blur measurement just leaves reduced effects at the user's
+        // explicit choice; there is nothing to recover here.
+      });
     return () => {
       mounted = false;
     };

@@ -50,7 +50,7 @@ OUT=""
 ARGS=()
 NEXT=""
 for arg in "$@"; do
-  if [ -n "$NEXT" ]; then
+  if [[ -n "$NEXT" ]]; then
     case "$NEXT" in
       db)     DB="$arg" ;;
       tables) TABLES="$arg" ;;
@@ -73,7 +73,7 @@ for arg in "$@"; do
     *) ARGS+=("$arg") ;;
   esac
 done
-if [ -n "$NEXT" ]; then
+if [[ -n "$NEXT" ]]; then
   echo "usage: estimate_check.sh [old port] [new port] [--db NAME] [--tables a,b] [--out FILE]" >&2
   exit 2
 fi
@@ -82,7 +82,7 @@ case "$DB" in
   *) echo "refusing: estimate_check.sh only reads demo_bank or demo_bank_large, not '$DB'" >&2
      exit 1 ;;
 esac
-if [ -z "$TABLES" ]; then
+if [[ -z "$TABLES" ]]; then
   echo "estimate_check.sh: --tables needs at least one table" >&2
   exit 2
 fi
@@ -98,7 +98,7 @@ for u in "$OLD_URL" "$NEW_URL"; do
     echo "refusing: estimate_check.sh only runs against local mock databases" >&2
     exit 1
   fi
-  if [ "${u##*/}" != "$DB" ]; then
+  if [[ "${u##*/}" != "$DB" ]]; then
     echo "refusing: estimate_check.sh reads database $DB, not '${u##*/}'" >&2
     exit 1
   fi
@@ -215,7 +215,7 @@ RESULTS="$TMP/results"
 TABLES_DONE=()
 IFS=',' read -r -a TABLE_LIST <<< "$TABLES"
 for tbl in "${TABLE_LIST[@]}"; do
-  [ -n "$tbl" ] || continue
+  [[ -n "$tbl" ]] || continue
   case "$tbl" in
     *[!A-Za-z0-9_]*) echo "estimate_check.sh: bad table name '$tbl'" >&2; exit 2 ;;
   esac
@@ -226,17 +226,17 @@ for tbl in "${TABLE_LIST[@]}"; do
     TBL_QUOTED="\"${tbl//\"/\"\"}\""
     exprs="$(col_exprs "$u" "$tbl")"
     keys="$(key_exprs "$u" "$tbl")"
-    if [ -z "$exprs" ]; then
+    if [[ -z "$exprs" ]]; then
       echo "estimate_check.sh: table demo_bank.$tbl has no columns (missing?)" >&2
       exit 1
     fi
-    if [ -z "$keys" ]; then keys="$exprs"; fi
+    if [[ -z "$keys" ]]; then keys="$exprs"; fi
     bytes="$(val "$u" "SELECT pg_total_relation_size(format('demo_bank.%I', '$tbl')::regclass)")"
     scan_sql "$TMP/scan_${side}_${tbl}.sql" "$exprs" "$keys"
     secs="$(scan "$u" "$TMP/scan_${side}_${tbl}.sql" "$TMP/fp_${side}_${tbl}")"
     rows="$(awk -F'|' '{ s += $2 } END { print s + 0 }' "$TMP/fp_${side}_${tbl}")"
     buckets="$(wc -l < "$TMP/fp_${side}_${tbl}" | tr -d ' ')"
-    if [ "$buckets" -eq 0 ] || [ "$buckets" -gt 4096 ]; then
+    if [[ "$buckets" -eq 0 ]] || [[ "$buckets" -gt 4096 ]]; then
       echo "estimate_check.sh: $side $tbl: fingerprint returned $buckets buckets" >&2
       exit 1
     fi
@@ -270,7 +270,7 @@ emit_json() {
   printf '  "generated_at": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf '  "tables": [\n'
   for tbl in "${TABLES_DONE[@]}"; do
-    if [ "$first" -eq 1 ]; then first=0; else printf ',\n'; fi
+    if [[ "$first" -eq 1 ]]; then first=0; else printf ',\n'; fi
     printf '    {"table": "%s", "old": %s, "new": %s}' \
       "$tbl" "$(json_side old "$tbl")" "$(json_side new "$tbl")"
   done
@@ -279,7 +279,7 @@ emit_json() {
   local side
   first=1
   for side in old new; do
-    if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+    if [[ "$first" -eq 1 ]]; then first=0; else printf ', '; fi
     awk -F'|' -v s="$side" '
       $2 == s { r += $3; b += $4; t += $5; n++ }
       END { printf "\"%s\": {\"rows\": %d, \"bytes\": %d, \"seconds\": %.3f}", s, r, b, t }' \
@@ -289,7 +289,7 @@ emit_json() {
   printf '}\n'
 }
 
-if [ -n "$OUT" ]; then
+if [[ -n "$OUT" ]]; then
   emit_json > "$OUT"
   echo "JSON written to $OUT" >&2
 else
