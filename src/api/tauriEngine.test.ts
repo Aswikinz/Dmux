@@ -365,6 +365,77 @@ describe('createTauriEngine', () => {
   });
 });
 
+describe('profile commands', () => {
+  const rawStoredProfile = {
+    id: 'old-profile',
+    label: 'Old database',
+    host: '127.0.0.1',
+    port: 5433,
+    database: 'bank',
+    user: 'dmux_dev',
+    encryption: 'verify',
+    tls_fingerprint: null,
+    plaintext_reason: null,
+  };
+
+  it('saveProfile sends the profile and a typed password to save_profile', async () => {
+    invoke.mockResolvedValueOnce({ profile: rawStoredProfile, warning: null });
+    const engine = createTauriEngine();
+    const result = await engine.saveProfile(profile(), 'hunter2');
+
+    expect(invoke).toHaveBeenCalledWith('save_profile', {
+      profile: expect.objectContaining({ encryption: 'verify' }),
+      password: 'hunter2',
+    });
+    expect(result.warning).toBeUndefined();
+    expect(result.profile.host).toBe('127.0.0.1');
+  });
+
+  it('saveProfile maps a keychain-unavailable warning back to the contract', async () => {
+    invoke.mockResolvedValueOnce({
+      profile: rawStoredProfile,
+      warning: 'password not saved; you will be asked each run',
+    });
+    const engine = createTauriEngine();
+    const result = await engine.saveProfile(profile(), 'hunter2');
+    expect(result.warning).toContain('asked each run');
+  });
+
+  it('saveProfile sends null when no password is typed', async () => {
+    invoke.mockResolvedValueOnce({ profile: rawStoredProfile, warning: null });
+    const engine = createTauriEngine();
+    await engine.saveProfile(profile());
+    expect(invoke).toHaveBeenCalledWith(
+      'save_profile',
+      expect.objectContaining({ password: null }),
+    );
+  });
+
+  it('profileHasPassword invokes profile_has_password', async () => {
+    invoke.mockResolvedValueOnce(true);
+    const engine = createTauriEngine();
+    await expect(engine.profileHasPassword('old-profile')).resolves.toBe(true);
+    expect(invoke).toHaveBeenCalledWith('profile_has_password', { id: 'old-profile' });
+  });
+
+  it('testConnection sends a typed one-time password through the connect input', async () => {
+    invoke.mockResolvedValueOnce(rawServerInfo);
+    const engine = createTauriEngine();
+    await engine.testConnection(profile(), 'hunter2');
+    expect(invoke).toHaveBeenCalledWith('probe_connection', {
+      input: expect.objectContaining({ password: 'hunter2' }),
+    });
+  });
+
+  it('testConnection surfaces the ask-for-password prompt on password_missing', async () => {
+    invoke.mockRejectedValueOnce({ kind: 'password_missing', reason: {}, profile: 'old-profile' });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('type the password');
+  });
+});
+
 describe('level mapping (engine snake_case <-> contract)', () => {
   it('mapLevel maps the engine levels 1:1', () => {
     expect(mapLevel('structure')).toBe('structure');

@@ -31,6 +31,7 @@ import type {
   Results,
   RunDefinition,
   RunProgress,
+  SaveProfileResult,
   SchemaDiffNode,
   ServerInfo,
   TableCheck,
@@ -208,6 +209,12 @@ interface BackendProfile {
   encryption: EncryptionField;
   tls_fingerprint: string | null;
   plaintext_reason: string | null;
+}
+
+/** Shape `save_profile` returns: the stored profile plus an optional warning. */
+interface RawSaveProfileResult {
+  profile: BackendProfile;
+  warning: string | null;
 }
 
 /** The engine's `CheckLevel` serialises as snake_case (`counts_and_totals`, ...). */
@@ -547,13 +554,32 @@ function toBackendProfile(profile: ConnectionProfile): BackendProfile {
   };
 }
 
-function toConnectInput(profile: ConnectionProfile): {
+function toConnectInput(
+  profile: ConnectionProfile,
+  password?: string,
+): {
   profile: BackendProfile;
-  password: null;
+  password: string | null;
 } {
-  // The password is read from the keychain on the backend; the UI never holds
-  // it (PLAN 6.5).
-  return { profile: toBackendProfile(profile), password: null };
+  // A typed password is a one-time value for this run, sent to the backend and
+  // then dropped; it never enters app state (PLAN 6.5).  `null` tells the
+  // backend to read the password from the keychain instead.
+  return { profile: toBackendProfile(profile), password: password ?? null };
+}
+
+/** Map the backend's stored-profile shape back onto the frontend contract. */
+function toConnectionProfile(raw: BackendProfile): ConnectionProfile {
+  return {
+    id: raw.id,
+    label: raw.label,
+    host: raw.host,
+    port: raw.port,
+    database: raw.database,
+    user: raw.user,
+    encryption: raw.encryption,
+    tlsFingerprint: raw.tls_fingerprint ?? undefined,
+    plaintextReason: raw.plaintext_reason ?? undefined,
+  };
 }
 
 /** Map the backend's real TLS state, never hardcoding `verified: true`. */
@@ -662,6 +688,9 @@ function describeError(error: unknown): string {
     }
     if (e.kind === 'plaintext_reason_required') {
       return 'a reason is required for an unencrypted connection';
+    }
+    if (e.kind === 'password_missing') {
+      return 'no password is stored for this profile; type the password to connect this run';
     }
     if (typeof e.message === 'string') {
       return e.message;
@@ -810,10 +839,13 @@ export function createTauriEngine(): Engine {
   let lastRawMapping: RawMapping | null = null;
 
   return {
-    async testConnection(profile: ConnectionProfile): Promise<ConnectionTestResult> {
+    async testConnection(
+      profile: ConnectionProfile,
+      password?: string,
+    ): Promise<ConnectionTestResult> {
       try {
         const info = await invoke<RawServerInfo>('probe_connection', {
-          input: toConnectInput(profile),
+          input: toConnectInput(profile, password),
         });
         const serverInfo = toServerInfo(info);
         if (serverInfo.isSuperuser) {
@@ -824,6 +856,24 @@ export function createTauriEngine(): Engine {
       } catch (error) {
         return { ok: false, error: describeError(error) };
       }
+    },
+
+    async saveProfile(
+      profile: ConnectionProfile,
+      password?: string,
+    ): Promise<SaveProfileResult> {
+      const result = await invoke<RawSaveProfileResult>('save_profile', {
+        profile: toBackendProfile(profile),
+        password: password ?? null,
+      });
+      return {
+        profile: toConnectionProfile(result.profile),
+        warning: result.warning ?? undefined,
+      };
+    },
+
+    async profileHasPassword(id: string): Promise<boolean> {
+      return invoke<boolean>('profile_has_password', { id });
     },
 
     async compareStructure(

@@ -9,6 +9,7 @@ import type {
   Results,
   RunDefinition,
   RunProgress,
+  SaveProfileResult,
   ServerInfo,
 } from './contract';
 
@@ -19,8 +20,23 @@ import type {
  * can be tested in a browser against the mock implementation.
  */
 export interface Engine {
-  /** Test a connection profile and return server metadata. */
-  testConnection(profile: ConnectionProfile): Promise<ConnectionTestResult>;
+  /**
+   * Test a connection profile and return server metadata.  `password`, when
+   * present, is a one-time value the user typed for this run; it is never
+   * stored and never enters app state (PLAN 6.5).  When omitted, the backend
+   * reads the password from the OS keychain.
+   */
+  testConnection(profile: ConnectionProfile, password?: string): Promise<ConnectionTestResult>;
+
+  /**
+   * Save a profile.  The optional `password` is stored in the OS keychain only
+   * (never SQLite); when it cannot be stored, the result carries a warning and
+   * the app asks for the password on each run.
+   */
+  saveProfile(profile: ConnectionProfile, password?: string): Promise<SaveProfileResult>;
+
+  /** Whether a keychain password is stored for a profile (never returns it). */
+  profileHasPassword(id: string): Promise<boolean>;
 
   /** Compare the structure/inventory of the two connected databases. */
   compareStructure(

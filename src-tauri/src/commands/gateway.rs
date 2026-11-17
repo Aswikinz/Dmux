@@ -193,6 +193,21 @@ impl SuperuserOverride {
     pub(crate) fn allows(&self) -> bool {
         self.allow && !self.reason.trim().is_empty()
     }
+
+    /// The recorded reason behind a valid override, trimmed (PLAN 6.2 / audit
+    /// M5).  `None` when the override is not a valid opt-in (not allowed, or a
+    /// blank reason), because then there is nothing to record.
+    ///
+    /// The results agent (`crates::commands::data::start_run`) must capture
+    /// this value when it accepts the override and store it with the run's
+    /// connection decision, so it can be recorded in the results as
+    /// `superuser override: <reason>`.  The matching plaintext reason is already
+    /// exposed by [`tls_state_from`] as [`TlsStateDto::Plaintext`]` { reason }`,
+    /// which the same agent should record as `plaintext: <reason>`.
+    #[allow(dead_code)] // consumed by the results agent (data.rs) in a later task
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.allows().then(|| self.reason.trim())
+    }
 }
 
 /// Test a connection and report server metadata (PLAN 4.1).  On an untrusted
@@ -256,6 +271,14 @@ pub async fn run_inventory(
 }
 
 /// Compare two already-collected inventories (PLAN 4.2).
+///
+/// **Display-only, and the inventories are webview-supplied** (audit L7): the
+/// UI collects them via [`run_inventory`], round-trips them through the webview
+/// and hands them back here.  Nothing a verdict, coverage line, result or
+/// report depends on may consume this output — a false PASS must never rest on
+/// data that crossed the IPC boundary.  Verdicts and results are produced by
+/// the engine's live run (`crates::commands::data`), which re-collects its own
+/// inventories; this diff only renders the "structure compare" screen.
 #[tauri::command]
 pub fn schema_diff(
     old: DatabaseInventory,
@@ -450,17 +473,37 @@ fn attention_candidates(issue: &mapping::AttentionIssue) -> Vec<String> {
     }
 }
 
-/// Update a mapping in place (re-hash it).  The caller supplies a validated
-/// [`Mapping`]; this command canonicalises and returns the stored form.
-#[tauri::command]
-pub fn update_mapping(mapping: Mapping) -> Result<Mapping, CommandError> {
-    Ok(mapping.with_fresh_hash())
+/// Validate a webview-supplied [`Mapping`] with the same checks [`import_mapping`]
+/// runs, and return the canonical, freshly-hashed form.
+///
+/// `update_mapping` / `export_mapping` receive a typed [`Mapping`] deserialised
+/// from the webview (audit L7), so it is untrusted input exactly like a mapping
+/// file.  [`mapping::to_json`] re-serialises it with a fresh hash and
+/// [`mapping::from_json`] then runs the engine's own validation — the format
+/// version, empty ignore reasons and the size limit — before the mapping is
+/// stored or exported.  The hash is re-derived here by design, so a stale
+/// client-supplied hash is discarded, never trusted.
+pub(crate) fn validate_mapping(mapping: &Mapping) -> Result<Mapping, CommandError> {
+    mapping::to_json(mapping)
+        .and_then(|bytes| mapping::from_json(&bytes))
+        .map_err(|e| CommandError::InvalidMapping {
+            message: e.to_string(),
+        })
 }
 
-/// Export a mapping as canonical JSON plus its SHA-256 hash (PLAN 4.3).
+/// Update a mapping in place (re-hash it).  The caller supplies a [`Mapping`]
+/// that is validated exactly like an imported file before it is canonicalised
+/// and returned (PLAN 6.3: mapping input is untrusted, audit L7).
+#[tauri::command]
+pub fn update_mapping(mapping: Mapping) -> Result<Mapping, CommandError> {
+    validate_mapping(&mapping)
+}
+
+/// Export a mapping as canonical JSON plus its SHA-256 hash (PLAN 4.3).  The
+/// mapping is validated exactly like an imported file first (audit L7).
 #[tauri::command]
 pub fn export_mapping(mapping: Mapping) -> Result<ExportResult, CommandError> {
-    let mapping = mapping.with_fresh_hash();
+    let mapping = validate_mapping(&mapping)?;
     let json = serde_json::to_string(&mapping).map_err(CommandError::from)?;
     Ok(ExportResult {
         json,
@@ -640,6 +683,106 @@ mod tests {
         let json = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[],"mapping_hash":"","extra":true}"#;
         let err = import_mapping(json.to_string()).unwrap_err();
         assert!(matches!(err, CommandError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn update_mapping_rejects_an_empty_ignore_reason() {
+        let mut mapping = Mapping::new();
+        mapping.ignored.push(mapping::IgnoredItem {
+            path: "public.accounts".to_string(),
+            reason: "   ".to_string(),
+        });
+        let err = update_mapping(mapping).unwrap_err();
+        assert!(matches!(err, CommandError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn export_mapping_rejects_an_empty_ignore_reason() {
+        let mut mapping = Mapping::new();
+        mapping.ignored.push(mapping::IgnoredItem {
+            path: "public.accounts".to_string(),
+            reason: String::new(),
+        });
+        let err = export_mapping(mapping).unwrap_err();
+        assert!(matches!(err, CommandError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn update_mapping_rejects_an_unsupported_version() {
+        let mut mapping = Mapping::new();
+        mapping.version = 999;
+        let err = update_mapping(mapping).unwrap_err();
+        assert!(matches!(err, CommandError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn update_mapping_still_rehashes_a_valid_mapping() {
+        let mut mapping = Mapping::new();
+        mapping.rules.push(mapping::Rule {
+            kind: mapping::RuleKind::PrefixReplace,
+            pattern: "old_".to_string(),
+            target: "new_".to_string(),
+        });
+        // A stale client hash is discarded, not trusted.
+        mapping.mapping_hash = "stale-client-hash".to_string();
+        let updated = update_mapping(mapping).unwrap();
+        assert_ne!(updated.mapping_hash, "stale-client-hash");
+        assert!(!updated.mapping_hash.is_empty());
+    }
+
+    #[test]
+    fn superuser_override_reason_is_retained() {
+        let allow = SuperuserOverride {
+            allow: true,
+            reason: "  migration requires a superuser login  ".to_string(),
+        };
+        assert!(allow.allows());
+        assert_eq!(
+            allow.reason(),
+            Some("migration requires a superuser login"),
+            "the reason must survive, trimmed, to the results agent"
+        );
+
+        let blank = SuperuserOverride {
+            allow: true,
+            reason: "   ".to_string(),
+        };
+        assert!(!blank.allows());
+        assert_eq!(blank.reason(), None);
+
+        let denied = SuperuserOverride {
+            allow: false,
+            reason: "unused".to_string(),
+        };
+        assert!(!denied.allows());
+        assert_eq!(denied.reason(), None);
+    }
+
+    #[test]
+    fn csp_contains_hardening_directives() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let raw = std::fs::read_to_string(path).expect("read tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("valid config JSON");
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp is a string");
+
+        for directive in [
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'none'",
+        ] {
+            assert!(csp.contains(directive), "CSP missing {directive:?}: {csp}");
+        }
+        assert!(
+            csp.contains("default-src 'self'"),
+            "the CSP must keep default-src 'self': {csp}"
+        );
+        assert!(
+            csp.contains("style-src"),
+            "the CSP must keep a style-src directive: {csp}"
+        );
     }
 
     // --- Live-server tests (gated, matching the engine core policy) ---

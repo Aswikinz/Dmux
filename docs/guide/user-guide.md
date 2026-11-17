@@ -81,6 +81,10 @@ and `dmux run <definition file>`, and writes a results file that opens in the de
 for review and reporting. Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
 script can act on the result.
 
+A run definition file names the databases and the checks; it never holds a database
+password. Point it at a password with `password_env` (the name of an environment variable
+the jump server sets), or use the keychain entry saved in the desktop app.
+
 > **TODO (packaging):** link the release page, the SHA-256 checksums and the software bill
 > of materials here once the release workflow publishes them.
 
@@ -345,9 +349,11 @@ query sent.
 
 - **Run history.** Every run, with its verdict, coverage and date. Open one to review or
   re-export it, or to repeat it from its saved definition.
-- **Scripts.** Optional custom checks, written in Python by the bank's own team. They
-  receive the run's results, never the database passwords or connections, and their
-  findings appear in the report marked as custom checks. Off unless switched on.
+- **Scripts.** Optional custom checks, written in Python by the bank's own team. A check
+  runs with your full permissions, so only run scripts you trust: Dmux strips the
+  environment and never hands a script the database passwords or connections, but it does
+  not sandbox the script itself. Findings appear in the report marked as custom checks.
+  Off unless switched on.
 - **Settings.** Theme, including the reduced effects theme for remote desktops; the run
   window; parallel-scan limits; where history is kept; and purging.
 
