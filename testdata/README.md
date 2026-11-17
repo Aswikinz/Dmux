@@ -121,8 +121,75 @@ block (T003 §4) against `accounts_perf`; the only deviation is
 `statement_timeout='1800s'` instead of `'300s'`, which is too tight for a 20M-row
 scan (the engine uses the run window). Results: `phase0/RESULTS.md`, T005 section.
 
+## Public schema: `demo_bank` (T015)
+
+`demo_bank/` is the invented banking layout of PLAN.md 8.1: the only schema public
+tests use. Nothing in it comes from a real system or a licensed dictionary
+(decision 11); the table, column and code names are made up, and the data is
+synthetic.
+
+**Shape.** 41 tables, about 118,000 rows in the `small` size (20,000 transactions).
+Everything is Postgres 9.4-compatible — no `IDENTITY`, no generated columns, no
+declarative partitioning — because the old database of the pair is 9.6 and the
+schema is loaded there first.
+
+| Feature | Where |
+|---|---|
+| primary keys, composite keys, a composite foreign key | all tables; `account_holders`, `balances_daily`, `payment_items`; `transactions (account_id, currency_code)` → `accounts` |
+| foreign keys, including a self-reference | `gl_accounts.parent_id` → `gl_accounts` |
+| UNIQUE, CHECK, partial and functional indexes | throughout; `ux_customer_addresses_home`, `ix_customers_name` |
+| a table with **no key** (duplicates legal) | `audit_log` (10,495 rows) |
+| sequences (4) | `seq_branch`, `seq_gl_entry`, `seq_note`, `seq_dispute` |
+| 2 views, 1 materialised view | `v_account_balances`, `v_open_disputes`, `mv_branch_totals` |
+| plpgsql function + trigger | `fn_log_account_change` on `accounts` (writes `audit_log`) |
+| one large object | oid 7654321, referenced by `customer_documents.content_oid` |
+| types | `char(1)` flags, `char(n)`, `varchar(n)`, `numeric(20,4)`, one `money` column (`loans.penalty_charge`), `float8`/`real`, `timestamp(0)`, `timestamptz`, `date`, `bytea`, `json`, `jsonb`, `text[]`, `interval`, `numrange` |
+
+**Determinism.** `data.sql` never calls `random()`, `now()` or `current_date`. Every
+value derives from the row number `g` and `md5(g)`; the large object is created with
+a fixed oid (a generated one would change on every build, because the cluster-wide
+counter is not reset by `DROP DATABASE`); and the trigger takes its timestamp from
+the row's own `updated_at`, never from `now()`. Accented characters are written as
+`chr(<code>)` with codes 160–255 only, so the same pure-ASCII file loads unchanged
+into the LATIN1 old database and the UTF-8 new one. The data set mixes NULLs, empty
+strings and trailing spaces on purpose.
+
+```
+testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434)
+testdata/demo_bank/build.sh 5435 5437       # old 9.4 -> new 18, other local ports
+testdata/demo_bank/verify.sh                # old vs new, plus per-table digests
+testdata/demo_bank/verify.sh --baseline /tmp/demo_bank.digest   # + same data every run
+```
+
+`build.sh` drops and recreates the database **`demo_bank`** on the old server
+(LATIN1, C sort order), loads `schema.sql` then `data.sql`, dumps it with
+`pg_dump -Fc`, drops and recreates `demo_bank` on the new server (UTF-8), restores
+with `pg_restore`, and `ANALYZE`s both sides. It prints each server's version,
+encoding and collation, and a table/row summary. It only ever touches the database
+named `demo_bank` (plus the `postgres` maintenance database used to create it) and
+guards all four URLs with `phase0/guard.sh` — it can never reach the `bank`
+databases or anything that is not a local mock.
+
+`verify.sh` computes one digest per table on each side:
+`count(*) | md5(string_agg(row_hash, <empty> ORDER BY row_hash COLLATE "C"))`, where
+`row_hash` is `md5(convert_to(ROW(<normalised columns>)::text, 'UTF8'))`. Ordering is
+by the hash with an explicit `C` collation, so neither the physical row order nor the
+servers' text sort order can change the result; floats and `bytea` are hashed from
+their bytes and `money` is cast to `numeric` (PLAN.md 3.2, decision 4). It asserts
+that old and new agree on every table and that both sides have the same table set.
+With `--baseline FILE` it also compares against an earlier run's digests, which is
+how "two builds produce the same data" is proved; the file is written on first use.
+It exits non-zero on any mismatch. The same digests come out of the 9.4 → 18 pair,
+so the data set is identical across versions too.
+
+Checked: build + verify green on 9.6 → 17 and on 9.4 → 18; two consecutive builds
+gave identical digests; a planted 0.01 `money` change, a NULL → empty-string change
+and a trailing-space change were each reported, while a reversed physical row order
+stayed quiet. After T016 plants the PLAN.md 8.2 differences in the new database,
+`verify.sh` is expected to fail — it is the identical-data proof, run before the
+differences are planted.
+
 ## Still to build (Nina, Phase 1)
 
-- `demo_bank/`: the invented public schema and its generator
-- `build.py`: one command to build both databases at a chosen size
-- `expected_diffs.json`: the answer key (PLAN.md section 8.2)
+- `demo_bank/`: the `full` and `large` sizes (PLAN.md 8.1); `small` exists (T015)
+- `expected_diffs.json`: the answer key (PLAN.md section 8.2, T016)
