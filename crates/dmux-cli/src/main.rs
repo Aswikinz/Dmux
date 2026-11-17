@@ -80,6 +80,11 @@ struct ConnArgs {
     password_env: Option<String>,
     #[arg(long, value_name = "MODE", default_value = "verify")]
     tls: String,
+    /// A PEM file of extra CA certificates to trust when verifying the
+    /// server (for example the bank's internal CA).  The host name is still
+    /// checked.
+    #[arg(long, value_name = "PATH")]
+    ca_file: Option<String>,
     #[arg(long, value_name = "TEXT")]
     reason: Option<String>,
     #[arg(long)]
@@ -104,6 +109,10 @@ enum ConfigError {
     TlsUnknown,
     /// `--allow-superuser` without a non-empty `--reason`.
     SuperuserNeedsReason,
+    /// `--ca-file` with an empty path.
+    CaFileEmpty,
+    /// `--ca-file` together with `--tls disable`: no certificate is checked.
+    CaFileWithoutTls,
 }
 
 impl ConfigError {
@@ -117,6 +126,10 @@ impl ConfigError {
                 "unknown --tls value (expected verify, fingerprint:<hex>, or disable)"
             }
             ConfigError::SuperuserNeedsReason => "--allow-superuser requires --reason <text>",
+            ConfigError::CaFileEmpty => "--ca-file <path> may not be empty",
+            ConfigError::CaFileWithoutTls => {
+                "--ca-file cannot be used with --tls disable: an unencrypted connection checks no certificate"
+            }
         }
     }
 }
@@ -132,14 +145,34 @@ impl ConnArgs {
         if self.allow_superuser && !allow_superuser_requires_reason(&self.reason) {
             return Err(ConfigError::SuperuserNeedsReason);
         }
-        Ok(ConnProfile::new(
+        let ca_file = check_ca_file(self.ca_file.as_deref(), &tls_mode)?;
+        let profile = ConnProfile::new(
             self.host.clone(),
             self.port,
             self.db.clone(),
             self.user.clone(),
             password,
             tls_mode,
-        ))
+        );
+        Ok(match ca_file {
+            Some(path) => profile.with_ca_file(path),
+            None => profile,
+        })
+    }
+}
+
+/// Validate a `--ca-file` / `ca_file` setting against the TLS mode.  The file
+/// itself is read when connecting; a missing or invalid PEM is then a TLS
+/// error that names only the path.
+fn check_ca_file<'a>(
+    ca_file: Option<&'a str>,
+    tls_mode: &TlsMode,
+) -> Result<Option<&'a str>, ConfigError> {
+    match ca_file {
+        None => Ok(None),
+        Some(p) if p.trim().is_empty() => Err(ConfigError::CaFileEmpty),
+        Some(_) if matches!(tls_mode, TlsMode::Disable(_)) => Err(ConfigError::CaFileWithoutTls),
+        Some(p) => Ok(Some(p)),
     }
 }
 
@@ -1030,6 +1063,9 @@ struct ConnDef {
     password_env: Option<String>,
     #[serde(default = "default_tls")]
     tls: String,
+    /// A PEM file of extra CA certificates to trust (`--ca-file`).
+    #[serde(default)]
+    ca_file: Option<String>,
     reason: Option<String>,
     /// A plaintext `password` is not allowed (decision 23 / PLAN 6.5).  This
     /// field exists only to turn its presence into a clear error; it is never
@@ -1070,14 +1106,25 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
                 .map_err(|_| "password environment variable is not set".to_string())?,
             None => String::new(),
         };
-        Ok(ConnProfile::new(
+        let ca_file = check_ca_file(c.ca_file.as_deref(), &tls_mode).map_err(|e| match e {
+            ConfigError::CaFileEmpty => "ca_file may not be empty".to_string(),
+            ConfigError::CaFileWithoutTls => "ca_file cannot be used with tls = \"disable\": \
+                 an unencrypted connection checks no certificate"
+                .to_string(),
+            other => other.message().to_string(),
+        })?;
+        let profile = ConnProfile::new(
             c.host.clone(),
             c.port,
             c.db.clone(),
             c.user.clone(),
             password,
             tls_mode,
-        ))
+        );
+        Ok(match ca_file {
+            Some(path) => profile.with_ca_file(path),
+            None => profile,
+        })
     };
 
     let old = match (&def.old, &def.old_file) {
@@ -1283,6 +1330,7 @@ mod tests {
             user: "u".into(),
             password_env: Some("DMUX_TEST_SENTINEL_PW".into()),
             tls: "SENTINEL-TLS-VALUE".into(),
+            ca_file: None,
             reason: None,
             allow_superuser: false,
         };
@@ -1642,6 +1690,134 @@ new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", 
         let c = definition("settle-5s", &format!("stats_settle_ms = 5000\n{CONNS}")).unwrap();
         assert_eq!(c.stats_settle, std::time::Duration::from_secs(5));
         assert!(definition("settle-low", &format!("stats_settle_ms = 500\n{CONNS}")).is_err());
+    }
+
+    #[test]
+    fn parses_the_ca_file_option() {
+        let cli = Cli::try_parse_from([
+            "dmux",
+            "probe",
+            "--host",
+            "h",
+            "--port",
+            "5432",
+            "--db",
+            "d",
+            "--user",
+            "u",
+            "--ca-file",
+            "/etc/bank/ca.pem",
+        ])
+        .expect("parse");
+        let Command::Probe(args) = cli.command else {
+            panic!("expected probe");
+        };
+        assert_eq!(args.conn.ca_file.as_deref(), Some("/etc/bank/ca.pem"));
+        let profile = args.conn.profile().expect("profile");
+        assert_eq!(profile.ca_file.as_deref(), Some("/etc/bank/ca.pem"));
+        // Without the option there is no CA file.
+        let cli = Cli::try_parse_from([
+            "dmux", "probe", "--host", "h", "--port", "5432", "--db", "d", "--user", "u",
+        ])
+        .expect("parse");
+        let Command::Probe(args) = cli.command else {
+            panic!("expected probe");
+        };
+        assert_eq!(args.conn.profile().unwrap().ca_file, None);
+    }
+
+    fn conn_args(tls: &str, reason: Option<&str>, ca_file: Option<&str>) -> ConnArgs {
+        ConnArgs {
+            host: "h".into(),
+            port: 5432,
+            db: "d".into(),
+            user: "u".into(),
+            password_env: None,
+            tls: tls.into(),
+            ca_file: ca_file.map(str::to_string),
+            reason: reason.map(str::to_string),
+            allow_superuser: false,
+        }
+    }
+
+    #[test]
+    fn ca_file_is_refused_when_empty_or_unencrypted() {
+        assert_eq!(
+            conn_args("verify", None, Some("  ")).profile().unwrap_err(),
+            ConfigError::CaFileEmpty
+        );
+        assert_eq!(
+            conn_args("disable", Some("lab"), Some("/ca.pem"))
+                .profile()
+                .unwrap_err(),
+            ConfigError::CaFileWithoutTls
+        );
+        // A pinned fingerprint may carry a CA file too (it is simply unused).
+        let p = conn_args("fingerprint:ab", None, Some("/ca.pem"))
+            .profile()
+            .unwrap();
+        assert_eq!(p.ca_file.as_deref(), Some("/ca.pem"));
+        // The messages are fixed strings.
+        assert!(ConfigError::CaFileEmpty.message().contains("--ca-file"));
+        assert!(ConfigError::CaFileWithoutTls
+            .message()
+            .contains("--tls disable"));
+    }
+
+    #[test]
+    fn definition_accepts_a_ca_file() {
+        let body = r#"
+old = { host = "127.0.0.1", port = 5433, db = "d", user = "u", ca_file = "/etc/bank/ca.pem" }
+new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", reason = "lab" }
+"#;
+        let cfg = definition("ca", body).expect("definition with ca_file parses");
+        match (&cfg.old, &cfg.new) {
+            (dmux_engine::run::Input::Live(old), dmux_engine::run::Input::Live(new)) => {
+                assert_eq!(old.ca_file.as_deref(), Some("/etc/bank/ca.pem"));
+                assert_eq!(new.ca_file, None);
+            }
+            _ => panic!("expected two live inputs"),
+        }
+        // JSON definitions take the same key.
+        let dir = std::env::temp_dir().join(format!("dmux-def-{}-cajson", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("def.json");
+        std::fs::write(
+            &path,
+            r#"{"old": {"host": "h", "port": 1, "db": "d", "user": "u", "ca_file": "/ca.pem"},
+                "new": {"host": "h", "port": 2, "db": "d", "user": "u", "ca_file": "/ca.pem"}}"#,
+        )
+        .unwrap();
+        let cfg = load_definition(path.to_str().unwrap()).expect("json parses");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(&cfg.new, dmux_engine::run::Input::Live(p) if p.ca_file.as_deref() == Some("/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn definition_refuses_a_bad_ca_file_setting() {
+        let empty = r#"
+old = { host = "127.0.0.1", port = 5433, db = "d", user = "u", ca_file = "" }
+new = { host = "127.0.0.1", port = 5434, db = "d", user = "u" }
+"#;
+        let err = definition("caempty", empty).unwrap_err();
+        assert_eq!(err, "ca_file may not be empty");
+        let plain = r#"
+old = { host = "127.0.0.1", port = 5433, db = "d", user = "u", tls = "disable", reason = "lab", ca_file = "/ca.pem" }
+new = { host = "127.0.0.1", port = 5434, db = "d", user = "u" }
+"#;
+        let err = definition("caplain", plain).unwrap_err();
+        assert!(
+            err.starts_with("ca_file cannot be used with tls = \"disable\""),
+            "{err}"
+        );
+        // A misspelt key is still rejected (deny_unknown_fields).
+        let typo = r#"
+old = { host = "127.0.0.1", port = 5433, db = "d", user = "u", cafile = "/ca.pem" }
+new = { host = "127.0.0.1", port = 5434, db = "d", user = "u" }
+"#;
+        assert!(definition("catypo", typo).unwrap_err().contains("cafile"));
     }
 
     #[test]
