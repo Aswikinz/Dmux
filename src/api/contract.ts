@@ -141,7 +141,19 @@ export interface RunProgress {
   etaSecondsMax?: number;
 }
 
-export type Verdict = 'PASS' | 'FAIL' | 'WARNING' | 'CHANGED_DURING_CHECK';
+/**
+ * The engine's results JSON emits exactly these verdict strings. A verdict is
+ * a statement about the data (or the tool) once a table has been checked; the
+ * run-progress "done"/"failed" states are not verdicts and never render as one.
+ */
+export type Verdict =
+  | 'PASS'
+  | 'FAIL'
+  | 'WIDELY_DIFFERENT'
+  | 'NEEDS_REVIEW'
+  | 'CHANGED_DURING_CHECK'
+  | 'TOOL_FAULT'
+  | 'WARNING';
 
 export interface FailureCard {
   id: string;
@@ -149,6 +161,8 @@ export interface FailureCard {
   schemaName: string;
   tableName: string;
   level: CheckLevel;
+  /** The verdict this card explains; drives its icon + word badge. */
+  verdict: Verdict;
   summary: string;
   detail: string;
 }
@@ -183,6 +197,8 @@ export interface Results {
   runId: string;
   verdict: Verdict;
   coverage: CoverageSummary;
+  /** Tables/columns the user chose to ignore, each with its required reason. */
+  ignored: IgnoreItem[];
   failures: FailureCard[];
   tableResults: TableResult[];
 }

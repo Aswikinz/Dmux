@@ -54,6 +54,19 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
             {results.coverage.countsTables} counts only, {results.coverage.ignoredTables} ignored.
           </p>
         </div>
+        {results.ignored.length > 0 && (
+          <div className="mt-4">
+            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Ignored</h3>
+            <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
+              {results.ignored.map((item) => (
+                <li key={item.id}>
+                  <span className="font-medium">{item.name}</span>
+                  <span className="ml-2 text-slate-500">— {item.reason}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="mt-4">
           <Switch
             label="Include row keys in the exported report"

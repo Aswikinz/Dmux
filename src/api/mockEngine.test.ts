@@ -125,16 +125,34 @@ describe('fixtures', () => {
     expect(results.tableResults.length).toBe(results.coverage.totalTables);
   });
 
-  it('distinguishes pass from fail from changed-during-check', () => {
+  it('distinguishes every verdict', () => {
     expect(fixtures.pass.verdict).toBe('PASS');
     expect(fixtures.fail.verdict).toBe('FAIL');
+    expect(fixtures.widelyDifferent.verdict).toBe('WIDELY_DIFFERENT');
+    expect(fixtures.needsReview.verdict).toBe('NEEDS_REVIEW');
     expect(fixtures.changedDuringCheck.verdict).toBe('CHANGED_DURING_CHECK');
+    expect(fixtures.toolFault.verdict).toBe('TOOL_FAULT');
     expect(fixtures.warning.verdict).toBe('WARNING');
-    expect(fixtures.toolFault.verdict).toBe('FAIL');
   });
 
-  it('reports the wide-different and tool-fault cases with details', () => {
+  it('never folds widely-different or tool-fault into FAIL', () => {
+    expect(fixtures.widelyDifferent.verdict).not.toBe('FAIL');
+    expect(fixtures.toolFault.verdict).not.toBe('FAIL');
+  });
+
+  it('reports failure cards with their own verdict', () => {
     expect(fixtures.widelyDifferent.failures[0].summary).toMatch(/buckets differ/);
+    expect(fixtures.widelyDifferent.failures[0].verdict).toBe('WIDELY_DIFFERENT');
     expect(fixtures.toolFault.failures[0].summary).toMatch(/spot check/);
+    expect(fixtures.toolFault.failures[0].verdict).toBe('TOOL_FAULT');
+    expect(fixtures.needsReview.failures[0].summary).toMatch(/manual review/);
+    expect(fixtures.needsReview.failures[0].verdict).toBe('NEEDS_REVIEW');
+  });
+
+  it('lists every ignored item with a reason', () => {
+    expect(fixtures.pass.ignored.length).toBe(fixtures.pass.coverage.ignoredTables);
+    for (const item of fixtures.pass.ignored) {
+      expect(item.reason.trim().length).toBeGreaterThan(0);
+    }
   });
 });

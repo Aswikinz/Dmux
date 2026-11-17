@@ -55,18 +55,27 @@ describe('Panel', () => {
 });
 
 describe('StatusBadge', () => {
-  it.each(['PASS', 'FAIL', 'WARNING', 'CHANGED_DURING_CHECK'] as const)(
-    'renders a word and icon for %s',
-    (status) => {
-      const { container } = render(<StatusBadge status={status} />);
-      expect(screen.getByText(status === 'CHANGED_DURING_CHECK' ? 'Changed during check' : status.charAt(0) + status.slice(1).toLowerCase())).toBeDefined();
-      expect(container.querySelector('svg')).toBeTruthy();
-    },
-  );
+  const verdictLabels: Record<string, string> = {
+    PASS: 'Pass',
+    FAIL: 'Fail',
+    WIDELY_DIFFERENT: 'Widely different',
+    NEEDS_REVIEW: 'Needs review',
+    CHANGED_DURING_CHECK: 'Changed during check',
+    TOOL_FAULT: 'Tool fault',
+    WARNING: 'Warning',
+  };
 
-  it('falls back to an idle badge for an unknown status', () => {
+  it.each(Object.keys(verdictLabels))('renders a word and icon for %s', (status) => {
+    const { container } = render(<StatusBadge status={status as never} />);
+    expect(screen.getByText(verdictLabels[status])).toBeDefined();
+    expect(container.querySelector('svg')).toBeTruthy();
+  });
+
+  it('renders a neutral Unknown state for an unrecognised status, never Pass or Idle', () => {
     const { container } = render(<StatusBadge status={'bogus' as never} />);
-    expect(screen.getByText('Idle')).toBeDefined();
+    expect(screen.getByText('Unknown')).toBeDefined();
+    expect(screen.queryByText('Pass')).toBeNull();
+    expect(screen.queryByText('Idle')).toBeNull();
     expect(container.querySelector('svg')).toBeTruthy();
   });
 });

@@ -405,6 +405,7 @@ describe('RunScreen', () => {
         runId: 'run-live',
         verdict: 'PASS',
         coverage: { totalTables: 1, fullValuesTables: 1, countsTables: 0, structureTables: 0, ignoredTables: 0 },
+        ignored: [],
         failures: [],
         tableResults: [],
       }),
@@ -531,6 +532,22 @@ describe('ResultsScreen', () => {
     // A changed row advertises its differing columns.
     expect(await screen.findByText('Changed columns: amount')).toBeDefined();
   });
+
+  it('lists ignored tables with their required reasons next to the coverage line', async () => {
+    wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'pass' })} runId="run-pass" />);
+    await screen.findByText(/tables fully checked/);
+    const ignoredheading = screen.getByRole('heading', { name: 'Ignored' });
+    expect(ignoredheading).toBeDefined();
+    expect(screen.getByText('archived_balances')).toBeDefined();
+    expect(screen.getByText(/Legacy archive table/)).toBeDefined();
+  });
+
+  it('shows the needs-review verdict in its own words', async () => {
+    wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'needsReview' })} runId="run-needs-review" />);
+    await screen.findByText('Failures');
+    expect(screen.getAllByText('Needs review').length).toBeGreaterThan(0);
+    expect(screen.getByText(/manual review/)).toBeDefined();
+  });
 });
 
 describe('ReportScreen', () => {
@@ -538,6 +555,11 @@ describe('ReportScreen', () => {
     runId: 'run-pass',
     verdict: 'PASS',
     coverage: { totalTables: 40, fullValuesTables: 12, countsTables: 10, structureTables: 15, ignoredTables: 3 },
+    ignored: [
+      { id: 'ign-0', name: 'archived_balances', reason: 'Legacy archive table' },
+      { id: 'ign-1', name: 'ignored_table_0002', reason: 'Out of scope' },
+      { id: 'ign-2', name: 'ignored_table_0003', reason: 'Out of scope' },
+    ],
     failures: [],
     tableResults: [],
   };

@@ -4,7 +4,7 @@ import { ProgressRow } from './ProgressRow';
 import type { TableProgress } from '../api/contract';
 
 describe('ProgressRow', () => {
-  it('shows the table name, progress and a word badge', () => {
+  it('shows the table name, progress and a state word (Done, not Pass)', () => {
     const progress: TableProgress = {
       tableId: 'tbl-000001',
       schemaName: 'demo_bank',
@@ -14,10 +14,25 @@ describe('ProgressRow', () => {
     };
     render(<ProgressRow progress={progress} />);
     expect(screen.getByText('demo_bank.account_master')).toBeDefined();
-    expect(screen.getByText('Pass')).toBeDefined();
+    expect(screen.getByText('Done')).toBeDefined();
+    // A finished scan is not a verified PASS.
+    expect(screen.queryByText('Pass')).toBeNull();
   });
 
-  it('maps failed to a Fail badge', () => {
+  it('a done table never shows a Pass badge, even if it later differs', () => {
+    const progress: TableProgress = {
+      tableId: 'tbl-000005',
+      schemaName: 'demo_bank',
+      tableName: 'acct_diff',
+      state: 'done',
+      progressPercent: 100,
+    };
+    render(<ProgressRow progress={progress} />);
+    expect(screen.getByText('Done')).toBeDefined();
+    expect(screen.queryByText('Pass')).toBeNull();
+  });
+
+  it('maps a failed scan to Failed, not data Fail', () => {
     const progress: TableProgress = {
       tableId: 'tbl-000002',
       schemaName: 'demo_bank',
@@ -26,7 +41,8 @@ describe('ProgressRow', () => {
       progressPercent: 0,
     };
     render(<ProgressRow progress={progress} />);
-    expect(screen.getByText('Fail')).toBeDefined();
+    expect(screen.getByText('Failed')).toBeDefined();
+    expect(screen.queryByText('Fail')).toBeNull();
   });
 
   it('maps changed-during-check to its badge', () => {

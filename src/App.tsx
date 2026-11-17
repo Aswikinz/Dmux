@@ -127,7 +127,7 @@ function AppShell() {
       }`}
     >
       <aside
-        className={`shrink-0 flex-col gap-4 border-r border-white/30 bg-white/60 p-4 backdrop-blur-[16px] transition-all dark:border-white/10 dark:bg-slate-900/60 ${
+        className={`shrink-0 flex-col gap-4 border-r border-white/30 bg-white/75 p-4 backdrop-blur-[16px] transition-all dark:border-white/10 dark:bg-slate-900/75 ${
           sidebarOpen ? 'flex w-64' : 'hidden'
         }`}
       >

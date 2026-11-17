@@ -7,16 +7,14 @@ interface ProgressRowProps {
   className?: string;
 }
 
+/**
+ * Shows run progress per table. It renders only the run *state* (done, running,
+ * failed, changed-during-check, …). It must never fabricate a verdict: a scan
+ * that finished is "Done", not "Pass", and a failed scan is "Failed", not a
+ * data "Fail". The per-table verdict appears only on the results screen once
+ * the engine has produced one.
+ */
 export function ProgressRow({ progress, className }: ProgressRowProps) {
-  const state =
-    progress.state === 'done'
-      ? 'PASS'
-      : progress.state === 'failed'
-        ? 'FAIL'
-        : progress.state === 'changed-during-check'
-          ? 'CHANGED_DURING_CHECK'
-          : progress.state;
-
   return (
     <div
       className={cn(
@@ -45,7 +43,7 @@ export function ProgressRow({ progress, className }: ProgressRowProps) {
           />
         </div>
       </div>
-      <StatusBadge status={state} />
+      <StatusBadge status={progress.state} />
     </div>
   );
 }
