@@ -1230,15 +1230,18 @@ name = "dmux-app"
 version = "0.3.0"
 dependencies = [
  "dmux-engine",
+ "hex",
  "keyring",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tauri",
  "tauri-build",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

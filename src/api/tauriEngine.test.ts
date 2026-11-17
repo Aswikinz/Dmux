@@ -144,6 +144,16 @@ describe('createTauriEngine', () => {
     expect(result.info?.tls).toEqual({ state: 'encrypted', verified: true });
   });
 
+  it('testConnection reports a session-only password, and never a password value', async () => {
+    invoke.mockResolvedValueOnce({ ...rawServerInfo, session_password: true });
+    const engine = createTauriEngine();
+    const result = await engine.testConnection(profile());
+    expect(result.info?.sessionPassword).toBe(true);
+    invoke.mockResolvedValueOnce({ ...rawServerInfo });
+    const plain = await engine.testConnection(profile());
+    expect(plain.info?.sessionPassword).toBe(false);
+  });
+
   it('testConnection reflects a pinned certificate fingerprint', async () => {
     invoke.mockResolvedValueOnce({
       ...rawServerInfo,

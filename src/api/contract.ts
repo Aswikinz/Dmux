@@ -44,6 +44,9 @@ export interface ServerInfo {
   tls: TlsState;
   /** Free-form warning text for the user, e.g. superuser refusal. */
   warning?: string;
+  /** True when the machine has no system keychain and Dmux keeps this
+   *  password in memory until the app closes.  The UI never holds it. */
+  sessionPassword?: boolean;
 }
 
 export interface ConnectionTestResult {

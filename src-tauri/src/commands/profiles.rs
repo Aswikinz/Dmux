@@ -9,12 +9,19 @@
 //! password in the same call, the old keychain entry is deleted, so the next
 //! use asks for the password again rather than reusing it against new (possibly
 //! attacker-controlled) details.
+//!
+//! On a machine with no usable keychain, a typed password is kept in the
+//! in-memory session cache instead ([`crate::secrets::SessionPasswords`]),
+//! bound to the profile's connection fields.  The same rule applies to it: a
+//! connection-field change or a delete forgets it.
 
 use serde::Serialize;
 use tauri::State;
 
 use crate::error::CommandError;
-use crate::secrets::{NOT_SAVED_MESSAGE, PASSWORD_REMOVED_MESSAGE};
+use crate::secrets::{
+    stored_fields_hash, NOT_SAVED_MESSAGE, PASSWORD_REMOVED_MESSAGE, SESSION_PASSWORD_MESSAGE,
+};
 use crate::state::AppState;
 use crate::store::StoredProfile;
 use crate::types::ProfileInput;
@@ -91,6 +98,8 @@ pub fn do_save_profile(
     // existing id keeps the password untouched.
     let must_clear = !is_update || fields_changed;
     if must_clear {
+        // The session password belongs to the old fields too.
+        state.session_passwords()?.forget(&incoming.id);
         state
             .keychain()?
             .delete(&incoming.id)
@@ -104,13 +113,19 @@ pub fn do_save_profile(
 
     let stored = state.store()?.save(&incoming)?;
 
-    // A supplied password goes to the keychain (never SQLite).  A failure is
-    // surfaced as a warning, never as a silent drop.
+    // A supplied password goes to the keychain (never SQLite).  With no usable
+    // keychain it is kept in memory for this session, bound to the saved
+    // fields, and the user is told so.  Any other failure is surfaced as a
+    // warning, never as a silent drop.
     if let Some(password) = password {
-        match state.keychain()?.set(&stored.id, &password) {
-            Ok(()) => {}
+        let stored_result = state.keychain()?.set(&stored.id, &password);
+        match stored_result {
+            Ok(()) => state.session_passwords()?.forget(&stored.id),
             Err(e) if e.to_string().contains(NOT_SAVED_MESSAGE) => {
-                warning = Some(NOT_SAVED_MESSAGE.to_string());
+                state
+                    .session_passwords()?
+                    .put(&stored.id, stored_fields_hash(&stored), &password);
+                warning = Some(SESSION_PASSWORD_MESSAGE.to_string());
             }
             Err(e) => warning = Some(e.to_string()),
         }
@@ -143,6 +158,7 @@ pub fn do_delete_profile(id: &str, state: &AppState) -> Result<bool, CommandErro
         Some(_) => {}
         None => return Ok(false),
     }
+    state.session_passwords()?.forget(id);
     state
         .keychain()?
         .delete(id)
@@ -604,14 +620,12 @@ mod tests {
             Err(CommandError::PasswordMissing { .. })
         ));
 
-        // The "password not saved" warning is surfaced.
-        assert!(
-            res.warning
-                .as_deref()
-                .is_some_and(|w| w.contains("asked each run")),
-            "expected a password-not-saved warning, got {:?}",
-            res.warning
-        );
+        // T055: the keychain refused the new password, so it is kept for this
+        // session only, bound to the NEW fields, and the user is told so.
+        assert_eq!(res.warning.as_deref(), Some(SESSION_PASSWORD_MESSAGE));
+        let sessions = s.session_passwords().unwrap();
+        assert!(sessions.contains("prod", &stored_fields_hash(&stored)));
+        assert!(!sessions.contains("prod", &stored_fields_hash(&seeded)));
     }
 
     #[test]
