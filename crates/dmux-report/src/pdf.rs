@@ -20,6 +20,7 @@ use genpdf::style;
 use genpdf::{Document, Element, SimplePageDecorator};
 
 use crate::layout::{self, Layout, ReportOptions};
+use crate::verify::HookEvidence;
 
 const FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
@@ -35,19 +36,31 @@ pub enum PdfError {
     Render(String),
 }
 
-/// Write the PDF summary for `results` to `path`.
+/// Write the PDF summary for verified results to `path`.
 ///
 /// `results_sha256` is the verified digest of the results file (PLAN 2.4); it is
-/// printed on page 1 so a later edit is detectable.
+/// printed on page 1 so a later edit is detectable.  `hooks`, when present,
+/// contributes the custom-check section and (via [`layout::build`]) folds into
+/// the displayed verdict.
 pub fn write_summary(
     results: &RunResults,
-    raw: &serde_json::Value,
+    hooks: Option<&HookEvidence>,
     results_sha256: &str,
     options: &ReportOptions,
     path: &Path,
 ) -> Result<(), PdfError> {
-    let layout = layout::build_from(results, raw, options);
-    let bytes = render_bytes(&layout, results_sha256)?;
+    let layout = layout::build(results, hooks, options);
+    write_summary_layout(&layout, results_sha256, path)
+}
+
+/// Write a pre-built layout to disk (used by the shared `render_all` path so the
+/// displayed-verdict fold happens once, in the caller).
+pub fn write_summary_layout(
+    layout: &Layout,
+    results_sha256: &str,
+    path: &Path,
+) -> Result<(), PdfError> {
+    let bytes = render_bytes(layout, results_sha256)?;
     std::fs::write(path, bytes)?;
     Ok(())
 }
@@ -291,6 +304,31 @@ pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<Document,
         }
     }
 
+    // Hook custom checks (PLAN 4.9), marked as such, with each script's hash.
+    if !layout.custom_checks.is_empty() || !layout.hook_scripts.is_empty() {
+        body.push(heading("Custom checks (Python hooks)"));
+        for c in &layout.custom_checks {
+            let scope = c
+                .table
+                .as_deref()
+                .map(|t| format!(" ({t})"))
+                .unwrap_or_default();
+            body.push(plain(&format!(
+                "[{}] {}{}: {}",
+                c.id, c.severity, scope, c.message
+            )));
+        }
+        for w in &layout.hook_warnings {
+            body.push(plain(&format!("hook warning: {w}")));
+        }
+        for s in &layout.hook_scripts {
+            body.push(plain(&format!(
+                "script {} — SHA-256 {}",
+                s.script, s.sha256
+            )));
+        }
+    }
+
     // Sign-off block.
     body.push(heading("Sign-off"));
     for line in layout::sign_off_block() {
@@ -318,7 +356,8 @@ mod tests {
     use super::*;
     use crate::layout::build;
     use dmux_engine::results::{
-        finalise, CheckLevel, RunResults, TableResult, Verdict, RESULTS_VERSION,
+        finalise, ChangedRowExport, CheckLevel, RunResults, TableDetail, TableResult, Verdict,
+        RESULTS_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -334,7 +373,7 @@ mod tests {
                 verdict: Verdict::Fail,
                 old_rows: Some(100),
                 new_rows: Some(99),
-                columns_covered: Some(vec!["id".into(), SENTINEL.into()]),
+                columns_covered: Some(vec!["id".into()]),
                 differing_buckets: Some(1),
                 missing_buckets: Some(0),
                 extra_buckets: Some(0),
@@ -344,23 +383,35 @@ mod tests {
                 reasons: vec!["row counts differ".into()],
             },
         );
+        // Drill-down key sentinels live in the typed `details` field.
+        let details = BTreeMap::from([(
+            "demo_bank.accounts".into(),
+            TableDetail {
+                changed_columns: vec!["balance".into()],
+                changed_rows: vec![ChangedRowExport {
+                    key: Some(vec![Some(SENTINEL.into())]),
+                    columns: vec!["balance".into()],
+                }],
+                missing_keys: None,
+                extra_keys: None,
+                control_totals: vec![],
+                plain_words: vec!["a balance changed".into()],
+            },
+        )]);
         let r = RunResults {
             results_version: RESULTS_VERSION,
             run_id: "run-1".into(),
             tool_version: "0.1.0".into(),
             mapping_hash: "mh".into(),
             verdict: Verdict::Fail,
-            coverage_line: "0 tables fully checked, 0 counts only, 0 ignored".into(),
+            coverage_line:
+                "0 of 1 tables fully checked, 0 counts only, 0 structure only, 0 ignored".into(),
             fully_checked: 0,
             counts_only: 0,
             ignored: 0,
             tables,
-            ignored_items: vec![],
-            changed_during_check: vec![],
-            warnings: vec![],
-            wal_start_lsn: None,
-            wal_end_lsn: None,
-            results_sha256: String::new(),
+            details,
+            ..RunResults::default()
         };
         finalise(r)
     }
@@ -564,28 +615,28 @@ mod tests {
     }
 
     #[test]
-    fn pdf_omits_keys_by_default_and_includes_them_when_ticked() {
+    fn pdf_omits_drilldown_keys_by_default_and_includes_them_when_ticked() {
         let r = fixture();
-        let without = build(&r, &ReportOptions::default());
-        let with = build(&r, &ReportOptions { include_keys: true });
+        let without = build(&r, None, &ReportOptions::default());
+        let with = build(&r, None, &ReportOptions { include_keys: true });
 
         let t_without = extract_texts(&render_bytes(&without, "abc").unwrap());
         let t_with = extract_texts(&render_bytes(&with, "abc").unwrap());
 
         assert!(
             !any_contains(&t_without, SENTINEL),
-            "key must be absent by default"
+            "drill-down key must be absent by default ({t_without:?})"
         );
         assert!(
-            any_contains(&t_with, "id"),
-            "covered column appears when ticked"
+            any_contains(&t_with, SENTINEL),
+            "drill-down key present when ticked ({t_with:?})"
         );
     }
 
     #[test]
     fn pdf_never_prints_a_row_value_sentinel() {
         let r = fixture();
-        let layout = build(&r, &ReportOptions::default());
+        let layout = build(&r, None, &ReportOptions::default());
         let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
         assert!(
             !any_contains(&texts, SENTINEL),
@@ -598,9 +649,8 @@ mod tests {
         let mut r = fixture();
         r.tables.get_mut("demo_bank.accounts").unwrap().reasons =
             vec!["\u{202E}benign".to_string()];
-        // re-finalise so the fixture digest is consistent (only used for render).
         let r = finalise(r);
-        let layout = build(&r, &ReportOptions::default());
+        let layout = build(&r, None, &ReportOptions::default());
         let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
         let joined = texts.concat();
         assert!(
@@ -615,7 +665,7 @@ mod tests {
 
     #[test]
     fn pdf_carries_mandatory_prose_and_signoff() {
-        let layout = build(&fixture(), &ReportOptions::default());
+        let layout = build(&fixture(), None, &ReportOptions::default());
         let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
         assert!(
             any_contains(&texts, "What a PASS does not prove"),
@@ -627,5 +677,33 @@ mod tests {
         assert!(any_contains(&texts, "Signature"));
         assert!(any_contains(&texts, "Coverage"));
         assert!(any_contains(&texts, "FAIL"));
+    }
+
+    #[test]
+    fn pdf_renders_hook_custom_checks_and_script_hashes() {
+        use crate::verify::{HookEvidence, HookFinding, HookScript};
+        let hooks = HookEvidence {
+            custom_checks: vec![HookFinding {
+                id: "c1".into(),
+                severity: "fail".into(),
+                message: "a custom check failed".into(),
+                table: Some("demo_bank.accounts".into()),
+            }],
+            scripts: vec![HookScript {
+                script: "hook.py".into(),
+                sha256: "ab".repeat(32),
+            }],
+            warnings: vec!["hook warning".into()],
+        };
+        let layout = build(&fixture(), Some(&hooks), &ReportOptions::default());
+        let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
+        assert!(
+            any_contains(&texts, "Custom checks (Python hooks)"),
+            "{texts:?}"
+        );
+        assert!(any_contains(&texts, "a custom check failed"));
+        assert!(any_contains(&texts, "hook.py"), "{texts:?}");
+        let joined = texts.concat();
+        assert!(joined.contains(&"ab".repeat(32)), "script hash present");
     }
 }

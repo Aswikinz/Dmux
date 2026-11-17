@@ -1,49 +1,68 @@
 //! Dmux report generation (PLAN.md 4.7 and 5).
 //!
-//! This crate turns a [`dmux_engine::results::RunResults`] (already written to a
-//! JSON file by `dmux compare` / `dmux run`) into the three artefacts a bank
-//! signs and audits:
+//! This crate turns a verified [`dmux_engine::results::RunResults`] (written to a
+//! JSON file by `dmux compare` / `dmux run`, with or without `--hooks`) into the
+//! three artefacts a bank signs and audits:
 //!
 //! - a PDF summary (`pdf`): page 1 carries the verdict, the coverage line, every
-//!   ignored item with its reason, failures first, the run/tool/mapping identity,
-//!   the SHA-256 of the results file, the "what a PASS does not prove" paragraph,
-//!   the md5 threat-model sentence and the tamper-evident-not-proof sentence, and
-//!   a sign-off block.  Per-table sections follow.
+//!   ignored item with its reason, failures first, structure findings, the
+//!   run/tool/mapping identity, the SHA-256 of the results file, the "what a PASS
+//!   does not prove" paragraph, the md5 threat-model sentence, the
+//!   tamper-evident-not-proof sentence, the hook custom checks and their script
+//!   hashes, and a sign-off block.  Per-table sections follow.
 //! - an Excel detail workbook (`xlsx`): sheets Summary, Tables, Differences,
-//!   Ignored, Warnings/Flags and Run log; lists longer than Excel's 1,048,576
-//!   row limit overflow to CSV, noted in the workbook.
+//!   Structure Findings, Ignored, Warnings Flags, Custom Checks and Run log;
+//!   lists longer than Excel's 1,048,576 row limit overflow to CSV, noted in the
+//!   workbook.
 //! - a run log (`log`): plain text and JSON.
 //!
 //! The engine's report contract is that **no row value ever leaves the database**:
 //! `RunResults` carries counts, hashes and names only, never row data.  This crate
-//! is a second line of defence: the layout module below contains the only place a
-//! value is joined to text, and it renders only summary fields, never row values
-//! or — unless `include_keys` is set — keys.  Tests feed sentinel row values into
-//! the fixture and assert they never appear in the PDF text or the XLSX XML.
+//! is a second line of defence: the layout module renders only summary fields,
+//! never row values or — unless `include_keys` is set — keys.  Tests feed sentinel
+//! row values into the fixture and assert they never appear in the PDF text or
+//! the XLSX XML.
 
 pub mod layout;
 pub mod log;
 pub mod pdf;
-pub mod v2;
 pub mod verify;
 pub mod xlsx;
 
 pub use layout::{IncludeKeys, ReportOptions};
-pub use verify::{verify_results_file, Verification};
+pub use verify::{verify_results_file, HookEvidence, Verification};
 
-/// The three artefacts `dmux report` writes, in one call.
+/// Build the layout for verified results, folding in hook evidence and the
+/// displayed verdict (the worse of the inner verdict and every hook finding).
+pub fn build_layout(verification: &Verification, options: &ReportOptions) -> layout::Layout {
+    let mut layout = layout::build(&verification.results, verification.hooks.as_ref(), options);
+    // The displayed overall verdict must never show PASS when a custom check
+    // failed: fold hook findings over the inner verdict.
+    if let Some(hooks) = &verification.hooks {
+        layout.verdict_word =
+            layout::verdict_word(verify::displayed_verdict(&verification.results, hooks))
+                .to_string();
+    }
+    layout
+}
+
+/// The three artefacts `dmux report` writes, in one call (test/golden entry).
 pub fn render_all(
-    results: &dmux_engine::results::RunResults,
-    raw: &serde_json::Value,
-    file_sha256: &str,
+    verification: &Verification,
     options: &ReportOptions,
     pdf_path: &std::path::Path,
     xlsx_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Result<(), ReportError> {
-    pdf::write_summary(results, raw, file_sha256, options, pdf_path)?;
-    xlsx::write_detail(results, raw, file_sha256, options, xlsx_path)?;
-    log::write_run_log(results, raw, options, log_path)?;
+    let layout = build_layout(verification, options);
+    pdf::write_summary_layout(&layout, &verification.sha256, pdf_path)?;
+    xlsx::write_detail_layout(&layout, &verification.sha256, xlsx_path)?;
+    log::write_run_log_locked(
+        &verification.results,
+        verification.hooks.as_ref(),
+        options,
+        log_path,
+    )?;
     Ok(())
 }
 
@@ -68,9 +87,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    /// An answer-key-like run: planted failures (12 deleted rows, 3 duplicate
-    /// rows, one changed balance), a PASSED table, an ignored table with its
-    /// required reason, and run-level warnings / a change-during-check note.
     fn golden_results() -> RunResults {
         let mut tables = BTreeMap::new();
         tables.insert(
@@ -155,11 +171,32 @@ mod tests {
             tool_version: "0.1.0".into(),
             mapping_hash: "mapping-hash-abc123".into(),
             verdict: Verdict::Fail,
-            coverage_line: "3 of 4 tables fully checked, 0 counts only, 1 ignored".into(),
+            coverage_line:
+                "3 of 4 tables fully checked, 0 counts only, 0 structure only, 1 ignored".into(),
             fully_checked: 3,
             counts_only: 0,
             ignored: 1,
+            structure_only: 0,
+            in_scope: 4,
+            structure_findings: vec![dmux_engine::results::StructureFinding {
+                object: "demo_bank.accounts.idx_missing".into(),
+                path: vec!["demo_bank".into(), "accounts".into(), "idx_missing".into()],
+                verdict: Verdict::Fail,
+                message: "index missing in the new database".into(),
+            }],
+            definition_hash: "definition-hash-golden".into(),
             tables,
+            details: std::collections::BTreeMap::from([(
+                "demo_bank.transaction_history".into(),
+                dmux_engine::results::TableDetail {
+                    changed_columns: vec!["amount".into()],
+                    changed_rows: vec![],
+                    missing_keys: None,
+                    extra_keys: None,
+                    control_totals: vec![],
+                    plain_words: vec![],
+                },
+            )]),
             ignored_items: vec![IgnoredItem {
                 path: "demo_bank.archived".into(),
                 reason: "out of scope: not migrated".into(),
@@ -171,7 +208,7 @@ mod tests {
             ],
             wal_start_lsn: Some("0/16B6D40".into()),
             wal_end_lsn: Some("0/16B6E80".into()),
-            results_sha256: String::new(),
+            ..RunResults::default()
         })
     }
 
@@ -194,16 +231,7 @@ mod tests {
         let options = ReportOptions {
             include_keys: false,
         };
-        render_all(
-            &results,
-            &verification.raw,
-            &verification.sha256,
-            &options,
-            &pdf,
-            &xlsx,
-            &log,
-        )
-        .unwrap();
+        render_all(&verification, &options, &pdf, &xlsx, &log).unwrap();
 
         let pdf_bytes = std::fs::read(&pdf).unwrap();
         let xlsx_bytes = std::fs::read(&xlsx).unwrap();
@@ -216,15 +244,50 @@ mod tests {
         assert!(log_text.contains("coverage: 3 of 4 tables fully checked"));
         assert!(log_text.contains("mapping_hash: mapping-hash-abc123"));
         assert!(log_text.contains("warnings: old database is SQL_ASCII"));
+
+        // The typed v2 fields flow into the layout: a structure finding and the
+        // definition hash are rendered into both artefacts.
+        let layout = build_layout(&verification, &options);
+        assert_eq!(layout.structure_findings.len(), 1);
+        assert_eq!(layout.definition_hash, "definition-hash-golden");
+    }
+
+    #[test]
+    fn a_typed_v2_file_round_trips_verification_then_renders() {
+        // Produce the results file exactly as the engine does (finalise stamps
+        // results_sha256 with its own `sha256_of`), write it to disk, re-read and
+        // verify it, then render — the typed v2 fields must survive.
+        let results = golden_results();
+        let dir = temp_dir();
+        let path = dir.join("engine-results.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+
+        let verification = verify::verify_results_file(&path).unwrap();
+        assert_eq!(verification.results.structure_findings.len(), 1);
+        assert_eq!(
+            verification.results.definition_hash,
+            "definition-hash-golden"
+        );
+
+        let options = ReportOptions {
+            include_keys: false,
+        };
+        let layout = build_layout(&verification, &options);
+        assert_eq!(
+            layout.structure_findings[0].message,
+            "index missing in the new database"
+        );
+        assert_eq!(layout.verdict_word, "FAIL");
     }
 
     #[test]
     fn golden_output_is_deterministic() {
         let results = golden_results();
+        let verification = verify::verify_results(&results).unwrap();
         let options = ReportOptions {
             include_keys: false,
         };
-        let layout = layout::build(&results, &options);
+        let layout = build_layout(&verification, &options);
 
         let p1 = pdf::render_bytes(&layout, "abc").unwrap();
         let p2 = pdf::render_bytes(&layout, "abc").unwrap();
@@ -236,8 +299,36 @@ mod tests {
         let x2 = b2.workbook.save_to_buffer().unwrap();
         assert_eq!(x1, x2, "XLSX must be byte-deterministic");
 
-        let l1 = log::text_log(&results, &serde_json::Value::Null, &options);
-        let l2 = log::text_log(&results, &serde_json::Value::Null, &options);
+        let l1 = log::text_log(&results, None, &options);
+        let l2 = log::text_log(&results, None, &options);
         assert_eq!(l1, l2, "log must be deterministic");
+    }
+
+    #[test]
+    fn a_hook_fail_folds_the_displayed_verdict_off_pass() {
+        use crate::verify::HookFinding;
+        let mut results = golden_results();
+        // Force the inner verdict to PASS so only the hook keeps it off PASS.
+        for t in results.tables.values_mut() {
+            t.verdict = Verdict::Pass;
+        }
+        results.verdict = Verdict::Pass;
+        let results = finalise(results);
+        let hooks = HookEvidence {
+            custom_checks: vec![HookFinding {
+                id: "c1".into(),
+                severity: "fail".into(),
+                message: "custom fail".into(),
+                table: None,
+            }],
+            ..Default::default()
+        };
+        let v = Verification {
+            results,
+            sha256: "x".into(),
+            hooks: Some(hooks),
+        };
+        let layout = build_layout(&v, &ReportOptions::default());
+        assert_eq!(layout.verdict_word, "FAIL");
     }
 }

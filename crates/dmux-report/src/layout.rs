@@ -1,35 +1,45 @@
-//! The report layout: a pure, deterministic model built from [`RunResults`].
+//! The report layout: a pure, deterministic model built from the *typed* v2
+//! [`RunResults`] plus optional hook evidence.
 //!
 //! Every piece of text the PDF, Excel and log artefacts emit flows through this
-//! module.  It is the single place a `RunResults` value is joined to prose, and
-//! it renders **summary fields only** — counts, hashes, names, verdicts and
+//! module.  It is the single place a results value is joined to prose, and it
+//! renders **summary fields only** — counts, hashes, names, verdicts and
 //! reasons.  It never renders row values (there are none in `RunResults`), and
-//! it renders keys ([`TableResult::columns_covered`]'s covered-column names)
-//! only when [`ReportOptions::include_keys`] is ticked.
+//! it renders keys (the drill-down's [`ChangedRowExport::key`] and missing/extra
+//! key lists) only when [`ReportOptions::include_keys`] is ticked.
 //!
 //! Building this model in isolation is what makes the leak tests possible: a
 //! test plants sentinel strings into fixture fields, builds a layout, and scans
 //! the resulting PDF/XLSX text for those sentinels.
 
-use crate::v2;
-use dmux_engine::results::{CheckLevel, RunResults, TableResult, Verdict};
+use dmux_engine::results::{CheckLevel, RunResults, TableDetail, TableResult, Verdict};
 
-/// Strip Unicode bidi/format control characters that could be used to spoof or
-/// confuse the reader of a report (PLAN 2.3 "sensitive data in reports", 2.4
-/// "trust and audit").  Table names, reasons, warnings and column names are
-/// untrusted input (mapping files, ignore reasons), so every user-derived string
-/// passes through this before it reaches any artefact.  It never alters ordinary
-/// text; it only drops the invisible/control code points.
+use crate::verify::HookEvidence;
+
+/// Strip Unicode bidi/format control characters and C0/C1 controls that could be
+/// used to spoof or confuse the reader of a report (PLAN 2.3, 2.4).  All
+/// user-derived strings are untrusted input (mapping files, ignore reasons, hook
+/// findings), so every one passes through this before reaching any artefact.
+/// Ordinary text is unchanged; invisible/control code points are dropped.  A
+/// newline inside a field is dropped here too — it is only meaningful as a
+/// deliberate paragraph break in the fixed prose, never inside a name or reason.
 fn sanitize(text: &str) -> String {
-    text.chars().filter(|&c| !is_bidi_control(c)).collect()
+    text.chars().filter(|&c| !is_stripped(c)).collect()
 }
 
-fn is_bidi_control(c: char) -> bool {
+/// A character dropped from untrusted text: C0/C1 controls and invisible
+/// bidi/format code points.
+fn is_stripped(c: char) -> bool {
+    if c.is_control() {
+        return true; // C0 + C1 controls (incl. \n, \t, \r)
+    }
     matches!(
         c,
         '\u{200B}'..='\u{200F}' // zero-width space … right-to-left mark
             | '\u{202A}'..='\u{202E}' // LRE/RLE/PDF/LRO/RLO
-            | '\u{2066}'..='\u{2069}' // LRI/RLI/FSI/PDI
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{206F}' // LRI/RLI/FSI/PDI and control set
+            | '\u{061C}' // Arabic letter mark
             | '\u{FEFF}' // zero-width no-break / BOM
     )
 }
@@ -37,7 +47,7 @@ fn is_bidi_control(c: char) -> bool {
 /// Render options the caller ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReportOptions {
-    /// Include key/covered-column names in the differences detail.  Default
+    /// Include key / covered-column names in the differences detail.  Default
     /// false: keys stay out of reports unless the user explicitly asks
     /// (PLAN.md 2.3, security rule 6).
     pub include_keys: bool,
@@ -82,7 +92,7 @@ fn is_failure(v: Verdict) -> bool {
 }
 
 /// One table's summary section (PDF per-table body; the Tables sheet).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableSummary {
     pub table: String,
     pub level: String,
@@ -99,12 +109,13 @@ pub struct TableSummary {
     /// Covered-column names, ONLY populated when `include_keys` is true.
     pub keys: Vec<String>,
     pub reasons: Vec<String>,
-    /// Drill-down detail (v2): columns that differ, plain-language notes and
+    /// Drill-down detail: columns that differ, plain-language notes and
     /// control-total differences (aggregates, never row data).
     pub changed_columns: Vec<String>,
     pub plain_words: Vec<String>,
     pub control_totals: Vec<String>,
-    /// Key material from the drill-down, ONLY when `include_keys` is true.
+    /// Key material from the drill-down (changed-row keys, missing/extra keys),
+    /// ONLY when `include_keys` is true.
     pub keyed_rows: Vec<String>,
 }
 
@@ -127,8 +138,40 @@ pub struct Difference {
     pub reasons: Vec<String>,
 }
 
-/// The complete layout model.  Everything downstream renders this.
+/// A structure (inventory) finding, rendered verbatim from the typed struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureFindingLine {
+    pub object: String,
+    pub verdict: String,
+    pub message: String,
+}
+
+/// A suggested match, rendered verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestionLine {
+    pub path: String,
+    pub candidate: String,
+    pub confidence: String,
+}
+
+/// A hook finding (custom check), marked as such (PLAN 4.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomCheck {
+    pub id: String,
+    pub severity: String,
+    pub message: String,
+    pub table: Option<String>,
+}
+
+/// A hook script's name + SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookScriptLine {
+    pub script: String,
+    pub sha256: String,
+}
+
+/// The complete layout model.  Everything downstream renders this.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Layout {
     pub results_version: String,
     pub run_id: String,
@@ -140,6 +183,8 @@ pub struct Layout {
     pub fully_checked: usize,
     pub counts_only: usize,
     pub ignored: usize,
+    pub in_scope: usize,
+    pub structure_only: usize,
     pub ignored_items: Vec<Ignored>,
     pub warnings: Vec<String>,
     pub changed_during_check: Vec<String>,
@@ -150,16 +195,13 @@ pub struct Layout {
     /// Differences only (tables with any missing/extra/changed row or a
     /// non-PASS verdict), failures first.
     pub differences: Vec<Difference>,
-    /// v2: total tables in scope and the structure-only tally (also reflected
-    /// in the coverage line the engine writes).
-    pub in_scope: usize,
-    pub structure_only: usize,
-    /// v2: structure (inventory) findings after the mapping is applied.
-    pub structure_findings: Vec<v2::StructureFinding>,
-    /// v2: suggested matches for unmapped tables/columns.
-    pub suggestions: Vec<v2::Suggestion>,
-    /// v2: SHA-256 of the run definition the results came from.
+    pub structure_findings: Vec<StructureFindingLine>,
+    pub suggestions: Vec<SuggestionLine>,
     pub definition_hash: String,
+    /// Hook evidence (present only for an envelope).
+    pub custom_checks: Vec<CustomCheck>,
+    pub hook_scripts: Vec<HookScriptLine>,
+    pub hook_warnings: Vec<String>,
 }
 
 /// Render an optional count as a place-holder-free string.
@@ -171,18 +213,11 @@ fn usize_or_dash(v: Option<usize>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
-/// Build the full layout from a results payload and the render options.  This is
-/// the plain-results form; for the raw JSON (v2 extension fields) use
-/// [`build_from`].
-pub fn build(results: &RunResults, options: &ReportOptions) -> Layout {
-    build_from(results, &serde_json::Value::Null, options)
-}
-
-/// Build the full layout from a results payload, its raw results JSON (for
-/// results-schema v2 extension fields) and the render options.
-pub fn build_from(
+/// Build the full layout from a results payload, optional hook evidence and the
+/// render options.  Everything renders only from the verified typed struct.
+pub fn build(
     results: &RunResults,
-    raw: &serde_json::Value,
+    hooks: Option<&HookEvidence>,
     options: &ReportOptions,
 ) -> Layout {
     let include_keys = options.include_keys;
@@ -202,7 +237,7 @@ pub fn build_from(
         .map(|name| {
             summarise(
                 results.tables.get(*name).expect("present"),
-                raw,
+                results.details.get(*name),
                 include_keys,
             )
         })
@@ -211,9 +246,6 @@ pub fn build_from(
     let mut differences: Vec<Difference> = tables
         .iter()
         .filter(|t| {
-            // A difference row exists when the verdict is a failure/flag OR a
-            // count is recorded.  PASSed/flagged-only tables with no counts do
-            // not produce difference rows.
             let verdict = results.tables[&t.table].verdict;
             let has_counts = results.tables[&t.table]
                 .missing_rows
@@ -235,7 +267,6 @@ pub fn build_from(
         })
         .collect();
 
-    // Failures first within differences too.
     differences.sort_by(|a, b| {
         let va = results.tables[&a.table].verdict;
         let vb = results.tables[&b.table].verdict;
@@ -255,6 +286,8 @@ pub fn build_from(
         fully_checked: results.fully_checked,
         counts_only: results.counts_only,
         ignored: results.ignored,
+        in_scope: results.in_scope,
+        structure_only: results.structure_only,
         ignored_items: results
             .ignored_items
             .iter()
@@ -273,30 +306,77 @@ pub fn build_from(
         wal_end_lsn: results.wal_end_lsn.as_deref().map(sanitize),
         tables,
         differences,
-        in_scope: v2::in_scope(raw),
-        structure_only: v2::structure_only(raw),
-        structure_findings: v2::structure_findings(raw)
-            .into_iter()
-            .map(|f| v2::StructureFinding {
+        structure_findings: results
+            .structure_findings
+            .iter()
+            .map(|f| StructureFindingLine {
                 object: sanitize(&f.object),
-                verdict: sanitize(&f.verdict),
+                verdict: verdict_word(f.verdict).to_string(),
                 message: sanitize(&f.message),
             })
             .collect(),
-        suggestions: v2::suggestions(raw)
-            .into_iter()
-            .map(|s| v2::Suggestion {
+        suggestions: results
+            .suggestions
+            .iter()
+            .map(|s| SuggestionLine {
                 path: sanitize(&s.path),
                 candidate: sanitize(&s.candidate),
-                confidence: sanitize(&s.confidence),
+                confidence: s.confidence.to_string(),
             })
             .collect(),
-        definition_hash: sanitize(&v2::definition_hash(raw)),
+        definition_hash: sanitize(&results.definition_hash),
+        custom_checks: hooks
+            .map(|h| {
+                h.custom_checks
+                    .iter()
+                    .map(|c| CustomCheck {
+                        id: sanitize(&c.id),
+                        severity: sanitize(&c.severity),
+                        message: sanitize(&c.message),
+                        table: c.table.as_deref().map(sanitize),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        hook_scripts: hooks
+            .map(|h| {
+                h.scripts
+                    .iter()
+                    .map(|s| HookScriptLine {
+                        script: sanitize(&s.script),
+                        sha256: sanitize(&s.sha256),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        hook_warnings: hooks
+            .map(|h| h.warnings.iter().map(|w| sanitize(w)).collect())
+            .unwrap_or_default(),
     }
 }
 
-fn summarise(tr: &TableResult, raw: &serde_json::Value, include_keys: bool) -> TableSummary {
-    let detail = v2::detail_for(raw, &tr.table, include_keys).unwrap_or_default();
+fn summarise(tr: &TableResult, detail: Option<&TableDetail>, include_keys: bool) -> TableSummary {
+    let mut keyed_rows = Vec::new();
+    if include_keys {
+        if let Some(d) = detail {
+            for row in &d.changed_rows {
+                if let Some(key) = &row.key {
+                    keyed_rows.push(format_key(key));
+                }
+            }
+            if let Some(missing) = &d.missing_keys {
+                for k in missing {
+                    keyed_rows.push(format!("missing {}", format_key(k)));
+                }
+            }
+            if let Some(extra) = &d.extra_keys {
+                for k in extra {
+                    keyed_rows.push(format!("extra {}", format_key(k)));
+                }
+            }
+        }
+    }
+
     TableSummary {
         table: sanitize(&tr.table),
         level: level_word(tr.level).to_string(),
@@ -321,11 +401,36 @@ fn summarise(tr: &TableResult, raw: &serde_json::Value, include_keys: bool) -> T
             Vec::new()
         },
         reasons: tr.reasons.iter().map(|r| sanitize(r)).collect(),
-        changed_columns: detail.changed_columns.iter().map(|c| sanitize(c)).collect(),
-        plain_words: detail.plain_words.iter().map(|w| sanitize(w)).collect(),
-        control_totals: detail.control_totals.iter().map(|c| sanitize(c)).collect(),
-        keyed_rows: detail.keyed_rows.iter().map(|k| sanitize(k)).collect(),
+        changed_columns: detail
+            .map(|d| d.changed_columns.iter().map(|c| sanitize(c)).collect())
+            .unwrap_or_default(),
+        plain_words: detail
+            .map(|d| d.plain_words.iter().map(|w| sanitize(w)).collect())
+            .unwrap_or_default(),
+        control_totals: detail
+            .map(|d| {
+                d.control_totals
+                    .iter()
+                    .map(|ct| {
+                        format!(
+                            "{}: {} -> {}",
+                            sanitize(&ct.column),
+                            sanitize(&ct.old),
+                            sanitize(&ct.new)
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        keyed_rows,
     }
+}
+
+fn format_key(key: &[Option<String>]) -> String {
+    key.iter()
+        .map(|k| k.as_deref().map(sanitize).unwrap_or_else(|| "NULL".into()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The plan-mandated fixed prose (PLAN.md 1, 2.4; decision 10).
@@ -367,7 +472,8 @@ pub fn sign_off_block() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use dmux_engine::results::{
-        CheckLevel, IgnoredItem, RunResults, TableResult, Verdict, RESULTS_VERSION,
+        CheckLevel, CheckLevel::FullValues, IgnoredItem, RunResults, StructureFinding, TableResult,
+        Verdict, RESULTS_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -395,15 +501,11 @@ mod tests {
         let mut tables = BTreeMap::new();
         tables.insert(
             "demo_bank.accounts".into(),
-            table("demo_bank.accounts", verdict, CheckLevel::FullValues),
+            table("demo_bank.accounts", verdict, FullValues),
         );
         tables.insert(
             "demo_bank.transactions".into(),
-            table(
-                "demo_bank.transactions",
-                Verdict::Fail,
-                CheckLevel::FullValues,
-            ),
+            table("demo_bank.transactions", Verdict::Fail, FullValues),
         );
         RunResults {
             results_version: RESULTS_VERSION,
@@ -411,7 +513,8 @@ mod tests {
             tool_version: "0.1.0".into(),
             mapping_hash: "mh-123".into(),
             verdict,
-            coverage_line: "1 of 2 tables fully checked, 0 counts only, 1 ignored".into(),
+            coverage_line:
+                "1 of 2 tables fully checked, 0 counts only, 0 structure only, 1 ignored".into(),
             fully_checked: 1,
             counts_only: 0,
             ignored: 1,
@@ -422,15 +525,13 @@ mod tests {
             }],
             changed_during_check: vec![],
             warnings: vec!["old database is SQL_ASCII".into()],
-            wal_start_lsn: None,
-            wal_end_lsn: None,
-            results_sha256: "abc".into(),
+            ..RunResults::default()
         }
     }
 
     #[test]
     fn verdict_and_coverage_and_ignored_are_present() {
-        let layout = build(&fixture(Verdict::Fail), &ReportOptions::default());
+        let layout = build(&fixture(Verdict::Fail), None, &ReportOptions::default());
         assert_eq!(layout.verdict_word, "FAIL");
         assert!(layout.coverage_line.contains("1 of 2"));
         assert_eq!(layout.ignored_items.len(), 1);
@@ -440,20 +541,20 @@ mod tests {
 
     #[test]
     fn failures_come_first() {
-        let layout = build(&fixture(Verdict::Pass), &ReportOptions::default());
-        // transactions is FAIL, accounts is PASS; failures precede.
+        let layout = build(&fixture(Verdict::Pass), None, &ReportOptions::default());
         assert_eq!(layout.tables[0].table, "demo_bank.transactions");
         assert_eq!(layout.tables[1].table, "demo_bank.accounts");
     }
 
     #[test]
     fn keys_are_absent_by_default_and_present_when_ticked() {
-        let layout = build(&fixture(Verdict::Fail), &ReportOptions::default());
+        let layout = build(&fixture(Verdict::Fail), None, &ReportOptions::default());
         assert!(layout.tables.iter().all(|t| t.keys.is_empty()));
         assert!(layout.differences.iter().all(|d| d.keys.is_empty()));
 
         let layout = build(
             &fixture(Verdict::Fail),
+            None,
             &ReportOptions { include_keys: true },
         );
         assert!(layout.tables.iter().any(|t| !t.keys.is_empty()));
@@ -461,18 +562,51 @@ mod tests {
     }
 
     #[test]
+    fn drilldown_keys_are_gated_on_include_keys() {
+        // Plant sentinels in the drill-down key fields (the fields that must
+        // never be printed without --include-keys).
+        let mut r = fixture(Verdict::Fail);
+        r.details.insert(
+            "demo_bank.transactions".into(),
+            dmux_engine::results::TableDetail {
+                changed_columns: vec!["amount".into()],
+                changed_rows: vec![dmux_engine::results::ChangedRowExport {
+                    key: Some(vec![Some(SENTINEL_VALUE.into())]),
+                    columns: vec!["amount".into()],
+                }],
+                missing_keys: Some(vec![vec![Some("MISSING-KEY-1".into())]]),
+                extra_keys: Some(vec![vec![Some("EXTRA-KEY-2".into())]]),
+                control_totals: vec![],
+                plain_words: vec!["an amount changed".into()],
+            },
+        );
+
+        let no_keys = build(&r, None, &ReportOptions::default());
+        let t = no_keys
+            .tables
+            .iter()
+            .find(|t| t.table == "demo_bank.transactions")
+            .unwrap();
+        assert!(t.keyed_rows.is_empty(), "keys must be absent by default");
+
+        let with_keys = build(&r, None, &ReportOptions { include_keys: true });
+        let t = with_keys
+            .tables
+            .iter()
+            .find(|t| t.table == "demo_bank.transactions")
+            .unwrap();
+        assert!(!t.keyed_rows.is_empty());
+        let joined = t.keyed_rows.join(" ");
+        assert!(joined.contains(SENTINEL_VALUE), "key present when ticked");
+        assert!(joined.contains("EXTRA-KEY-2"));
+    }
+
+    #[test]
     fn sentinel_row_values_stay_out_of_the_layout() {
-        // Plant a sentinel where a row value would live: the covered-column
-        // list (the only "key-like" namespace in the schema).  With include_keys
-        // off it must not surface anywhere in the layout's rendered text; with
-        // include_keys on it appears (that is the flip side the renderer tests).
         let results = fixture(Verdict::Fail);
-        // Simulate a row-value sentinel by overriding a reason string that a
-        // buggy renderer might join verbatim.
-        let layout = build(&results, &ReportOptions::default());
+        let layout = build(&results, None, &ReportOptions::default());
         let flat = format!("{:?}", (layout.tables.clone(), layout.differences.clone()));
         assert!(!flat.contains(SENTINEL_VALUE));
-        // Sanity: the sentinel genuinely is not part of the fixture either.
         assert!(!serde_json::to_string(&results)
             .unwrap()
             .contains(SENTINEL_VALUE));
@@ -480,15 +614,15 @@ mod tests {
 
     #[test]
     fn bidi_and_format_controls_are_stripped() {
-        // A reason with a right-to-left override and a zero-width no-break space
-        // is reduced to its visible characters: spoofing is impossible.
+        // A reason with a right-to-left override, an Arabic letter mark and a
+        // zero-width no-break space is reduced to its visible characters.
         let mut results = fixture(Verdict::Fail);
         results
             .tables
             .get_mut("demo_bank.transactions")
             .unwrap()
-            .reasons = vec!["\u{202E}evil\u{FEFF} text".to_string()];
-        let layout = build(&results, &ReportOptions::default());
+            .reasons = vec!["\u{202E}evil\u{061C}\u{FEFF} text".to_string()];
+        let layout = build(&results, None, &ReportOptions::default());
         let reason = &layout
             .tables
             .iter()
@@ -497,7 +631,75 @@ mod tests {
             .reasons[0];
         assert_eq!(reason, "evil text");
         assert!(!reason.contains('\u{202E}'));
+        assert!(!reason.contains('\u{061C}'));
         assert!(!reason.contains('\u{FEFF}'));
+    }
+
+    #[test]
+    fn extra_format_and_bidi_ranges_are_stripped() {
+        // U+061C, U+2060–U+2064, U+206A–U+206F, plus C0/C1, must all be dropped.
+        let mut results = fixture(Verdict::Fail);
+        results
+            .tables
+            .get_mut("demo_bank.transactions")
+            .unwrap()
+            .reasons = vec!["a\u{061C}\u{2060}\u{2064}\u{206A}\u{206F}\u{0000}b".to_string()];
+        let layout = build(&results, None, &ReportOptions::default());
+        let reason = &layout
+            .tables
+            .iter()
+            .find(|t| t.table == "demo_bank.transactions")
+            .unwrap()
+            .reasons[0];
+        assert_eq!(reason, "ab");
+        for c in [
+            '\u{061C}', '\u{2060}', '\u{2064}', '\u{206A}', '\u{206F}', '\u{0000}',
+        ] {
+            assert!(!reason.contains(c), "must strip {c:?}");
+        }
+    }
+
+    #[test]
+    fn c0_and_c1_controls_are_stripped() {
+        let mut results = fixture(Verdict::Fail);
+        results
+            .tables
+            .get_mut("demo_bank.transactions")
+            .unwrap()
+            .reasons = vec![format!("tab{}\u{000B}ret\r\nend", '\t')];
+        let layout = build(&results, None, &ReportOptions::default());
+        let reason = &layout
+            .tables
+            .iter()
+            .find(|t| t.table == "demo_bank.transactions")
+            .unwrap()
+            .reasons[0];
+        assert!(!reason.contains('\t'));
+        assert!(!reason.contains('\u{000B}'));
+        assert!(!reason.contains('\r'));
+        assert!(!reason.contains('\n'));
+    }
+
+    #[test]
+    fn hook_findings_flow_into_the_layout() {
+        use crate::verify::{HookEvidence, HookFinding};
+        let hooks = HookEvidence {
+            custom_checks: vec![HookFinding {
+                id: "c1".into(),
+                severity: "fail".into(),
+                message: "custom finding".into(),
+                table: Some("s.t".into()),
+            }],
+            ..Default::default()
+        };
+        let layout = build(
+            &fixture(Verdict::Pass),
+            Some(&hooks),
+            &ReportOptions::default(),
+        );
+        assert_eq!(layout.custom_checks.len(), 1);
+        assert_eq!(layout.custom_checks[0].severity, "fail");
+        assert_eq!(layout.custom_checks[0].message, "custom finding");
     }
 
     #[test]
@@ -514,54 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_fields_flow_into_the_layout() {
-        // A results object with v2 extensions: structure findings, a definition
-        // hash, and drill-down detail whose keys are gated on include_keys.
-        let raw = serde_json::json!({
-            "in_scope": 12,
-            "structure_only": 3,
-            "definition_hash": "defhash",
-            "structure_findings": [
-                { "object": "a.t.idx", "verdict": "FAIL", "message": "missing index" }
-            ],
-            "suggestions": [
-                { "path": "a.old", "candidate": "a.new", "confidence": 80 }
-            ],
-            "details": {
-                "demo_bank.accounts": {
-                    "changed_columns": ["balance"],
-                    "plain_words": ["a balance changed"],
-                    "control_totals": [{"column":"balance","old":"1","new":"2"}],
-                    "changed_rows": [{"key":["123"]}]
-                }
-            }
-        });
-
-        let layout = build_from(&fixture(Verdict::Fail), &raw, &ReportOptions::default());
-        assert_eq!(layout.in_scope, 12);
-        assert_eq!(layout.structure_only, 3);
-        assert_eq!(layout.definition_hash, "defhash");
+    fn structure_findings_flow_in_typed() {
+        let mut r = fixture(Verdict::Fail);
+        r.structure_findings = vec![StructureFinding {
+            object: "a.t.idx".into(),
+            path: vec!["a".into(), "t".into(), "idx".into()],
+            verdict: Verdict::Fail,
+            message: "missing index".into(),
+        }];
+        let layout = build(&r, None, &ReportOptions::default());
         assert_eq!(layout.structure_findings.len(), 1);
-        assert_eq!(layout.suggestions.len(), 1);
-
-        let acct = layout
-            .tables
-            .iter()
-            .find(|t| t.table == "demo_bank.accounts")
-            .unwrap();
-        assert_eq!(acct.changed_columns, vec!["balance".to_string()]);
-        assert!(acct.keyed_rows.is_empty(), "keys gated off by default");
-
-        let with_keys = build_from(
-            &fixture(Verdict::Fail),
-            &raw,
-            &ReportOptions { include_keys: true },
-        );
-        let acct = with_keys
-            .tables
-            .iter()
-            .find(|t| t.table == "demo_bank.accounts")
-            .unwrap();
-        assert!(!acct.keyed_rows.is_empty(), "keys present when ticked");
+        assert_eq!(layout.structure_findings[0].message, "missing index");
+        assert_eq!(layout.structure_findings[0].verdict, "FAIL");
     }
 }

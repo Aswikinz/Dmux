@@ -1,17 +1,23 @@
 import { browser, $, expect } from '@wdio/globals';
 
-// The one Phase 0 smoke test: the real built app opens and shows the
-// placeholder screen. Linux drives WebKitGTK through WebKitWebDriver under
-// Xvfb; Windows drives WebView2 through an auto-managed msedgedriver.
+// The one smoke test: the real built app opens and shows the shipped shell.
+// It checks rendered content, not just that a window appeared, so a broken
+// bundle or a missing embedded asset fails CI. Linux drives WebKitGTK through
+// WebKitWebDriver under Xvfb; Windows drives WebView2 through an auto-managed
+// msedgedriver.
 describe('Dmux smoke test', () => {
-  it('shows the placeholder screen in the Dmux window', async () => {
+  it('shows the app shell and the Connect screen in the Dmux window', async () => {
     await expect(browser).toHaveTitle('Dmux');
 
-    const heading = await $('h1');
+    const main = await $('main');
+    await expect(main).toBeDisplayed();
+
+    const heading = await $('//main//h2[normalize-space(.)="Connect"]');
     await expect(heading).toBeDisplayed();
-    await expect(heading).toHaveText('Dmux — migration verification');
 
     const body = await $('body');
-    await expect(body).toHaveText(expect.stringContaining('Phase 0 skeleton'));
+    // The section label is uppercased by CSS, and WebDriver returns the
+    // rendered (uppercase) text, so match case-insensitively.
+    await expect(body).toHaveText(expect.stringMatching(/old database/i));
   });
 });

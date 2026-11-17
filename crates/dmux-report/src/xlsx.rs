@@ -45,12 +45,23 @@ pub struct BuiltWorkbook {
 /// to `<stem>_<sheet>.csv` next to it.
 pub fn write_detail(
     results: &RunResults,
-    raw: &serde_json::Value,
+    hooks: Option<&crate::verify::HookEvidence>,
     results_sha256: &str,
     options: &ReportOptions,
     path: &Path,
 ) -> Result<(), XlsxError> {
-    let mut layout = layout::build_from(results, raw, options);
+    let layout = layout::build(results, hooks, options);
+    write_detail_layout(&layout, results_sha256, path)
+}
+
+/// Write a pre-built layout to disk (used by the shared `render_all` path so the
+/// displayed-verdict fold happens once, in the caller).
+pub fn write_detail_layout(
+    layout: &Layout,
+    results_sha256: &str,
+    path: &Path,
+) -> Result<(), XlsxError> {
+    let mut layout = layout.clone();
     // The Summary sheet's "Results SHA-256" is the verified file digest (for an
     // envelope this is the envelope digest, not the nested results' own hash).
     layout.results_sha256 = results_sha256.to_string();
@@ -79,7 +90,8 @@ fn csv_path_for(xlsx_path: &Path, sheet: &str) -> std::path::PathBuf {
 
 fn write_csv(path: &std::path::Path, overflow: &Overflow) -> Result<(), XlsxError> {
     let mut csv = String::new();
-    csv.push_str(&overflow.header.join(","));
+    let header: Vec<String> = overflow.header.iter().map(|c| csv_escape_cell(c)).collect();
+    csv.push_str(&header.join(","));
     csv.push('\n');
     for row in &overflow.rows {
         let escaped: Vec<String> = row.iter().map(|c| csv_escape_cell(c)).collect();
@@ -90,19 +102,26 @@ fn write_csv(path: &std::path::Path, overflow: &Overflow) -> Result<(), XlsxErro
     Ok(())
 }
 
-/// Defuse CSV formula injection (PLAN 2.3): a cell that begins with `=`, `+`,
-/// `-`, `@`, a tab or a carriage return would be read back as a formula/command
-/// by a spreadsheet, so it is prefixed with a single quote, forcing it to be
-/// treated as literal text.  Header cells are not escaped (the header is fixed).
+/// Escape a cell for CSV: quote per RFC 4180 (wrap in double quotes when the
+/// value contains a comma, double quote, newline or carriage return, doubling any
+/// inner quote), THEN apply the spreadsheet formula-injection prefix (a `'`
+/// before a leading `=`, `+`, `-`, `@`, tab or CR) so a spreadsheet reads it as
+/// text, never a formula (PLAN 2.3).
 fn csv_escape_cell(cell: &str) -> String {
+    let quoted =
+        if cell.contains(',') || cell.contains('"') || cell.contains('\n') || cell.contains('\r') {
+            format!("\"{}\"", cell.replace('"', "\"\""))
+        } else {
+            cell.to_string()
+        };
     if cell
         .chars()
         .next()
         .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'))
     {
-        format!("'{cell}")
+        format!("'{quoted}")
     } else {
-        cell.to_string()
+        quoted
     }
 }
 
@@ -259,6 +278,44 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
             "Structure Findings",
             &mut overflow,
         )?;
+    }
+
+    // --- Custom Checks sheet (hook findings, PLAN 4.9: marked as such) ---
+    {
+        let custom = workbook.add_worksheet();
+        custom.set_name("Custom Checks")?;
+        let custom_rows: Vec<Vec<String>> = layout
+            .custom_checks
+            .iter()
+            .map(|c| {
+                vec![
+                    c.id.clone(),
+                    c.severity.clone(),
+                    c.table.clone().unwrap_or_default(),
+                    c.message.clone(),
+                ]
+            })
+            .collect();
+        write_sheet(
+            custom,
+            &[
+                "ID".to_string(),
+                "Severity".to_string(),
+                "Table".to_string(),
+                "Message".to_string(),
+            ],
+            &custom_rows,
+            row_limit,
+            "Custom Checks",
+            &mut overflow,
+        )?;
+
+        // Script hashes also go here, one row per script.
+        for (i, s) in layout.hook_scripts.iter().enumerate() {
+            custom.write_string((1 + custom_rows.len() + 2 + i) as u32, 0, "script")?;
+            custom.write_string((1 + custom_rows.len() + 2 + i) as u32, 1, &s.script)?;
+            custom.write_string((1 + custom_rows.len() + 2 + i) as u32, 2, &s.sha256)?;
+        }
     }
 
     // --- Ignored sheet ---
@@ -469,6 +526,9 @@ mod tests {
             structure_findings: vec![],
             suggestions: vec![],
             definition_hash: String::new(),
+            custom_checks: vec![],
+            hook_scripts: vec![],
+            hook_warnings: vec![],
         }
     }
 
@@ -560,6 +620,90 @@ mod tests {
     }
 
     #[test]
+    fn csv_quotes_per_rfc4180_and_then_prefixes_formula() {
+        // Comma, quote, newline and CR force RFC-4180 double-quoting; a leading
+        // `=` still gets the formula prefix AFTER quoting.
+        assert_eq!(csv_escape_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_escape_cell("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_escape_cell("x\r\ny"), "\"x\r\ny\"");
+        assert_eq!(csv_escape_cell("=a,b"), "'\"=a,b\"");
+        assert_eq!(csv_escape_cell("=1+1,2"), "'\"=1+1,2\"");
+    }
+
+    #[test]
+    fn workbook_omits_drilldown_keys_at_rendered_level() {
+        // A full build through `build` (typed) with drill-down key sentinels:
+        // absent without --include-keys, present with.
+        use dmux_engine::results::{
+            ChangedRowExport, RunResults, TableDetail, Verdict, RESULTS_VERSION,
+        };
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert(
+            "demo_bank.accounts".into(),
+            dmux_engine::results::TableResult {
+                table: "demo_bank.accounts".into(),
+                level: dmux_engine::results::CheckLevel::FullValues,
+                verdict: Verdict::Fail,
+                old_rows: Some(10),
+                new_rows: Some(9),
+                columns_covered: Some(vec!["id".into()]),
+                differing_buckets: Some(1),
+                missing_buckets: Some(0),
+                extra_buckets: Some(0),
+                missing_rows: Some(0),
+                extra_rows: Some(0),
+                changed_rows: Some(1),
+                reasons: vec![],
+            },
+        );
+        let mut details = std::collections::BTreeMap::new();
+        details.insert(
+            "demo_bank.accounts".into(),
+            TableDetail {
+                changed_columns: vec!["balance".into()],
+                changed_rows: vec![ChangedRowExport {
+                    key: Some(vec![Some(SENTINEL.into())]),
+                    columns: vec!["balance".into()],
+                }],
+                missing_keys: None,
+                extra_keys: None,
+                control_totals: vec![],
+                plain_words: vec![],
+            },
+        );
+        let results = RunResults {
+            results_version: RESULTS_VERSION,
+            run_id: "r".into(),
+            tool_version: "v".into(),
+            mapping_hash: "h".into(),
+            verdict: Verdict::Fail,
+            coverage_line:
+                "0 of 1 tables fully checked, 0 counts only, 0 structure only, 0 ignored".into(),
+            fully_checked: 0,
+            counts_only: 0,
+            ignored: 0,
+            tables,
+            details,
+            ..RunResults::default()
+        };
+
+        let no_keys = build(&results, None, &ReportOptions::default());
+        let no_keys_xml = shared_strings(&workbook_bytes(&no_keys)).unwrap();
+        assert!(
+            !no_keys_xml.contains(SENTINEL),
+            "drill-down key leaked without --include-keys"
+        );
+
+        let with_keys = build(&results, None, &ReportOptions { include_keys: true });
+        let with_keys_xml = shared_strings(&workbook_bytes(&with_keys)).unwrap();
+        assert!(
+            with_keys_xml.contains(SENTINEL),
+            "drill-down key should be present with --include-keys"
+        );
+    }
+
+    #[test]
     fn bidi_control_chars_are_stripped_by_the_layout() {
         // The layout builder is the sanitisation boundary; a reason carrying a
         // right-to-left override is dropped before any renderer sees it.
@@ -597,11 +741,9 @@ mod tests {
             ignored_items: vec![],
             changed_during_check: vec![],
             warnings: vec![],
-            wal_start_lsn: None,
-            wal_end_lsn: None,
-            results_sha256: String::new(),
+            ..RunResults::default()
         };
-        let layout = build(&results, &ReportOptions::default());
+        let layout = build(&results, None, &ReportOptions::default());
         assert!(
             layout.tables[0].reasons[0].contains("looks benign"),
             "reason preserved"

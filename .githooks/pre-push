@@ -15,6 +15,11 @@ if ! (cd "$ROOT" && DMUX_PRIVATE_PATTERNS="$RAW" bash scripts/check-public-clean
   echo "push refused: a tracked file matches a private-name pattern; run scripts/check-public-clean.sh" >&2
   exit 1
 fi
+# Fast hygiene gate that CI enforces too: catch it here, not after a red run.
+if ! (cd "$ROOT" && bash scripts/check-eof.sh >/dev/null); then
+  echo "push refused: a tracked text file lacks a final newline; run scripts/check-eof.sh" >&2
+  exit 1
+fi
 ZERO="0000000000000000000000000000000000000000"
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [[ "$local_sha" == "$ZERO" ]] && continue

@@ -1,150 +1,167 @@
 //! `dmux capture`: save one database's fingerprints to a file (PLAN.md 3.3).
 //!
 //! The capture is a [`FingerprintFile`]: versioned, hashed, untrusted-input
-//! parsed.  The mapping must be fixed at capture time (an in-place upgrade keeps
-//! every name, so the identity mapping works).
+//! parsed.  It records each table's full plan (columns sorted by name, resolved
+//! types, options, key and control-total columns, bucket width) so a later
+//! comparison scans the other side with exactly the same plan.  The mapping is
+//! fixed at capture time (its hash is recorded); an in-place upgrade keeps
+//! every name, so the identity mapping works.  The file also carries the
+//! database's full structural inventory (PLAN.md 3.3).
+//!
+//! Levels: FullValues stores bucket summaries; CountsAndTotals stores the row
+//! count and control totals only.  Structure is refused: a fingerprint file
+//! holds data summaries, and structure is compared live (`dmux run`) or from
+//! inventories (`dmux diff`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::fingerprint::{fingerprint, Side, Source, TablePlan};
+use crate::core::fingerprint::{Side, Source};
+use crate::core::normalise::{plan_column, ColumnOptions};
 use crate::db::{probe_server, ConnProfile, ReadOnlySession};
 use crate::fingerprint_file::{
     CapturedServer, CapturedTable, FingerprintFile, FINGERPRINT_VERSION,
 };
 use crate::mapping::Mapping;
-use crate::plan::{build_table_spec, read_live_table, row_estimate, TableSpec};
+use crate::plan::{build_table_spec, core_table_plan, SpecInputs};
 use crate::results::CheckLevel;
 
-use super::{list_tables, map_table, RunError};
+use super::{inventory, live_table, scan_counts, scan_fingerprint, RunError};
 
-/// Capture one database's fingerprints for every in-scope table.
-///
-/// `profile` is the live database, `level` the check level for every table,
-/// `control_total_columns` the control-total columns, `mapping` the (identity)
-/// mapping, and `allow_superuser` the superuser override.
+/// What to capture.
+#[derive(Debug, Clone)]
+pub struct CaptureOptions<'a> {
+    pub level: CheckLevel,
+    pub control_total_columns: &'a BTreeSet<String>,
+    /// Per-column options, by `schema.table.column`.
+    pub column_options: &'a BTreeMap<String, ColumnOptions>,
+    pub mapping: &'a Mapping,
+    pub allow_superuser: bool,
+}
+
+/// Capture one database's fingerprints for every in-scope table.  A table
+/// that cannot be planned or scanned stops the capture with an error naming
+/// it: a capture never silently leaves a table out.
 pub async fn capture(
     profile: &ConnProfile,
-    level: CheckLevel,
-    control_total_columns: &BTreeSet<String>,
-    mapping: &Mapping,
-    allow_superuser: bool,
+    opts: &CaptureOptions<'_>,
 ) -> Result<FingerprintFile, RunError> {
-    let info = probe_server(profile, allow_superuser).await?;
-    let mut session = ReadOnlySession::open(profile, allow_superuser).await?;
-    let tables = list_tables(&mut session).await?;
+    if opts.level == CheckLevel::Structure {
+        return Err(RunError::Config(
+            "a fingerprint file holds data summaries; use `dmux run` or `dmux diff` for structure"
+                .into(),
+        ));
+    }
+    let info = probe_server(profile, opts.allow_superuser).await?;
+    let mut session = ReadOnlySession::open(profile, opts.allow_superuser).await?;
+    let inv = inventory(&mut session).await?;
+    let ignored_tables: BTreeSet<&str> = opts
+        .mapping
+        .ignored
+        .iter()
+        .filter(|i| i.path.matches('.').count() == 1)
+        .map(|i| i.path.as_str())
+        .collect();
 
-    // The identity mapping: every table maps to itself.  Rename rules still
-    // apply so a documented rename is honoured at capture time.
-    let mut captured_tables: Vec<CapturedTable> = Vec::with_capacity(tables.len());
-
-    for (schema, table) in &tables {
-        let (new_schema, new_name) = map_table(mapping, schema, table);
-
-        let live = session
-            .with_read_only("5s", |to| {
-                Box::pin(async move {
-                    read_live_table(&*to, schema, table)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(super::run_err)
-                })
-            })
-            .await?;
-        let estimate = session
-            .with_read_only("5s", |to| {
-                Box::pin(async move {
-                    row_estimate(&*to, schema, table)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(super::run_err)
-                })
-            })
-            .await?;
-
-        let spec: TableSpec = build_table_spec(
-            &live,
-            &live,
-            &new_schema,
-            &new_name,
-            level,
-            mapping,
-            control_total_columns,
-            estimate,
-        );
-
-        // A capture records the plan even for tables whose coverage is
-        // incomplete, so compare can report them below PASS; but the fingerprint
-        // itself still needs the mapped columns only.
-        let key = spec.key.clone();
-        let bucket_digits = spec.bucket_digits;
-
-        // Build column plans explicitly so a normalisation error maps to
-        // CoreError (and thus RunError) rather than leaking a NormaliseError.
-        let mut col_plans = Vec::with_capacity(spec.columns.len());
-        for m in &spec.columns {
-            col_plans.push(crate::core::normalise::plan_column(m).map_err(RunError::from)?);
-        }
-
-        let plan = if col_plans.is_empty() {
-            // A table with no mapped columns cannot be fingerprinted; still
-            // record it as an empty-keyless placeholder so compare flags it.
-            None
-        } else {
-            Some(TablePlan::new(col_plans, key, bucket_digits)?)
-        };
-
-        let (rows, buckets, control_totals, needs_review, keyed, bucket_digits) = match plan {
-            Some(p) => {
-                let src = Source::Table {
-                    schema: schema.clone(),
-                    name: table.clone(),
-                };
-                let mh = mapping.mapping_hash.clone();
-                let fp = session
-                    .with_read_only("300s", |to| {
-                        Box::pin(async move {
-                            fingerprint(&*to, &p, Side::Old, &src, &mh)
-                                .await
-                                .map_err(RunError::from)
-                                .map_err(super::run_err)
-                        })
-                    })
-                    .await?;
-                (
-                    fp.rows,
-                    fp.buckets,
-                    fp.control_totals,
-                    fp.needs_review,
-                    fp.keyed,
-                    fp.bucket_digits,
-                )
+    let mut captured = Vec::new();
+    for s in &inv.schemas {
+        for t in &s.tables {
+            let path = format!("{}.{}", s.name, t.name);
+            if ignored_tables.contains(path.as_str()) {
+                continue;
             }
-            None => (0u64, Vec::new(), Vec::new(), true, false, bucket_digits),
-        };
-
-        captured_tables.push(CapturedTable {
-            old_qualified: format!("{schema}.{table}"),
-            level,
-            keyed,
-            bucket_digits,
-            columns: spec.columns_covered(),
-            key_columns: spec
-                .key
+            let fail = |why: String| RunError::Config(format!("cannot capture {path}: {why}"));
+            let live = live_table(&mut session, &s.name, &t.name)
+                .await
+                .map_err(fail)?
+                .ok_or_else(|| fail("the table disappeared during the capture".into()))?;
+            let spec = build_table_spec(
+                &live,
+                &live,
+                SpecInputs {
+                    new_schema: &s.name,
+                    new_name: &t.name,
+                    level: opts.level,
+                    mapping: opts.mapping,
+                    control_total_columns: opts.control_total_columns,
+                    column_options: opts.column_options,
+                    estimated_rows: t.n_live_tup.max(0) as u64,
+                },
+            );
+            if spec.columns.is_empty() {
+                return Err(fail("no column to capture".into()));
+            }
+            let mut plans = Vec::with_capacity(spec.columns.len());
+            for m in &spec.columns {
+                plans.push(plan_column(m).map_err(|e| fail(e.to_string()))?);
+            }
+            let control_columns: Vec<String> = spec
+                .columns
                 .iter()
-                .map(|i| spec.columns[*i].old_name.clone())
-                .collect(),
-            column_types: spec.columns.iter().map(|c| c.old_type.clone()).collect(),
-            rows,
-            buckets,
-            control_totals,
-            needs_review,
-        });
+                .zip(plans.iter())
+                .filter(|(_, p)| p.old_control.is_some())
+                .map(|(m, _)| m.old_name.clone())
+                .collect();
+
+            let (rows, buckets, control_totals, needs_review, bucket_digits) = match opts.level {
+                CheckLevel::CountsAndTotals => {
+                    let controls: Vec<String> =
+                        plans.iter().filter_map(|p| p.old_control.clone()).collect();
+                    let (rows, totals) = scan_counts(&mut session, &s.name, &t.name, &controls)
+                        .await
+                        .map_err(fail)?;
+                    (rows, Vec::new(), totals, false, spec.bucket_digits)
+                }
+                _ => {
+                    let plan = core_table_plan(&spec).map_err(|e| fail(e.to_string()))?;
+                    let src = Source::Table {
+                        schema: s.name.clone(),
+                        name: t.name.clone(),
+                    };
+                    let fp = scan_fingerprint(
+                        &mut session,
+                        &plan,
+                        Side::Old,
+                        &src,
+                        &opts.mapping.mapping_hash,
+                    )
+                    .await
+                    .map_err(fail)?;
+                    (
+                        fp.rows,
+                        fp.buckets,
+                        fp.control_totals,
+                        fp.needs_review,
+                        fp.bucket_digits,
+                    )
+                }
+            };
+
+            captured.push(CapturedTable {
+                old_qualified: path,
+                level: opts.level,
+                keyed: spec.is_keyed(),
+                bucket_digits,
+                columns: spec.columns_covered(),
+                key_columns: spec
+                    .key
+                    .iter()
+                    .map(|i| spec.columns[*i].old_name.clone())
+                    .collect(),
+                column_types: spec.columns.iter().map(|c| c.old_type.clone()).collect(),
+                options: spec.columns.iter().map(|c| c.options.clone()).collect(),
+                control_columns,
+                rows,
+                buckets,
+                control_totals,
+                needs_review,
+            });
+        }
     }
 
-    Ok(FingerprintFile {
+    let file = FingerprintFile {
         format_version: FINGERPRINT_VERSION,
         tool_version: crate::version().to_string(),
-        mapping_hash: mapping.mapping_hash.clone(),
+        mapping_hash: opts.mapping.mapping_hash.clone(),
         server: CapturedServer {
             version_num: info.version_num,
             version_string: info.version_string,
@@ -152,7 +169,14 @@ pub async fn capture(
             collation: info.collation,
             sql_ascii: info.sql_ascii,
         },
-        tables: captured_tables,
+        tables: captured,
+        // The full structure, so a saved-file comparison checks indexes,
+        // constraints, sequences and large objects like a live run.
+        inventory: Some(Box::new(inv)),
         sha256: String::new(),
-    })
+    };
+    // A capture must itself be a valid file before anyone relies on it.
+    file.validate()
+        .map_err(|e| RunError::Config(format!("the capture is not consistent: {e}")))?;
+    Ok(file)
 }

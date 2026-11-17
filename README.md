@@ -103,4 +103,6 @@ scripts/              worktree helpers and CI checks
 
 ## Licence
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See `LICENSE`. Third-party components (notably the embedded
+Liberation fonts) are listed with their licences in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

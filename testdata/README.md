@@ -155,11 +155,15 @@ into the LATIN1 old database and the UTF-8 new one. The data set mixes NULLs, em
 strings and trailing spaces on purpose.
 
 ```
-testdata/demo_bank/build.sh                 # old 9.6 (:5433) -> new 17 (:5434), planted
-testdata/demo_bank/build.sh --no-plant      # identical data on both sides (verify.sh's build)
-testdata/demo_bank/build.sh 5435 5437       # old 9.4 -> new 18, other local ports
+testdata/demo_bank/build.sh                 # small: old 9.6 (:5433) -> new 17 (:5434), planted
+testdata/demo_bank/build.sh --no-plant      # small: identical data on both sides (verify.sh's build)
+testdata/demo_bank/build.sh 5435 5437       # small: old 9.4 -> new 18, other local ports
+testdata/demo_bank/build.sh --size large    # large in demo_bank_large, identical data (T031)
+testdata/demo_bank/build.sh --scale 4       # custom factor in demo_bank_large
 testdata/demo_bank/verify.sh                # --no-plant build: old vs new, per-table digests
+testdata/demo_bank/verify.sh --db demo_bank_large    # the large size
 testdata/demo_bank/verify.sh --baseline /tmp/demo_bank.digest   # + same data every run
+testdata/demo_bank/estimate_check.sh --out /tmp/estimate.json   # sizes and scan times (JSON)
 testdata/demo_bank/check_key.sh             # planted build: prove expected_diffs.json
 ```
 
@@ -191,6 +195,116 @@ Checked: build + verify green on 9.6 → 17 and on 9.4 → 18; two consecutive
 builds gave identical digests; a planted 0.01 `money` change, a NULL → empty-string
 change and a trailing-space change were each reported, while a reversed physical row
 order stayed quiet.
+
+### Sizes: `small`, `large` and a custom scale (T031)
+
+PLAN.md 8.1 asks for three sizes. `full` belongs to the private generator (T032);
+`small` and `large` live here, and `--scale N` covers sizes in between.
+
+`data.sql` has two integer knobs and both are **1** for the small size, so the
+small data set is exactly what it always was: the digest baseline taken before
+T031 still matches on every one of the 41 tables, and `check_key.sh` still passes
+129 of 129 checks.
+
+| Size | Flag | Accounts | Transactions | Database | Rows | Disk per side | Load time per side |
+|---|---|---|---|---|---|---|---|
+| small | `--size small` (default) | 5,000 | 20,000 | `demo_bank` | 117,732 | ~30 MB | ~10 s |
+| large | `--size large` | 1,000,000 | 20,000,000 | `demo_bank_large` | 45,064,432 | 8.9 GB (9.6) / 8.3 GB (17) | ~60 min |
+| custom | `--scale N` | 5,000 × N | 20,000 × N | `demo_bank_large` | × N | × N | × N |
+
+Every table that grows with the customer count follows the account knob
+(customers, addresses, documents, accounts, holders, daily balances, cards, loans,
+schedules, collateral, beneficiaries, standing orders, batches and items, charges,
+exchange audit, statements, KYC, alerts, audit log, cheques, disputes, notes,
+user roles). The ledger (`gl_entries`) and the transaction history follow the
+transaction knob. Bank reference data — countries, currencies, branches, products,
+account types, transaction types, the chart of accounts, fx and interest rates,
+fees, rate bands, limits — keeps its size at every setting, because a bank does
+not open a new currency when it gains a customer. `data.sql` will print the row
+count of every table for a chosen size:
+
+```
+psql "postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/demo_bank" \
+    -f testdata/demo_bank/data.sql -v size=large -v list_parts=1
+```
+
+**Disk and time.** Measured on this laptop with other agents building at the same
+time: the large size is 8.9 GB in the 9.6 old database and 8.3 GB in the 17 new
+one, the `pg_dump -Fc` file is 1.1 GB, the old side takes about **60 minutes** to
+load (45 million rows, roughly 12,000 rows/s through the real WAL and indexes),
+and the dump, restore (`-j 4`), `ANALYZE` and row summary take about 7 minutes
+more. So allow about 10 GB free per side, 12 GB while the dump exists, and
+roughly 70 minutes for the build. `verify.sh --db demo_bank_large` took 25 minutes
+and `estimate_check.sh` 17 minutes on the same run; both only read, so they are
+safe against a database another task is only reading. The four biggest tables are
+`transactions` (20,000,000 rows, 5.8 GB with its indexes), `gl_entries`
+(8,000,000), `balances_daily` (3,000,000) and `audit_log` (2,000,000). Load time
+is never part of a timed measurement: `estimate_check.sh` times reads only, with
+nothing else loading.
+
+**Where it lives.** The large size is always the database **`demo_bank_large`**,
+never `demo_bank`: engine tests read `demo_bank` on :5433/:5434 while other tasks
+build, so a million-account rebuild of it would break them (decision 19). `build.sh`
+refuses `--size large --db demo_bank` and `--scale N --db demo_bank` outright, and
+its F1 guard accepts only the two names `demo_bank` and `demo_bank_large`. To check
+a large build that must not disturb either, use the matrix servers:
+`build.sh 5435 5437 --size large --db demo_bank_large`.
+
+**Batching, and why nothing is `UNLOGGED`.** Above the small size `build.sh` loads in
+parts: `data.sql` prints a load plan (order, part name, rows, windowable) and
+`build.sh` runs one psql process per part — and per 1,000,000-row window (`--batch
+N`) for the big ones — so every `INSERT` is its own transaction and memory and
+rollback cost stay bounded. `UNLOGGED` is not used anywhere: the dump/restore copy
+has to be faithful, so the real WAL and the real indexes are written. After every
+part `build.sh` asserts the table holds exactly the rows the plan promised, so a
+broken window or a guard that loaded nothing can never pass quietly. The parts path
+is proven equal to the one-run small path: `--scale 1 --batch 700` (which forces
+hundreds of windows) produces the same per-table digests as the small build, and a
+planted build of it still satisfies the answer key.
+
+**Planting.** Large defaults to `--no-plant` (identical data on both sides), which
+is what the size and timing work needs. `plant.sql` keys off small-data ids, so it
+is the small build's business; `--plant` on the large size is allowed but
+`check_key.sh` is written for the small data set.
+
+**`estimate_check.sh`.** PLAN.md 4.5 estimates from size on disk, and the nightly
+workflow (PLAN.md 9) checks the estimate against reality on the large size. For
+each table and each side the harness records three numbers: `rows` (exact, summed
+from the fingerprint's own bucket counts, so no extra scan), `bytes`
+(`pg_total_relation_size`, the basis estimates use) and `seconds` (wall clock of one
+full scan in the phase0 fingerprint shape, generated from the catalog the way the
+engine generates it). It writes one small JSON document — `{"version":1,
+"database":…,"generated_at":…,"tables":[{"table":…,"old":{…},"new":{…}}],
+"totals":{…}}` — to stdout or `--out FILE`, and the readable table to stderr:
+
+```
+testdata/demo_bank/build.sh --size large                 # ~70 minutes, no planting
+testdata/demo_bank/verify.sh --db demo_bank_large        # old == new, every table
+testdata/demo_bank/estimate_check.sh --tables accounts,transactions \
+    --out /tmp/dmux-estimate-large.json                  # the nightly gate's input
+```
+
+On this laptop the reference scan took 65 s on 9.6 and 24 s on 17 for `accounts`
+(1,000,000 rows, 332 MB) and 551 s on 9.6 against 161 s on 17 for `transactions`
+(20,000,000 rows, 5.8 GB with indexes) — about 3.4× slower on the old server,
+which is the range the estimate has to be honest about.
+
+Both servers' fingerprints must be byte-identical or the run fails: differing data
+would make the timing meaningless. Everything it runs is read-only (READ ONLY
+transactions, a read-only session, guarded local URLs), so it is safe to point at a
+database another task is reading.
+
+Checked (T031): large build + `verify.sh --db demo_bank_large` green on 9.6 → 17
+(45,064,432 rows on each side, old == new on all 41 tables; `accounts`,
+`balances_daily`, `gl_entries` and `transactions` are above the 256 MiB threshold
+and therefore chunked); `estimate_check.sh` produced the JSON shape the nightly
+gate reads, with byte-identical fingerprints on both servers; `--scale 1 --batch
+700` (hundreds of windows per table) matched the small baseline digests, and a
+planted build of it still satisfied the answer key; the small build's 41 digests
+are unchanged from before this change; the answer key still passes 129 of 129; and
+the chunked digest agrees with the classic one on every table of the small data
+(`VERIFY_CHUNK_ABOVE=0`, 41 of 41 chunked, old == new).
+
 
 ### Answer key (T016)
 
@@ -258,4 +372,5 @@ testdata/demo_bank/check_key.sh    # 129 checks, exit 0 only when the key is tru
 
 ## Still to build (Nina, Phase 1)
 
-- `demo_bank/`: the `full` and `large` sizes (PLAN.md 8.1); `small` exists (T015)
+- `demo_bank/` `full`: the whole private schema, a few rows each — that is the
+  private generator (T032, `private/` only). `small` and `large` exist (T015, T031).

@@ -1,39 +1,66 @@
-//! Verify a results file before it is rendered (PLAN.md 2.4).
+//! Verify a results file before it is rendered (PLAN.md 2.4, 2.3).
 //!
 //! The engine stamps [`RunResults::results_sha256`] — a SHA-256 of the canonical
 //! results JSON — at the end of a run.  Before rendering a report, `dmux report`
-//! re-reads the file and recomputes that digest over the parsed content.  If the
-//! value in the file does not match, the file was edited after it was written and
-//! the report refuses to render it.  This is the tamper-evident guarantee: it is
-//! not tamper-proof, but it makes an unnoticed edit detectable.
+//! re-reads the file and recomputes that digest **with the engine's own
+//! [`sha256_of`]** over the *typed* v2 [`RunResults`], never a re-implementation
+//! and never a raw-JSON hash.  Any field that survives that check (structure
+//! findings, drill-down detail, definition hash, in-scope/structure-only tallies)
+//! is exactly the value that was signed, so a forged finding is refused, not
+//! rendered.
 //!
 //! Results files come in two shapes:
 //!
 //! - a plain [`RunResults`] JSON (from `dmux compare` / `dmux run`); verify the
 //!   `results_sha256` field against the canonical form;
-//! - an envelope `{ results, hooks, envelope_sha256 }` (written by
-//!   `dmux run --hooks`, T027): verify `envelope_sha256`, the SHA-256 of the
-//!   envelope with its own `envelope_sha256` key removed.  This lets the report
-//!   render a run that carried custom hook findings without trusting the
-//!   envelope blindly.
+//! - an envelope `{ results, hooks: { custom_checks, scripts, warnings },
+//!   envelope_sha256 }` (written by `dmux run --hooks`, T027): verify
+//!   `envelope_sha256`, the SHA-256 of the whole envelope with its own
+//!   `envelope_sha256` key removed.  The nested results must ALSO pass
+//!   `sha256_of`, so a forged finding or a forged results field is caught.
+//!
+//! The envelope integrity check is [*TODO(T027)*](verify_envelope_bytes): once
+//! `dmux-hooks` merges, switch this to `dmux_hooks::verify_envelope` so the
+//! document keeps one source of truth for the envelope algorithm.
 
 use std::path::Path;
 
-use dmux_engine::results::{sha256_of, RunResults};
+use dmux_engine::results::{sha256_of, RunResults, Verdict};
 
-/// A results file that passed verification, with its digest and the raw JSON.
+/// One hook finding carried in an envelope's `hooks.custom_checks` (T027).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookFinding {
+    pub id: String,
+    pub severity: String,
+    pub message: String,
+    pub table: Option<String>,
+}
+
+/// One hook script's recorded name + SHA-256 (the code that actually ran).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookScript {
+    pub script: String,
+    pub sha256: String,
+}
+
+/// Hook evidence recovered from a verified envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookEvidence {
+    pub custom_checks: Vec<HookFinding>,
+    pub scripts: Vec<HookScript>,
+    pub warnings: Vec<String>,
+}
+
+/// A results file that passed verification, with its digest, the parsed typed
+/// results, and (for an envelope) the hook evidence.
 #[derive(Debug)]
 pub struct Verification {
     pub results: RunResults,
-    /// The digest the plan calls "the SHA-256 of the results file" — for a plain
-    /// results file this is `results_sha256`; for an envelope it is the
-    /// envelope's own digest.
+    /// The digest printed on the report's first page: `results_sha256` for a
+    /// plain file, or the envelope digest for an envelope.
     pub sha256: String,
-    /// The raw parsed JSON of the results object, retained so report modules can
-    /// read results-schema fields that a given engine release may not expose on
-    /// `RunResults` (structure findings, suggestions, drill-down detail).  Its
-    /// integrity is already covered by whichever digest was verified.
-    pub raw: serde_json::Value,
+    /// Hook evidence, present only when the file was an envelope.
+    pub hooks: Option<HookEvidence>,
 }
 
 /// Why verification failed.
@@ -58,6 +85,13 @@ pub enum VerifyError {
     EnvelopeMissingResults,
     #[error("envelope is missing its envelope_sha256")]
     EnvelopeMissingDigest,
+    #[error("envelope integrity check failed: {0}")]
+    Envelope(String),
+    #[error(
+        "results file is internally inconsistent: the overall verdict is PASS \
+         but a table or structure finding is not PASS; refusing to render"
+    )]
+    InconsistentVerdict,
 }
 
 /// Read and verify a results file (either shape).
@@ -67,55 +101,142 @@ pub fn verify_results_file(path: &Path) -> Result<Verification, VerifyError> {
     verify_value(&value)
 }
 
-/// Verify a parsed JSON value that is either a plain results object or an
-/// envelope (`run --hooks` writes the envelope; `compare`/`run` write plain).
+/// Verify a parsed JSON value that is either a plain results object or a
+/// T027 hook envelope.
 pub fn verify_value(value: &serde_json::Value) -> Result<Verification, VerifyError> {
-    let envelope = is_envelope(value);
-    let raw_results: serde_json::Value = if envelope {
-        value
-            .get("results")
-            .cloned()
-            .ok_or(VerifyError::EnvelopeMissingResults)?
+    if is_envelope(value) {
+        verify_envelope(value)
     } else {
-        value.clone()
-    };
-    let results: RunResults = serde_json::from_value(raw_results.clone())?;
+        verify_plain(value)
+    }
+}
 
-    let (recorded, recomputed) = if envelope {
-        // Remove the envelope's own signature key, serialise the rest, hash it.
-        let mut closed = value.as_object().cloned().unwrap_or_default();
-        closed.remove("envelope_sha256");
-        let canonical =
-            serde_json::to_string(&serde_json::Value::Object(closed)).unwrap_or_default();
-        let recomputed = sha256_hex(canonical.as_bytes());
-        let recorded = value
-            .get("envelope_sha256")
-            .and_then(|v| v.as_str())
-            .ok_or(VerifyError::EnvelopeMissingDigest)?
-            .to_string();
-        (recorded, recomputed)
-    } else {
-        // The engine's self-verifying digest.
-        let recomputed = sha256_of(&results);
-        let recorded = results.results_sha256.clone();
-        (recorded, recomputed)
-    };
+/// Verify a plain (non-envelope) results file.
+fn verify_plain(value: &serde_json::Value) -> Result<Verification, VerifyError> {
+    // Deserialize into the typed v2 RunResults first: a forged field that does
+    // not fit the schema fails now, and the digest is computed over the typed
+    // value that will actually be rendered.
+    let results: RunResults = serde_json::from_value(value.clone())?;
+    let recomputed = sha256_of(&results);
+    let recorded = results.results_sha256.clone();
+    check_digest(&recorded, &recomputed)?;
+    check_verdict_consistency(&results)?;
+    Ok(Verification {
+        results,
+        sha256: recomputed,
+        hooks: None,
+    })
+}
 
+/// Verify a T027 hook envelope: `{ results, hooks, envelope_sha256 }`.
+///
+/// Both layers are checked — the envelope digest (binding the hook evidence to
+/// the results) and the inner results' own [`sha256_of`] (binding the results
+/// values) — so neither a forged finding nor a forged results field can reach
+/// the renderer.
+fn verify_envelope(value: &serde_json::Value) -> Result<Verification, VerifyError> {
+    verify_envelope_bytes(value).map_err(VerifyError::Envelope)?;
+
+    let results_value = value
+        .get("results")
+        .cloned()
+        .ok_or(VerifyError::EnvelopeMissingResults)?;
+    let results: RunResults = serde_json::from_value(results_value)?;
+    let results_recomputed = sha256_of(&results);
+    check_digest(&results.results_sha256, &results_recomputed)?;
+    check_verdict_consistency(&results)?;
+
+    let hooks = parse_hook_evidence(value.get("hooks"));
+    let sha256 = value
+        .get("envelope_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or(VerifyError::EnvelopeMissingDigest)?
+        .to_string();
+
+    Ok(Verification {
+        results,
+        sha256,
+        hooks: Some(hooks),
+    })
+}
+
+/// Verify an envelope's own `envelope_sha256`.
+///
+/// [*TODO(T027)*] — this is an adapter that keeps `dmux-report` from depending on
+/// the not-yet-merged `dmux-hooks` crate.  Once T027 lands, replace this body
+/// with `dmux_hooks::verify_envelope(value)` so there is one source of truth for
+/// the algorithm.  The algorithm here matches `dmux_hooks::envelope_sha256`:
+/// remove the top-level `envelope_sha256` key from a copy, serialise the rest
+/// canonically (serde_json → stable ordering), SHA-256 hex.
+pub fn verify_envelope_bytes(value: &serde_json::Value) -> Result<(), String> {
+    let stored = value
+        .get("envelope_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "envelope has no envelope_sha256".to_string())?;
+    if stored.is_empty() {
+        return Err("envelope has no envelope_sha256".to_string());
+    }
+    let mut clone = value.clone();
+    if let Some(obj) = clone.as_object_mut() {
+        obj.remove("envelope_sha256");
+    }
+    let canonical = serde_json::to_string(&clone).unwrap_or_default();
+    let actual = sha256_hex(canonical.as_bytes());
+    if actual != stored {
+        return Err("envelope_sha256 mismatch: file was modified after running".to_string());
+    }
+    Ok(())
+}
+
+fn check_digest(recorded: &str, recomputed: &str) -> Result<(), VerifyError> {
     if recorded.is_empty() {
         return Err(VerifyError::MissingDigest);
     }
     if recorded != recomputed {
         return Err(VerifyError::Tampered {
-            recorded,
-            recomputed,
+            recorded: recorded.to_string(),
+            recomputed: recomputed.to_string(),
         });
     }
+    Ok(())
+}
 
-    Ok(Verification {
-        results,
-        sha256: recomputed,
-        raw: raw_results,
-    })
+/// Fail-closed guard: the engine never writes PASS alongside a non-PASS table or
+/// structure finding, so such a combination means the file was tampered (or a
+/// writer bug).  Refuse to render rather than sign a PASS that hides a failure.
+fn check_verdict_consistency(results: &RunResults) -> Result<(), VerifyError> {
+    if !results.verdict.is_pass() {
+        return Ok(()); // only a PASS is capable of hiding a gap
+    }
+    let any_table_bad = results.tables.values().any(|t| !t.verdict.is_pass());
+    let any_finding_bad = results
+        .structure_findings
+        .iter()
+        .any(|f| !f.verdict.is_pass());
+    if any_table_bad || any_finding_bad {
+        return Err(VerifyError::InconsistentVerdict);
+    }
+    Ok(())
+}
+
+/// The displayed overall verdict of an envelope:
+/// `worse(inner results verdict, every hook finding folded in)`.
+///
+/// A `fail` finding forces the run off PASS; an `info` or `warning` finding
+/// contributes `Warning` (never PASS, never hides a failure).  This matters
+/// because `dmux hook` writes findings *without* mutating the nested results
+/// verdict (T027), so the report must fold hooks in itself.
+pub fn displayed_verdict(results: &RunResults, hooks: &HookEvidence) -> Verdict {
+    let mut worst = results.verdict;
+    for f in &hooks.custom_checks {
+        let v = match f.severity.as_str() {
+            "fail" => Verdict::Fail,
+            "warning" => Verdict::Warning,
+            _ => Verdict::Warning, // "info" folds to Warning: still not PASS
+        };
+        worst = worst.worst(v);
+    }
+    worst
 }
 
 fn is_envelope(value: &serde_json::Value) -> bool {
@@ -129,16 +250,69 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+fn parse_hook_evidence(hooks: Option<&serde_json::Value>) -> HookEvidence {
+    let Some(hooks) = hooks.and_then(|h| h.as_object()) else {
+        return HookEvidence::default();
+    };
+    let custom_checks = hooks
+        .get("custom_checks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    Some(HookFinding {
+                        id: f.get("id")?.as_str()?.to_string(),
+                        severity: f.get("severity")?.as_str()?.to_string(),
+                        message: f.get("message")?.as_str()?.to_string(),
+                        table: f.get("table").and_then(|t| t.as_str()).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let scripts = hooks
+        .get("scripts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(HookScript {
+                        script: s.get("script")?.as_str()?.to_string(),
+                        sha256: s.get("sha256")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let warnings = hooks
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| w.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    HookEvidence {
+        custom_checks,
+        scripts,
+        warnings,
+    }
+}
+
 /// Verify an already-parsed [`RunResults`] payload (plain shape only).
 pub fn verify_results(results: &RunResults) -> Result<Verification, VerifyError> {
     let value = serde_json::to_value(results)?;
-    verify_value(&value)
+    verify_plain(&value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dmux_engine::results::{finalise, RunResults, Verdict, RESULTS_VERSION};
+    use dmux_engine::results::{
+        finalise, CheckLevel::FullValues, RunResults, StructureFinding, TableResult, Verdict,
+        RESULTS_VERSION,
+    };
     use std::collections::BTreeMap;
 
     fn results() -> RunResults {
@@ -148,17 +322,33 @@ mod tests {
             tool_version: "0.1.0".into(),
             mapping_hash: "mh".into(),
             verdict: Verdict::Pass,
-            coverage_line: "".into(),
-            fully_checked: 0,
+            coverage_line:
+                "1 of 1 tables fully checked, 0 counts only, 0 structure only, 0 ignored".into(),
+            fully_checked: 1,
             counts_only: 0,
             ignored: 0,
-            tables: BTreeMap::new(),
+            tables: BTreeMap::from([(
+                "s.t".into(),
+                TableResult {
+                    table: "s.t".into(),
+                    level: FullValues,
+                    verdict: Verdict::Pass,
+                    old_rows: Some(1),
+                    new_rows: Some(1),
+                    columns_covered: Some(vec!["id".into()]),
+                    differing_buckets: Some(0),
+                    missing_buckets: Some(0),
+                    extra_buckets: Some(0),
+                    missing_rows: Some(0),
+                    extra_rows: Some(0),
+                    changed_rows: Some(0),
+                    reasons: vec![],
+                },
+            )]),
             ignored_items: vec![],
             changed_during_check: vec![],
             warnings: vec![],
-            wal_start_lsn: None,
-            wal_end_lsn: None,
-            results_sha256: String::new(),
+            ..RunResults::default()
         }
     }
 
@@ -172,7 +362,7 @@ mod tests {
     #[test]
     fn an_edited_file_is_refused() {
         let mut r = finalise(results());
-        r.verdict = Verdict::Fail; // a tampered edit, digest untouched
+        r.verdict = Verdict::Fail;
         match verify_results(&r).unwrap_err() {
             VerifyError::Tampered { .. } => {}
             other => panic!("expected Tampered, got {other}"),
@@ -187,12 +377,60 @@ mod tests {
         ));
     }
 
-    /// Build a T027-style envelope: the full results object + hooks, then stamp
-    /// `envelope_sha256` over a copy with that key removed.
-    fn envelope(results: &RunResults) -> serde_json::Value {
+    #[test]
+    fn a_forged_structure_finding_is_refused() {
+        // A v2 file whose results_sha256 was computed WITHOUT the finding: the
+        // forged finding must not survive verification.
+        let finalised = finalise(results());
+        let mut v = serde_json::to_value(finalised).unwrap();
+        v["structure_findings"] = serde_json::json!([
+            { "object": "s.t.idx", "path": ["s","t","idx"], "verdict": "FAIL", "message": "forged" }
+        ]);
+        let err = verify_value(&v).unwrap_err();
+        assert!(matches!(err, VerifyError::Tampered { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_legit_structure_finding_verifies_and_survives() {
+        let mut r = results();
+        r.structure_findings = vec![StructureFinding {
+            object: "s.t.idx".into(),
+            path: vec!["s".into(), "t".into(), "idx".into()],
+            verdict: Verdict::Fail,
+            message: "missing index".into(),
+        }];
+        r.verdict = Verdict::Fail;
+        let finalised = finalise(r);
+        let v = verify_results(&finalised).unwrap();
+        assert_eq!(v.results.structure_findings.len(), 1);
+        assert_eq!(v.results.structure_findings[0].message, "missing index");
+    }
+
+    #[test]
+    fn a_pass_with_a_bad_table_is_refused() {
+        // Fail-closed: PASS plus a non-PASS table cannot be signed off.
+        let mut r = finalise(results());
+        r.verdict = Verdict::Pass;
+        r.tables.get_mut("s.t").unwrap().verdict = Verdict::Fail;
+        let r = finalise(r);
+        match verify_results(&r).unwrap_err() {
+            VerifyError::InconsistentVerdict => {}
+            other => panic!("expected InconsistentVerdict, got {other}"),
+        }
+    }
+
+    /// Build a T027-style envelope, stamped exactly as the CLI does.
+    fn envelope(results: &RunResults, checks: serde_json::Value) -> serde_json::Value {
         let mut env = serde_json::Map::new();
         env.insert("results".into(), serde_json::to_value(results).unwrap());
-        env.insert("hooks".into(), serde_json::json!([]));
+        env.insert(
+            "hooks".into(),
+            serde_json::json!({
+                "custom_checks": checks,
+                "scripts": [{"script": "hook.py", "sha256": "ab".repeat(32)}],
+                "warnings": [],
+            }),
+        );
         let digest = sha256_hex(
             serde_json::to_string(&serde_json::Value::Object(env.clone()))
                 .unwrap()
@@ -203,21 +441,57 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_verifies_and_exposes_the_hash() {
-        let env = envelope(&finalise(results()));
+    fn an_envelope_verifies_and_exposes_hook_evidence() {
+        let env = envelope(
+            &finalise(results()),
+            serde_json::json!([
+                { "id": "c1", "severity": "fail", "message": "bad thing", "source": "custom_checks" }
+            ]),
+        );
         let v = verify_value(&env).unwrap();
-        assert!(!v.sha256.is_empty());
-        assert_eq!(v.results.run_id, "run-1");
+        let hooks = v.hooks.as_ref().unwrap();
+        assert_eq!(hooks.custom_checks.len(), 1);
+        assert_eq!(hooks.custom_checks[0].severity, "fail");
+        assert_eq!(hooks.scripts.len(), 1);
+        assert_eq!(hooks.scripts[0].sha256.len(), 64);
     }
 
     #[test]
     fn a_tampered_envelope_is_refused() {
-        let mut env = envelope(&finalise(results()));
-        env["results"]["verdict"] = serde_json::json!("FAIL");
+        let mut env = envelope(&finalise(results()), serde_json::json!([]));
+        env["hooks"]["custom_checks"] = serde_json::json!([
+            { "id": "x", "severity": "fail", "message": "injected" }
+        ]);
         assert!(matches!(
             verify_value(&env),
-            Err(VerifyError::Tampered { .. })
+            Err(VerifyError::Envelope(_) | VerifyError::Tampered { .. })
         ));
+    }
+
+    #[test]
+    fn displayed_verdict_folds_a_hook_fail_off_pass() {
+        let r = results(); // veridct PASS
+        let hooks = HookEvidence {
+            custom_checks: vec![HookFinding {
+                id: "c".into(),
+                severity: "fail".into(),
+                message: "m".into(),
+                table: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(displayed_verdict(&r, &hooks), Verdict::Fail);
+
+        let hook_warning = HookEvidence {
+            custom_checks: vec![HookFinding {
+                id: "c".into(),
+                severity: "warning".into(),
+                message: "m".into(),
+                table: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(displayed_verdict(&r, &hook_warning), Verdict::Warning);
     }
 
     #[test]
