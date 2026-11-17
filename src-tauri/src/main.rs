@@ -1,6 +1,15 @@
 // Prevents an extra console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod commands;
+mod error;
+mod secrets;
+mod state;
+mod store;
+mod types;
+
+use tauri::Manager;
+
 /// Unique application identifier (decision 1: distinct from the other tool
 /// named dmux). Must match `identifier` in tauri.conf.json; Tauri 2 allows
 /// only alphanumerics, hyphens and periods, in reverse-domain notation.
@@ -14,7 +23,28 @@ fn main() {
         APP_IDENTIFIER,
         "tauri.conf.json identifier drifted from APP_IDENTIFIER"
     );
+
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            commands::profiles::list_profiles,
+            commands::profiles::save_profile,
+            commands::profiles::delete_profile,
+            commands::profiles::profile_has_password,
+            commands::gateway::probe_connection,
+            commands::gateway::run_inventory,
+            commands::gateway::schema_diff,
+            commands::gateway::build_mapping,
+            commands::gateway::update_mapping,
+            commands::gateway::export_mapping,
+            commands::gateway::import_mapping,
+            commands::gateway::get_version,
+        ])
+        .setup(|app| {
+            let data_dir = state::app_data_dir(app.handle());
+            let app_state = state::AppState::new(data_dir)?;
+            app.manage(app_state);
+            Ok(())
+        })
         .run(context)
         .expect("error while running the Dmux app");
 }

@@ -1,3 +1,24 @@
+// build.rs: configure the Tauri build and declare the app's custom commands so
+// tauri-build generates `allow-<command>` / `deny-<command>` permission
+// identifiers for them (snake_case).  The capability file then references
+// exactly these, keeping app permissions tight (PLAN 6.9).
+
 fn main() {
-    tauri_build::build()
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "list_profiles",
+            "save_profile",
+            "delete_profile",
+            "profile_has_password",
+            "probe_connection",
+            "run_inventory",
+            "schema_diff",
+            "build_mapping",
+            "update_mapping",
+            "export_mapping",
+            "import_mapping",
+            "get_version",
+        ]),
+    ))
+    .expect("failed to run tauri build script");
 }

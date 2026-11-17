@@ -17,6 +17,10 @@ export interface ConnectionProfile {
   database: string;
   user: string;
   encryption: EncryptionMode;
+  /** SHA-256 fingerprint of the certificate to trust once (encryption === 'trust'). */
+  tlsFingerprint?: string;
+  /** Recorded reason for an unencrypted connection (encryption === 'allow-plaintext'). */
+  plaintextReason?: string;
   /** Stored in the OS keychain, never in UI state. */
   passwordFromKeychain?: boolean;
 }
@@ -24,7 +28,7 @@ export interface ConnectionProfile {
 export type TlsState =
   | { state: 'encrypted'; verified: true }
   | { state: 'encrypted'; verified: false; fingerprint: string }
-  | { state: 'plaintext' }
+  | { state: 'plaintext'; reason?: string }
   | { state: 'unknown' };
 
 export interface ServerInfo {

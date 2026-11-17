@@ -11,7 +11,7 @@ import { RunScreen } from './screens/RunScreen';
 import { ResultsScreen } from './screens/ResultsScreen';
 import { ReportScreen } from './screens/ReportScreen';
 import type { Engine } from './api/engine';
-import { createMockEngine, type MockEngineOptions } from './api/mockEngine';
+import { resolveEngine } from './api/engineSelection';
 import type {
   ConnectionProfile,
   Inventory,
@@ -43,15 +43,10 @@ const stepLabels: { id: Step; label: string }[] = [
   { id: 'report', label: 'Report' },
 ];
 
-function resolveEngine(): Engine {
-  // In the browser test harness the engine can be forced through a global for a
-  // given fixture, falling back to the default mock engine.
-  const forced = typeof window !== 'undefined' ? (window as unknown as { __dmuxForcedFixture?: string }).__dmuxForcedFixture : undefined;
-  if (forced) {
-    return createMockEngine({ forcedFixture: forced as MockEngineOptions['forcedFixture'] });
-  }
-  return createMockEngine();
-}
+// The engine is resolved per runtime (see src/api/engineSelection.ts): the real
+// Tauri backend inside the desktop app for the structure half (the data half
+// is stubbed until T022), the deterministic mock in the browser / Vitest /
+// Playwright, and a forced fixture for UI tests.
 
 function AppShell() {
   const { resolvedMode, mode, setMode, reducedEffects, toggleReducedEffects } = useTheme();

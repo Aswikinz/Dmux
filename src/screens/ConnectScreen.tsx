@@ -97,6 +97,32 @@ function ProfileEditor({
         }
         data-testid={`${title}-encryption`}
       />
+      {profile.encryption === 'trust' && (
+        <div className="space-y-1">
+          <Input
+            label="Certificate fingerprint (SHA-256)"
+            value={profile.tlsFingerprint ?? ''}
+            onChange={(e) => onChange({ ...profile, tlsFingerprint: e.target.value })}
+            data-testid={`${title}-fingerprint`}
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Trust this certificate once. Shown when the server's certificate cannot be verified.
+          </p>
+        </div>
+      )}
+      {profile.encryption === 'allow-plaintext' && (
+        <div className="space-y-1">
+          <Input
+            label="Reason for unencrypted connection"
+            value={profile.plaintextReason ?? ''}
+            onChange={(e) => onChange({ ...profile, plaintextReason: e.target.value })}
+            data-testid={`${title}-plaintext-reason`}
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Required. This choice is recorded in the report (PLAN 6.7).
+          </p>
+        </div>
+      )}
     </div>
   );
 }

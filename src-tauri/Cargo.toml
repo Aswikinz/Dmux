@@ -1,6 +1,6 @@
 [package]
 name = "dmux-app"
-description = "Dmux desktop app (Phase 0 skeleton)"
+description = "Dmux desktop app (thin Tauri commands over the engine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,3 +12,20 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# The engine library: connections, inventory, schema diff, mapping. The desktop
+# app wraps its public API in typed, async Tauri commands; it never touches
+# `core/` (the comparison core) or `ident` directly.
+dmux-engine = { path = "../crates/dmux-engine" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# Profile store (never passwords): bundled SQLite in the app data dir.
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+# Passwords live in the OS keychain (decision: PLAN 4.1). `v1` (default) gives
+# Windows Credential Manager and the Secret Service on Linux.
+keyring = "4.2.0"
+
+[dev-dependencies]
+# Test-only: build a temp profile store and probe against the mock databases.
+tempfile = "3"

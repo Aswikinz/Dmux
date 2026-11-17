@@ -102,14 +102,12 @@ export function ResultsScreen({
   onNext,
   onBack,
 }: ResultsScreenProps) {
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedFailures, setExpandedFailures] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let mounted = true;
     async function load() {
-      setLoading(true);
       setError(null);
       try {
         const result = await engine.getResults(runId);
@@ -119,10 +117,6 @@ export function ResultsScreen({
       } catch (e) {
         if (mounted) {
           setError(e instanceof Error ? e.message : String(e));
-        }
-      } finally {
-        if (mounted) {
-          setLoading(false);
         }
       }
     }
@@ -147,13 +141,18 @@ export function ResultsScreen({
     ] as ColumnDef<TableResult>[];
   }, []);
 
-  if (loading || !results) {
+  if (!results) {
     return (
       <div className="space-y-6">
         <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Results</h2>
-        <Panel>
-          <div className="py-8 text-center text-slate-600 dark:text-slate-300">Loading results…</div>
-        </Panel>
+        {error && <ErrorCard title="Could not load results">{error}</ErrorCard>}
+        {!error && (
+          <Panel>
+            <div className="py-8 text-center text-slate-600 dark:text-slate-300">
+              Loading results…
+            </div>
+          </Panel>
+        )}
       </div>
     );
   }
