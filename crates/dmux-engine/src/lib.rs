@@ -5,6 +5,9 @@
 //! compare, drilldown) arrives in later phases; this crate deliberately
 //! contains no database code yet.
 
+pub mod core;
+pub mod ident;
+
 /// The engine version, taken from the crate manifest at compile time.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
