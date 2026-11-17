@@ -63,10 +63,11 @@ Status: todo, doing, review, done, blocked.
 | T047 | Audit M4/M9: trust-once fingerprint recorded by the verifier (no error-text parsing); optional CA file (profile, UI). | arjun | in progress | T026 |
 | T048 | Audit M6/M7/L3/L10/L2: honest hook warning + refuse writable scripts; no password in definition files; 0600 outputs; sanitised hook stderr; no key lists in hook payload; CLI --ca-file. | arjun | todo | T026 |
 | T049 | Docs after the audit: M1/M6 wording, I1/I3/I5 in "How Dmux decides", BYPASSRLS + pause replay in DBA guide. | ella | todo | T043-T048 |
-| T050 | Audit L7/L8/M5 (Tauri): validated mappings from the webview, nothing verdict-bearing round-trips through it, override reason retained, CSP hardening. | arjun | in progress | T026 |
-| T051 | Audit M8: build provenance attestations + keyless cosign signature on SHA256SUMS + verify instructions. | kenji | in progress | T026 |
-| T052 | Fixtures: RLS database (rls_bank) and a TLS-only Postgres (profile tls, :5439). | nina | in progress | T026 |
-| T054 | Connect screen: no mock defaults (127.0.0.1/5433/demo_bank/dmux_dev) in the shipped UI; password entry sent once to the keychain via save_profile and cleared; ask-per-run when no keychain (PLAN 4.1/6.5). Owner finding. | arjun | in progress | T040 |
+| T050 | Audit L7/L8/M5 (Tauri): validated mappings from the webview, nothing verdict-bearing round-trips through it, override reason retained, CSP hardening. | arjun | done | T026 |
+| T051 | Audit M8: build provenance attestations + keyless cosign signature on SHA256SUMS + verify instructions. | kenji | done | T026 |
+| T052 | Fixtures: RLS database (rls_bank) and a TLS-only Postgres (profile tls, :5439). | nina | done | T026 |
+| T055 | Keychain-less runs: backend holds a typed password in memory only for the app session (never persisted, cleared on profile change/exit) so Compare structure → Run works without a keychain (T054 gap). | arjun | todo | T044 |
+| T054 | Connect screen: no mock defaults (127.0.0.1/5433/demo_bank/dmux_dev) in the shipped UI; password entry sent once to the keychain via save_profile and cleared; ask-per-run when no keychain (PLAN 4.1/6.5). Owner finding. | arjun | done | T040 |
 | T053 | Live cancel test gated on DMUX_TEST_LARGE_* (CI has no demo_bank_large). | maya | done | T040 |
 | T027 | Python hooks (PLAN 4.9): script receives results JSON, returns extra findings marked custom; no passwords/connections; off by default; script hash in run log; time limit; Windows ships its own Python, Flatpak uses runtime Python. | arjun (kimi-k2.7-code) | done | T022 |
 | T030 | SonarCloud findings: exclude *.sql (Oracle rules on Postgres fixtures), suppress mock-password rule with reason, --locked / https-only curl / npx --ignore-scripts, shell [[ ]], release staging dir dist/ → release-out/ (frontend leaked into v0.0.1). | kenji (deepseek-v4-pro) | done | T021 |
