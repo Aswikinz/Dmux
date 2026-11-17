@@ -24,6 +24,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 hex = "0.4.3"
+# App-side hashing when a server cannot run md5() (FIPS mode, PLAN 2.2): the same
+# md5 the server would compute, over the same normalised bytes.
+md-5 = "0.11.0"
+# Streams rows for app-side hashing so a huge table never sits in memory.
+futures-util = "0.3.32"
 flate2 = "1.1.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 

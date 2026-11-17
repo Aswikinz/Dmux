@@ -19,6 +19,8 @@ dmux-engine = { path = "../crates/dmux-engine" }
 # Report rendering (PDF/XLSX) from engine-held results, with the same
 # verification `dmux report` uses (T059).
 dmux-report = { path = "../crates/dmux-report" }
+# Custom checks (Python hooks) run after a run finishes (T074).
+dmux-hooks = { path = "../crates/dmux-hooks" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

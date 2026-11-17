@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dmux
+Comment=Prove a PostgreSQL migration copied every row and value
+Exec=dmux-app
+Icon=verify.dmux.desktop
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=dmux-app

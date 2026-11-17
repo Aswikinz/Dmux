@@ -57,6 +57,10 @@ export function DataTable<T extends object>({
     data: filteredData,
     columns,
     state: enableSelection ? { rowSelection } : undefined,
+    // There is no paging here.  Without this, react-table resets the page index
+    // whenever `data` changes identity, and `filteredData` is a new array on
+    // every render, so any parent re-render would loop forever.
+    autoResetPageIndex: false,
     enableRowSelection: enableSelection,
     onRowSelectionChange: (updater) => {
       const next = typeof updater === 'function' ? updater(rowSelection) : updater;

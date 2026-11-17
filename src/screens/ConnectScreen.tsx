@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
@@ -8,8 +8,9 @@ import { ErrorCard } from '../design/ErrorCard';
 import { StatusBadge } from '../design/StatusBadge';
 import { Tooltip } from '../design/Tooltip';
 import type { Engine } from '../api/engine';
+import { formatWhen } from './HistoryScreen';
 import type { ConnectionProfile, EncryptionMode, ServerInfo } from '../api/contract';
-import { CheckCircle, Database, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { BookmarkCheck, CheckCircle, Database, Pencil, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
 
 /** Shown when the backend keeps the password for this session only (no keychain). */
 export const SESSION_PASSWORD_NOTICE =
@@ -44,6 +45,192 @@ function emptyProfile(side: 'old' | 'new'): ConnectionProfile {
 
 export const defaultOldProfile = () => emptyProfile('old');
 export const defaultNewProfile = () => emptyProfile('new');
+
+/**
+ * Pick a saved connection for one side.  Picking fills the form with the saved
+ * details (never a password: the backend keeps that, and only ever sends it to
+ * the saved host).  A saved connection can be deleted here, with its password.
+ */
+function SavedProfilePicker({
+  engine,
+  title,
+  otherProfileId,
+  reloadKey,
+  onPick,
+}: {
+  engine: Engine;
+  title: string;
+  /** The profile id the other side uses; it cannot be used on both sides. */
+  otherProfileId: string;
+  /** Changes whenever a profile was saved, so the list refreshes. */
+  reloadKey: number;
+  onPick: (profile: ConnectionProfile, hasPassword: boolean) => void;
+}) {
+  const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
+  const [selectedId, setSelectedId] = useState('');
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      setProfiles(await engine.listProfiles());
+    } catch {
+      setProfiles([]);
+    }
+  }, [engine]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload, reloadKey]);
+
+  async function pick(id: string) {
+    setSelectedId(id);
+    setMessage(null);
+    setHasPassword(null);
+    const profile = profiles.find((p) => p.id === id);
+    if (!profile) return;
+    if (profile.id === otherProfileId) {
+      setSelectedId('');
+      setMessage('That saved connection is already used for the other database.');
+      return;
+    }
+    const has = await engine.profileHasPassword(profile.id).catch(() => false);
+    setHasPassword(has);
+    onPick(profile, has);
+  }
+
+  const selected = profiles.find((p) => p.id === selectedId);
+  const options = [
+    { value: '', label: profiles.length === 0 ? 'No saved connections yet' : 'Enter the details by hand' },
+    ...profiles.map((p) => ({
+      value: p.id,
+      label: `${p.label} (${p.user}@${p.host}:${p.port}/${p.database})`,
+    })),
+  ];
+
+  return (
+    <div className="space-y-2" data-testid={`${title}-saved`}>
+      <Select
+        id={`${title}-saved-select`}
+        label={`Saved connections for the ${title.toLowerCase()}`}
+        options={options}
+        value={selectedId}
+        disabled={profiles.length === 0}
+        onChange={(e) => void pick(e.target.value)}
+        data-testid={`${title}-saved-select`}
+      />
+      {selected && (
+        <div className="space-y-2 text-sm">
+          <p className="text-slate-700 dark:text-slate-300" role="status">
+            {hasPassword === null
+              ? 'Checking for a saved password…'
+              : hasPassword
+                ? 'A password is saved for this connection.'
+                : 'No password is saved for this connection. Type it below, or type it and press Save.'}
+          </p>
+        </div>
+      )}
+      {message && (
+        <p className="text-sm text-slate-700 dark:text-slate-300" role="status">
+          {message}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export type PasswordKind = 'keychain' | 'session' | 'none';
+
+export interface SavedInfo {
+  /** The profile fields as saved; a difference means unsaved edits. */
+  snapshot: string;
+  /** ISO time of the last successful test, or null when not tested yet. */
+  testedAt: string | null;
+  password: PasswordKind;
+}
+
+const snapshotOf = (p: ConnectionProfile) => JSON.stringify(p);
+
+function passwordText(kind: PasswordKind): string {
+  if (kind === 'keychain') return 'Password is in your system keychain.';
+  if (kind === 'session') return 'Password is kept in memory only until you close the app.';
+  return 'No password is saved. Type it to test again.';
+}
+
+/** The "this connection is saved" card, with Retry, Edit and Delete. */
+function SavedCard({
+  title,
+  profile,
+  info,
+  busy,
+  onRetry,
+  onEdit,
+  onDelete,
+}: {
+  title: string;
+  profile: ConnectionProfile;
+  info: SavedInfo;
+  busy: boolean;
+  onRetry: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const changed = snapshotOf(profile) !== info.snapshot;
+  return (
+    <div
+      className="space-y-2 rounded-xl border border-accent-200 bg-accent-50/60 p-3.5 text-sm dark:border-accent-500/30 dark:bg-accent-500/[0.08]"
+      data-testid={`${title}-saved-card`}
+    >
+      <div className="flex items-center gap-2 font-semibold text-accent-900 dark:text-accent-100" role="status">
+        {changed ? (
+          <>
+            <Pencil className="h-4 w-4" aria-hidden="true" />
+            Saved connection, with unsaved changes
+          </>
+        ) : (
+          <>
+            <BookmarkCheck className="h-4 w-4" aria-hidden="true" />
+            Saved
+          </>
+        )}
+      </div>
+      <p className="text-slate-700 dark:text-slate-300">
+        {changed
+          ? 'Press Save, or test the connection, to keep your changes.'
+          : info.testedAt
+            ? `Last tested ${formatWhen(info.testedAt)}.`
+            : 'Not tested yet in this session.'}
+      </p>
+      <p className="text-slate-700 dark:text-slate-300">{passwordText(info.password)}</p>
+      {!confirming ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="secondary" disabled={busy} onClick={onRetry}>
+            Retry connection
+          </Button>
+          <Button size="sm" variant="secondary" onClick={onEdit}>
+            Edit
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setConfirming(true)}>
+            Delete connection
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Confirm deleting the connection">
+          <span className="font-medium text-red-800 dark:text-red-300">
+            Delete "{profile.label}" and its saved password?
+          </span>
+          <Button size="sm" variant="danger" onClick={onDelete}>
+            Yes, delete it
+          </Button>
+          <Button size="sm" variant="secondary" onClick={() => setConfirming(false)}>
+            Keep it
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ProfileEditor({
   title,
@@ -337,6 +524,24 @@ export function ConnectScreen({
   );
   const [testing, setTesting] = useState<'old' | 'new' | null>(null);
   const [saving, setSaving] = useState<'old' | 'new' | null>(null);
+  // Bumped after every save so the saved-connection lists refresh.
+  const [savedVersion, setSavedVersion] = useState(0);
+  const [savedInfo, setSavedInfo] = useState<{ old: SavedInfo | null; new: SavedInfo | null }>({
+    old: null,
+    new: null,
+  });
+  const [testNotice, setTestNotice] = useState<{ old: string | null; new: string | null }>({
+    old: null,
+    new: null,
+  });
+
+  function markPicked(side: 'old' | 'new', p: ConnectionProfile, has: boolean) {
+    setTestNotice((n) => ({ ...n, [side]: null }));
+    setSavedInfo((i) => ({
+      ...i,
+      [side]: { snapshot: snapshotOf(p), testedAt: null, password: has ? 'keychain' : 'none' },
+    }));
+  }
 
   // The typed password lives only in this component's local state, is sent once
   // to the backend on Save/Test, and is cleared as soon as the call returns —
@@ -393,6 +598,10 @@ export function ConnectScreen({
       setOldSaveWarning(result.warning ?? null);
       setOldPasswordSaved(await engine.profileHasPassword(oldProfile.id));
       onChangeOld(result.profile);
+      const hasOld = await engine.profileHasPassword(result.profile.id);
+      const kindOld: PasswordKind = result.warning?.includes('memory') ? 'session' : hasOld ? 'keychain' : 'none';
+      setSavedInfo((i) => ({ ...i, old: { snapshot: snapshotOf(result.profile), testedAt: i.old?.testedAt ?? null, password: kindOld } }));
+      setSavedVersion((v) => v + 1);
     } catch (error) {
       setOldSaveError(describeThrown(error));
     } finally {
@@ -410,6 +619,10 @@ export function ConnectScreen({
       setNewSaveWarning(result.warning ?? null);
       setNewPasswordSaved(await engine.profileHasPassword(newProfile.id));
       onChangeNew(result.profile);
+      const hasNew = await engine.profileHasPassword(result.profile.id);
+      const kindNew: PasswordKind = result.warning?.includes('memory') ? 'session' : hasNew ? 'keychain' : 'none';
+      setSavedInfo((i) => ({ ...i, new: { snapshot: snapshotOf(result.profile), testedAt: i.new?.testedAt ?? null, password: kindNew } }));
+      setSavedVersion((v) => v + 1);
     } catch (error) {
       setNewSaveError(describeThrown(error));
     } finally {
@@ -418,26 +631,117 @@ export function ConnectScreen({
     }
   }
 
-  async function testOld() {
-    setTesting('old');
+  /**
+   * Test one side.  A successful test also saves the connection (the password,
+   * if typed, goes to the keychain or the in-memory session cache, never to
+   * SQLite), so it is kept for next time.
+   */
+  async function runTest(side: 'old' | 'new') {
+    const profile = side === 'old' ? oldProfile : newProfile;
+    const typed = side === 'old' ? oldPassword : newPassword;
+    const setResult = side === 'old' ? setOldResult : setNewResult;
+    const setPassword = side === 'old' ? setOldPassword : setNewPassword;
+    const setPasswordSaved = side === 'old' ? setOldPasswordSaved : setNewPasswordSaved;
+    const setWarning = side === 'old' ? setOldSaveWarning : setNewSaveWarning;
+    const onChange = side === 'old' ? onChangeOld : onChangeNew;
+    setTesting(side);
+    setTestNotice((n) => ({ ...n, [side]: null }));
     try {
-      const result = await engine.testConnection(oldProfile, oldPassword || undefined);
-      setOldResult(result);
+      // With no typed password the backend tests the SAVED details.  If the
+      // form differs from the saved ones, say so instead of testing the wrong
+      // server.
+      if (!typed) {
+        const existing = (await engine.listProfiles()).find((p) => p.id === profile.id);
+        if (existing && snapshotOf(existing) !== snapshotOf(profile)) {
+          setResult({
+            ok: false,
+            error:
+              'You changed the connection details. Type the password to test them, or press Edit to go back to the saved details.',
+          });
+          return;
+        }
+      }
+      const result = await engine.testConnection(profile, typed || undefined);
+      setResult(result);
+      if (!result.ok) return;
+      try {
+        const saved = await engine.saveProfile(profile, typed || undefined);
+        setWarning(saved.warning ?? null);
+        const has = await engine.profileHasPassword(saved.profile.id);
+        const kind: PasswordKind =
+          result.info?.sessionPassword || saved.warning?.includes('memory')
+            ? 'session'
+            : has
+              ? 'keychain'
+              : 'none';
+        setPasswordSaved(kind === 'keychain');
+        onChange(saved.profile);
+        setSavedInfo((i) => ({
+          ...i,
+          [side]: {
+            snapshot: snapshotOf(saved.profile),
+            testedAt: new Date().toISOString(),
+            password: kind,
+          },
+        }));
+        setSavedVersion((v) => v + 1);
+      } catch (error) {
+        setTestNotice((n) => ({
+          ...n,
+          [side]: `Connected, but the connection could not be saved: ${describeThrown(error)}`,
+        }));
+      }
     } finally {
-      setOldPassword('');
+      setPassword('');
       setTesting(null);
     }
   }
 
-  async function testNew() {
-    setTesting('new');
+  const testOld = () => runTest('old');
+  const testNew = () => runTest('new');
+
+  async function deleteSaved(side: 'old' | 'new') {
+    const profile = side === 'old' ? oldProfile : newProfile;
     try {
-      const result = await engine.testConnection(newProfile, newPassword || undefined);
-      setNewResult(result);
-    } finally {
-      setNewPassword('');
-      setTesting(null);
+      await engine.deleteProfile(profile.id);
+      setSavedInfo((i) => ({ ...i, [side]: null }));
+      (side === 'old' ? setOldResult : setNewResult)(null);
+      (side === 'old' ? setOldPasswordSaved : setNewPasswordSaved)(false);
+      setTestNotice((n) => ({ ...n, [side]: `Deleted the saved connection "${profile.label}" and its saved password.` }));
+      setSavedVersion((v) => v + 1);
+    } catch (error) {
+      setTestNotice((n) => ({ ...n, [side]: describeThrown(error) }));
     }
+  }
+
+  function editSaved(side: 'old' | 'new') {
+    const title = side === 'old' ? 'Old database' : 'New database';
+    document.querySelector<HTMLInputElement>(`[data-testid="${title}-host"]`)?.focus();
+  }
+
+  function savedCard(side: 'old' | 'new') {
+    const info = savedInfo[side];
+    const title = side === 'old' ? 'Old database' : 'New database';
+    return (
+      <>
+        {testNotice[side] && (
+          <p className="text-sm text-slate-700 dark:text-slate-300" role="status">
+            {testNotice[side]}
+          </p>
+        )}
+        {info && (
+          <SavedCard
+            title={title}
+            profile={side === 'old' ? oldProfile : newProfile}
+            info={info}
+            busy={testing !== null || saving !== null}
+            onRetry={() => void runTest(side)}
+            onEdit={() => editSaved(side)}
+            onDelete={() => void deleteSaved(side)}
+          />
+        )}
+      </>
+    );
   }
 
   return (
@@ -445,6 +749,19 @@ export function ConnectScreen({
       <ScreenHeader title="Connect" subtitle="Enter the old and new databases. Dmux only ever reads them." />
       <div className="grid gap-6 lg:grid-cols-2">
         <Panel>
+          <SavedProfilePicker
+            engine={engine}
+            title="Old database"
+            otherProfileId={newProfile.id}
+            reloadKey={savedVersion}
+            onPick={(p, has) => {
+              onChangeOld(p);
+              setOldPassword('');
+              setOldResult(null);
+              setOldPasswordSaved(false);
+              markPicked('old', p, has);
+            }}
+          />
           <ProfileEditor
             title="Old database"
             profile={oldProfile}
@@ -490,9 +807,23 @@ export function ConnectScreen({
               </ErrorCard>
             )}
             {oldResult?.ok && oldResult.info && <ServerInfoCard info={oldResult.info} />}
+            {savedCard('old')}
           </div>
         </Panel>
         <Panel>
+          <SavedProfilePicker
+            engine={engine}
+            title="New database"
+            otherProfileId={oldProfile.id}
+            reloadKey={savedVersion}
+            onPick={(p, has) => {
+              onChangeNew(p);
+              setNewPassword('');
+              setNewResult(null);
+              setNewPasswordSaved(false);
+              markPicked('new', p, has);
+            }}
+          />
           <ProfileEditor
             title="New database"
             profile={newProfile}
@@ -538,6 +869,7 @@ export function ConnectScreen({
               </ErrorCard>
             )}
             {newResult?.ok && newResult.info && <ServerInfoCard info={newResult.info} />}
+            {savedCard('new')}
           </div>
         </Panel>
       </div>

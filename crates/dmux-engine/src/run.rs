@@ -42,7 +42,10 @@ use crate::consistency::{
 };
 use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerdict};
 use crate::core::drilldown::{classify, fetch_rows};
-use crate::core::fingerprint::{fingerprint, Fingerprint, Side, Source, TablePlan};
+use crate::core::fingerprint::{
+    fingerprint, fingerprint_range, merge_fingerprints, range_cuts, range_parts, Fingerprint,
+    RangeFilter, RangeType, Side, Source, TablePlan,
+};
 use crate::core::normalise::{plan_column, ColumnOptions};
 use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession, ServerInfo};
 use crate::estimate::{estimate_from_seconds, timed_sample, total_estimate, Estimate};
@@ -636,16 +639,161 @@ pub(crate) async fn foreign_tables_set(
     .map_err(RunError::from)
 }
 
+/// How one side turns rows into hashes (PLAN.md 2.2): on the server with
+/// `md5()`, or, where the server cannot run `md5()` (FIPS mode), in Dmux from
+/// the same normalised values.  Both give identical fingerprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashMode {
+    Server,
+    App,
+}
+
+impl HashMode {
+    pub(crate) fn of(md5_available: bool) -> Self {
+        if md5_available {
+            HashMode::Server
+        } else {
+            HashMode::App
+        }
+    }
+}
+
+/// The hash mode of each side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Modes {
+    pub old: HashMode,
+    pub new: HashMode,
+}
+
+/// The run warning for a side that hashes in the app, if any.
+pub(crate) fn app_hash_warning(side: &str, mode: HashMode) -> Option<String> {
+    (mode == HashMode::App).then(|| {
+        format!(
+            "the {side} database cannot compute md5 (for example a FIPS-mode server), so Dmux hashed its rows itself; the result is the same, the scan is slower"
+        )
+    })
+}
+
+/// Scan one side, or one range of it, in its own read-only transaction.
 pub(crate) async fn scan_fingerprint(
     s: &mut ReadOnlySession,
     plan: &TablePlan,
     side: Side,
     src: &Source,
     mapping_hash: &str,
+    mode: HashMode,
+    range: Option<&RangeFilter>,
 ) -> Result<Fingerprint, String> {
     s.with_read_only("300s", |to| {
         Box::pin(async move {
-            fingerprint(&*to, plan, side, src, mapping_hash)
+            let r = match (mode, range) {
+                (HashMode::Server, None) => fingerprint(&*to, plan, side, src, mapping_hash).await,
+                (HashMode::Server, Some(r)) => {
+                    fingerprint_range(&*to, plan, side, src, r, mapping_hash).await
+                }
+                (HashMode::App, r) => {
+                    crate::core::apphash::fingerprint_app(&*to, plan, side, src, r, mapping_hash)
+                        .await
+                }
+            };
+            r.map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Tables with at least this many rows (the larger side's estimate) are split
+/// into ranges of their first key column, when it is a number or a date.
+pub const SPLIT_MIN_ROWS: i64 = 2_000_000;
+/// About this many rows per range.
+pub const SPLIT_ROWS_PER_PART: i64 = 1_000_000;
+/// At most this many ranges per table.
+pub const SPLIT_MAX_PARTS: i64 = 32;
+
+/// How many ranges a table of `rows` rows is split into (0 = not split).
+pub(crate) fn split_parts_for(rows: i64) -> u32 {
+    if rows < SPLIT_MIN_ROWS {
+        return 0;
+    }
+    (rows / SPLIT_ROWS_PER_PART).clamp(2, SPLIT_MAX_PARTS) as u32
+}
+
+/// The split column for a planned table: the first key column, when both
+/// sides give it the same number or date type (PLAN.md 3.1: never text).
+/// Returns (old name, new name, type).
+pub(crate) fn split_column(spec: &crate::plan::TableSpec) -> Option<(String, String, RangeType)> {
+    let first = *spec.key.first()?;
+    let m = &spec.columns[first];
+    let (o, n) = (RangeType::of(&m.old_type)?, RangeType::of(&m.new_type)?);
+    (o == n).then(|| (m.old_name.clone(), m.new_name.clone(), o))
+}
+
+/// Scan one side of a huge table range by range, up to `parallelism` ranges at
+/// a time (each on its own read-only session), and sum the parts.  The parts
+/// cover every row exactly once (`range_parts`), so the sum equals the whole
+/// table's fingerprint.  A stop is honoured between ranges; the caller's
+/// `checkpoint` then reports it as a cancellation, never as a result.
+#[allow(clippy::too_many_arguments)]
+async fn scan_side_in_ranges(
+    config: &RunConfig,
+    profile: &ConnProfile,
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+    mapping_hash: &str,
+    mode: HashMode,
+    filters: Vec<RangeFilter>,
+    parallelism: usize,
+) -> Result<Fingerprint, String> {
+    let workers = parallelism.clamp(1, filters.len().max(1));
+    let mut extra = Vec::new();
+    for _ in 1..workers {
+        let x = ReadOnlySession::open(profile, config.allow_superuser)
+            .await
+            .map_err(|e| e.to_string())?;
+        register(config, &x).map_err(|e| e.to_string())?;
+        extra.push(x);
+    }
+    let mut queues: Vec<Vec<RangeFilter>> = vec![Vec::new(); workers];
+    for (i, f) in filters.into_iter().enumerate() {
+        queues[i % workers].push(f);
+    }
+    let sessions: Vec<&mut ReadOnlySession> = std::iter::once(s).chain(extra.iter_mut()).collect();
+    let jobs = sessions
+        .into_iter()
+        .zip(queues)
+        .map(|(sess, queue)| async move {
+            let mut parts = Vec::with_capacity(queue.len());
+            for f in &queue {
+                if stopped(config) {
+                    return Err("the run was stopped".to_string());
+                }
+                parts.push(
+                    scan_fingerprint(sess, plan, side, src, mapping_hash, mode, Some(f)).await?,
+                );
+            }
+            Ok::<_, String>(parts)
+        });
+    let mut parts = Vec::new();
+    for r in futures_util::future::join_all(jobs).await {
+        parts.extend(r?);
+    }
+    merge_fingerprints(&parts).map_err(|e| e.to_string())
+}
+
+/// The cut points for a split, read on one side.
+async fn read_cuts(
+    s: &mut ReadOnlySession,
+    src: &Source,
+    column: &str,
+    ty: RangeType,
+    parts: u32,
+) -> Result<Vec<String>, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            range_cuts(&*to, src, column, ty, parts)
                 .await
                 .map_err(|e| run_err(RunError::from(e)))
         })
@@ -677,12 +825,17 @@ async fn drill_rows(
     side: Side,
     src: &Source,
     buckets: &[u32],
+    mode: HashMode,
 ) -> Result<Vec<crate::core::drilldown::RowRef>, String> {
     s.with_read_only("300s", |to| {
         Box::pin(async move {
-            fetch_rows(&*to, plan, side, src, buckets)
-                .await
-                .map_err(|e| run_err(RunError::from(e)))
+            let r = match mode {
+                HashMode::Server => fetch_rows(&*to, plan, side, src, buckets).await,
+                HashMode::App => {
+                    crate::core::apphash::fetch_rows_app(&*to, plan, side, src, buckets).await
+                }
+            };
+            r.map_err(|e| run_err(RunError::from(e)))
         })
     })
     .await
@@ -695,12 +848,18 @@ async fn drill_values(
     side: Side,
     src: &Source,
     hashes: &[String],
+    mode: HashMode,
 ) -> Result<std::collections::HashMap<String, Vec<Option<String>>>, String> {
     s.with_read_only("300s", |to| {
         Box::pin(async move {
-            scan::values_by_key_hash(&*to, plan, side, src, hashes)
-                .await
-                .map_err(|e| run_err(RunError::from(e)))
+            let r = match mode {
+                HashMode::Server => scan::values_by_key_hash(&*to, plan, side, src, hashes).await,
+                HashMode::App => {
+                    crate::core::apphash::values_by_key_hash_app(&*to, plan, side, src, hashes)
+                        .await
+                }
+            };
+            r.map_err(|e| run_err(RunError::from(e)))
         })
     })
     .await
@@ -926,6 +1085,16 @@ async fn run_live(
 
     let mut b = Builder::new(run_id, mapping_hash.clone(), def_hash);
     b.set_sql_ascii(old_info.sql_ascii || new_info.sql_ascii);
+    // md5 unavailable on a side (FIPS): hash that side in the app (PLAN 2.2).
+    let modes = Modes {
+        old: HashMode::of(old_info.md5_available),
+        new: HashMode::of(new_info.md5_available),
+    };
+    for (side, mode) in [("old", modes.old), ("new", modes.new)] {
+        if let Some(w) = app_hash_warning(side, mode) {
+            b.results.warnings.push(w);
+        }
+    }
     if old_info.sql_ascii {
         b.results
             .warnings
@@ -1149,6 +1318,7 @@ async fn run_live(
             p,
             &mapping_hash,
             &mut b.results,
+            modes,
         )
         .await?;
         e.facts.change_detection_old = Some(change_detection_word(old_cd));
@@ -1251,6 +1421,7 @@ async fn scan_pair(
     p: &Pair,
     mapping_hash: &str,
     results: &mut RunResults,
+    modes: Modes,
 ) -> Result<Evidence, RunError> {
     let fault = |why: String| Ok(Evidence::new(&p.path, p.level, Outcome::Fault(why)));
     checkpoint(config)?;
@@ -1380,9 +1551,93 @@ async fn scan_pair(
                 Err(e) => return with_coverage(fault(format!("the plan cannot be built: {e}"))),
             };
             checkpoint(config)?;
-            let ofp = scan_fingerprint(old_s, &plan, Side::Old, &old_src, mapping_hash).await;
+            // Huge tables are split into ranges of a number or date key column
+            // (PLAN.md 3.1); the same cut points are used on both sides.
+            let parts = split_parts_for(p.old_rows.max(p.new_rows));
+            let split = match (parts, split_column(&spec), &config.old, &config.new) {
+                (n, Some(col), Input::Live(op), Input::Live(np)) if n >= 2 => {
+                    match read_cuts(old_s, &old_src, &col.0, col.2, n).await {
+                        Ok(cuts) => range_parts(&cuts).map(|ps| (col, ps, op, np)),
+                        Err(why) => {
+                            return with_coverage(fault(format!(
+                                "the ranges for splitting this table could not be read: {why}"
+                            )))
+                        }
+                    }
+                }
+                _ => None,
+            };
             checkpoint(config)?;
-            let nfp = scan_fingerprint(new_s, &plan, Side::New, &new_src, mapping_hash).await;
+            let (ofp, nfp) = match split {
+                None => {
+                    let ofp = scan_fingerprint(
+                        old_s,
+                        &plan,
+                        Side::Old,
+                        &old_src,
+                        mapping_hash,
+                        modes.old,
+                        None,
+                    )
+                    .await;
+                    checkpoint(config)?;
+                    let nfp = scan_fingerprint(
+                        new_s,
+                        &plan,
+                        Side::New,
+                        &new_src,
+                        mapping_hash,
+                        modes.new,
+                        None,
+                    )
+                    .await;
+                    (ofp, nfp)
+                }
+                Some(((old_col, new_col, ty), ps, op, np)) => {
+                    let filters = |column: &str| -> Vec<RangeFilter> {
+                        ps.iter()
+                            .map(|part| RangeFilter {
+                                column: column.to_string(),
+                                ty,
+                                part: part.clone(),
+                            })
+                            .collect()
+                    };
+                    let ofp = scan_side_in_ranges(
+                        config,
+                        op,
+                        old_s,
+                        &plan,
+                        Side::Old,
+                        &old_src,
+                        mapping_hash,
+                        modes.old,
+                        filters(&old_col),
+                        config.old_parallelism,
+                    )
+                    .await;
+                    checkpoint(config)?;
+                    let nfp = scan_side_in_ranges(
+                        config,
+                        np,
+                        new_s,
+                        &plan,
+                        Side::New,
+                        &new_src,
+                        mapping_hash,
+                        modes.new,
+                        filters(&new_col),
+                        config.new_parallelism,
+                    )
+                    .await;
+                    results.warnings.push(format!(
+                        "{}: scanned in {} ranges of column {old_col} (a large table)",
+                        p.path,
+                        ps.len()
+                    ));
+                    (ofp, nfp)
+                }
+            };
             checkpoint(config)?;
             let (ofp, nfp) = match (ofp, nfp) {
                 (Ok(a), Ok(b)) => (a, b),
@@ -1431,6 +1686,7 @@ async fn scan_pair(
                 &p.path,
                 &mut e,
                 results,
+                modes,
             )
             .await?;
             e.spot = if plan.is_keyed() {
@@ -1568,15 +1824,16 @@ async fn drill(
     table: &str,
     e: &mut Evidence,
     results: &mut RunResults,
+    modes: Modes,
 ) -> Result<(), RunError> {
     if comparison.non_equal().is_empty() || comparison.verdict == CoreVerdict::Error {
         return Ok(());
     }
     let buckets = comparison.drilldown_buckets();
     checkpoint(config)?;
-    let o = drill_rows(old_s, plan, Side::Old, old_src, &buckets).await;
+    let o = drill_rows(old_s, plan, Side::Old, old_src, &buckets, modes.old).await;
     checkpoint(config)?;
-    let n = drill_rows(new_s, plan, Side::New, new_src, &buckets).await;
+    let n = drill_rows(new_s, plan, Side::New, new_src, &buckets, modes.new).await;
     checkpoint(config)?;
     let (o, n) = match (o, n) {
         (Ok(o), Ok(n)) => (o, n),
@@ -1608,9 +1865,9 @@ async fn drill(
             .min(crate::core::drilldown::CHANGED_DETAIL_LIMIT)];
         let hashes: Vec<String> = take.iter().map(|(o, _)| o.key_hash.clone()).collect();
         checkpoint(config)?;
-        let ov = drill_values(old_s, plan, Side::Old, old_src, &hashes).await;
+        let ov = drill_values(old_s, plan, Side::Old, old_src, &hashes, modes.old).await;
         checkpoint(config)?;
-        let nv = drill_values(new_s, plan, Side::New, new_src, &hashes).await;
+        let nv = drill_values(new_s, plan, Side::New, new_src, &hashes, modes.new).await;
         checkpoint(config)?;
         match (ov, nv) {
             (Ok(ov), Ok(nv)) => {
@@ -2145,5 +2402,179 @@ mod tests {
             .await
             .unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(120));
+    }
+
+    // --- Huge-table ranges and app-side hashing on a real table (T067) ---
+
+    #[test]
+    fn split_thresholds() {
+        assert_eq!(split_parts_for(0), 0);
+        assert_eq!(split_parts_for(SPLIT_MIN_ROWS - 1), 0);
+        assert_eq!(split_parts_for(SPLIT_MIN_ROWS), 2);
+        assert_eq!(split_parts_for(5_500_000), 5);
+        assert_eq!(split_parts_for(i64::MAX), SPLIT_MAX_PARTS as u32);
+        assert_eq!(HashMode::of(true), HashMode::Server);
+        assert_eq!(HashMode::of(false), HashMode::App);
+        assert!(app_hash_warning("old", HashMode::Server).is_none());
+        let w = app_hash_warning("new", HashMode::App).unwrap();
+        assert!(w.starts_with("the new database cannot compute md5"), "{w}");
+    }
+
+    fn spec_with(key_types: &[(&str, &str, &str)]) -> crate::plan::TableSpec {
+        use crate::core::normalise::{ColumnMapping, PgType};
+        crate::plan::TableSpec {
+            columns: key_types
+                .iter()
+                .map(|(n, o, nw)| ColumnMapping {
+                    old_name: (*n).into(),
+                    new_name: format!("{n}_new"),
+                    old_type: PgType::parse(o),
+                    new_type: PgType::parse(nw),
+                    options: ColumnOptions::default(),
+                    control_total: false,
+                })
+                .collect(),
+            key: vec![0],
+            old_qualified: "s.t".into(),
+            old_schema: "s".into(),
+            old_name: "t".into(),
+            new_qualified: "s.t".into(),
+            new_schema: "s".into(),
+            new_name: "t".into(),
+            level: CheckLevel::FullValues,
+            bucket_digits: 3,
+            ignored_columns: BTreeMap::new(),
+            dropped: Vec::new(),
+            added: Vec::new(),
+            coverage_complete: true,
+            uncovered: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_split_column_is_a_number_or_date_key_of_one_type() {
+        assert_eq!(
+            split_column(&spec_with(&[("id", "bigint", "bigint")])),
+            Some(("id".into(), "id_new".into(), RangeType::Int8))
+        );
+        assert_eq!(
+            split_column(&spec_with(&[("d", "date", "date")])).map(|c| c.2),
+            Some(RangeType::Date)
+        );
+        // Never text, and never a key whose type differs between the sides.
+        assert_eq!(split_column(&spec_with(&[("k", "text", "text")])), None);
+        assert_eq!(
+            split_column(&spec_with(&[("k", "integer", "bigint")])),
+            None
+        );
+        let mut keyless = spec_with(&[("id", "bigint", "bigint")]);
+        keyless.key.clear();
+        assert_eq!(split_column(&keyless), None);
+    }
+
+    fn demo_profile() -> Option<ConnProfile> {
+        let url = match std::env::var("DMUX_TEST_DEMO_OLD_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                assert!(
+                    std::env::var("CI").as_deref() != Ok("true"),
+                    "CI=true but DMUX_TEST_DEMO_OLD_URL is not set"
+                );
+                return None;
+            }
+        };
+        let rest = url.strip_prefix("postgres://")?;
+        let (creds, hostdb) = rest.split_once('@')?;
+        let (user, pass) = creds.split_once(':')?;
+        let (hostport, db) = hostdb.split_once('/')?;
+        let (host, port) = hostport.split_once(':')?;
+        Some(ConnProfile::new(
+            host,
+            port.parse().ok()?,
+            db,
+            user,
+            pass.to_string(),
+            crate::db::TlsMode::Disable("local test database".to_string()),
+        ))
+    }
+
+    /// The range path on a real table: split into parts, scanned on several
+    /// sessions at once, summed, equals the whole-table scan, in both hashing
+    /// modes; and the app-side whole scan equals the server's.
+    #[tokio::test]
+    async fn a_split_table_sums_to_its_whole_scan_on_a_real_table() {
+        let Some(profile) = demo_profile() else {
+            return;
+        };
+        let config = RunConfig {
+            allow_superuser: true,
+            ..RunConfig::new(Input::Live(profile.clone()), Input::Live(profile.clone()))
+        };
+        let mut s = ReadOnlySession::open(&profile, true).await.unwrap();
+        let live = live_table(&mut s, "demo_bank", "transactions")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec = build_table_spec(
+            &live,
+            &live,
+            SpecInputs {
+                new_schema: "demo_bank",
+                new_name: "transactions",
+                level: CheckLevel::FullValues,
+                mapping: &Mapping::new(),
+                control_total_columns: &BTreeSet::new(),
+                column_options: &BTreeMap::new(),
+                estimated_rows: 20_000,
+            },
+        );
+        let plan = crate::plan::core_table_plan(&spec).unwrap();
+        let src = Source::Table {
+            schema: "demo_bank".into(),
+            name: "transactions".into(),
+        };
+        let whole = scan_fingerprint(&mut s, &plan, Side::Old, &src, "m", HashMode::Server, None)
+            .await
+            .unwrap();
+        assert!(whole.rows > 1000);
+        let app_whole = scan_fingerprint(&mut s, &plan, Side::Old, &src, "m", HashMode::App, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            app_whole, whole,
+            "app-side hashing must equal the server on a real table"
+        );
+        let (col, _, ty) = split_column(&spec).expect("transactions splits on its key");
+        let cuts = read_cuts(&mut s, &src, &col, ty, 7).await.unwrap();
+        let parts = range_parts(&cuts).unwrap();
+        for (mode, workers) in [
+            (HashMode::Server, 3),
+            (HashMode::App, 2),
+            (HashMode::Server, 1),
+        ] {
+            let filters: Vec<RangeFilter> = parts
+                .iter()
+                .map(|p| RangeFilter {
+                    column: col.clone(),
+                    ty,
+                    part: p.clone(),
+                })
+                .collect();
+            let merged = scan_side_in_ranges(
+                &config,
+                &profile,
+                &mut s,
+                &plan,
+                Side::Old,
+                &src,
+                "m",
+                mode,
+                filters,
+                workers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(merged, whole, "{mode:?} with {workers} sessions");
+        }
     }
 }

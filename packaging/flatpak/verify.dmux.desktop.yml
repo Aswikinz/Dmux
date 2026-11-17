@@ -1,0 +1,56 @@
+# Flatpak manifest for the Dmux desktop app. Built in CI by release.yml from the
+# release .deb (the same binary as the other Linux installers), never from source,
+# so the Flatpak is byte-for-byte the build that was tested. CI copies the .deb to
+# packaging/flatpak/dmux.deb and fills @VERSION@ / @DATE@ in the metainfo copy.
+# The app id must match "identifier" in src-tauri/tauri.conf.json.
+#
+# Runtime: GNOME 50 carries WebKitGTK 4.1 (libwebkit2gtk-4.1), GTK 3 and libsoup 3,
+# which is everything Tauri 2 links. It also carries Python 3, which the Flatpak
+# uses for custom checks (hooks); nothing Python-related is bundled here.
+id: verify.dmux.desktop
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: dmux-app
+finish-args:
+  # Dmux connects to PostgreSQL servers.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # The OS keychain (Secret Service) for saved passwords.
+  - --talk-name=org.freedesktop.secrets
+  # No filesystem access. Files are chosen through the portal file dialog.
+modules:
+  - name: dmux
+    buildsystem: simple
+    build-commands:
+      # A .deb is an ar archive holding data.tar.*; the app installs under usr/.
+      - ar x dmux.deb
+      - mkdir deb-root
+      - tar -xf data.tar.* -C deb-root
+      - install -Dm755 deb-root/usr/bin/dmux-app /app/bin/dmux-app
+      # Bundled resources (licences) live in usr/lib/<product name>.
+      - cp -a deb-root/usr/lib/. /app/lib/
+      - install -Dm644 verify.dmux.desktop.desktop /app/share/applications/verify.dmux.desktop.desktop
+      - install -Dm644 verify.dmux.desktop.metainfo.xml /app/share/metainfo/verify.dmux.desktop.metainfo.xml
+      - install -Dm644 icon-128.png /app/share/icons/hicolor/128x128/apps/verify.dmux.desktop.png
+      - install -Dm644 icon-256.png /app/share/icons/hicolor/256x256/apps/verify.dmux.desktop.png
+      - install -Dm644 icon-512.png /app/share/icons/hicolor/512x512/apps/verify.dmux.desktop.png
+    sources:
+      - type: file
+        path: dmux.deb
+      - type: file
+        path: verify.dmux.desktop.desktop
+      - type: file
+        path: verify.dmux.desktop.metainfo.xml
+      - type: file
+        path: ../../src-tauri/icons/128x128.png
+        dest-filename: icon-128.png
+      - type: file
+        path: ../../src-tauri/icons/128x128@2x.png
+        dest-filename: icon-256.png
+      - type: file
+        path: ../../src-tauri/icons/icon.png
+        dest-filename: icon-512.png

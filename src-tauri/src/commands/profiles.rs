@@ -176,13 +176,17 @@ pub fn delete_profile(id: String, state: State<'_, AppState>) -> Result<bool, Co
 /// Return whether a password is stored for a profile, without returning it.
 #[tauri::command]
 pub fn profile_has_password(id: String, state: State<'_, AppState>) -> Result<bool, CommandError> {
-    match state.store()?.get(&id)? {
-        Some(_) => {}
+    let stored = match state.store()?.get(&id)? {
+        Some(stored) => stored,
         None => return Err(CommandError::ProfileNotFound { key: id }),
-    }
+    };
     match state.keychain()?.get(&id) {
         Ok(_) => Ok(true),
-        Err(CommandError::PasswordMissing { .. }) => Ok(false),
+        // No keychain entry: a session-only password kept for the saved fields
+        // (T055) still counts as "a password is available".
+        Err(CommandError::PasswordMissing { .. }) => Ok(state
+            .session_passwords()?
+            .contains(&id, &stored_fields_hash(&stored))),
         Err(e) => Err(e),
     }
 }

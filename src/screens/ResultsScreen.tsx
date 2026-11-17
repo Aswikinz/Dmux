@@ -6,6 +6,7 @@ import { StatusBadge } from '../design/StatusBadge';
 import { ErrorCard } from '../design/ErrorCard';
 import { DataTable } from '../components/DataTable';
 import { TableDetailPanel, WhatWasChecked } from '../components/TableDetailPanel';
+import { CustomChecksPanel } from '../components/CustomChecksPanel';
 import { LEVEL_LABELS, VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
@@ -311,6 +312,8 @@ export function ResultsScreen({
           recorded reason, and no table changed during the check.
         </p>
       </Panel>
+
+      {results.customChecks && <CustomChecksPanel checks={results.customChecks} />}
 
       {results.failures.length > 0 && (
         <Panel>

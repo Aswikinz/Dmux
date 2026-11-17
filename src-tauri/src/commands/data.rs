@@ -81,7 +81,13 @@ pub struct TableCheckDto {
     pub schema_name: String,
     pub table_name: String,
     pub level: CheckLevel,
+    /// Columns Dmux *suggests* as control totals.  Nothing is checked as a
+    /// control total until the user confirms it (the UI sends only confirmed
+    /// names to `start_run`).
     pub control_total_columns: Option<Vec<String>>,
+    /// The table's size on the old database, in bytes (0 when unknown), so the
+    /// UI can select tables by size.
+    pub size_bytes: i64,
 }
 
 /// The check plan, mirroring the contract's `CheckPlan`.
@@ -236,6 +242,9 @@ pub struct ResultsDto {
     pub mapping_hash: String,
     pub results_sha256: String,
     pub connections: dmux_engine::results::Connections,
+    /// Custom checks (Python scripts), present only when they ran for this run.
+    /// The `verdict` above already includes any custom failure.
+    pub custom_checks: Option<crate::hooks::CustomChecksDto>,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +258,26 @@ fn is_control_total_name(name: &str) -> bool {
     ["amt", "bal", "amount", "balance", "total"]
         .iter()
         .any(|s| lower.contains(s))
+}
+
+/// Whether a column's type is a number (PLAN 4.4 suggests number columns only:
+/// summing text or dates means nothing).
+fn is_number_type(type_name: &str) -> bool {
+    let t = type_name.trim().to_ascii_lowercase();
+    [
+        "numeric",
+        "decimal",
+        "integer",
+        "int",
+        "bigint",
+        "smallint",
+        "real",
+        "double precision",
+        "float",
+        "money",
+    ]
+    .iter()
+    .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))
 }
 
 /// Build a check plan from two live databases (PLAN 4.4-4.5).  Every level and
@@ -295,7 +324,7 @@ pub async fn build_check_plan(
                 table
                     .columns
                     .iter()
-                    .filter(|c| is_control_total_name(&c.name))
+                    .filter(|c| is_control_total_name(&c.name) && is_number_type(&c.type_name))
                     .map(|c| c.name.clone())
                     .collect()
             } else {
@@ -313,6 +342,7 @@ pub async fn build_check_plan(
                 table_name: table.name.clone(),
                 level: CheckLevel::FullValues,
                 control_total_columns: (!controls.is_empty()).then_some(controls),
+                size_bytes: table.size_bytes.max(0),
             });
             estimate_inputs.push((schema.name.clone(), table.name.clone()));
         }
@@ -485,8 +515,10 @@ pub(crate) fn start_run_with(
     let mapping = validate_mapping(&input.mapping)?;
     let old_profile = resolve(&input.old, state)?;
     let new_profile = resolve(&input.new, state)?;
-    let old_parallelism = input.old_parallelism.unwrap_or(2);
-    let new_parallelism = input.new_parallelism.unwrap_or(4);
+    // The request's limits, else the ones saved in Settings (2 and 4 by default).
+    let prefs = crate::prefs::Prefs::load(&*state.store()?)?;
+    let (old_parallelism, new_parallelism) =
+        crate::prefs::effective_parallelism(input.old_parallelism, input.new_parallelism, &prefs);
     if old_parallelism == 0 || new_parallelism == 0 {
         return Err(CommandError::InvalidInput {
             message: "the parallel-scan limits must be at least 1".to_string(),
@@ -496,6 +528,7 @@ pub(crate) fn start_run_with(
 
     let run_id = RunManager::fresh_id();
     let resume_store = crate::state::resume_store_path(state, &run_id)?;
+    state.note_run_start(&run_id, &input.old.profile.label, &input.new.profile.label);
 
     let config = RunConfig {
         mapping,
@@ -513,6 +546,7 @@ pub(crate) fn start_run_with(
 
     let manager = Arc::clone(&state.runs);
     manager.insert(&run_id, RunHandle::new(config, Some(resume_store)));
+    manager.set_hook_plan(&run_id, crate::hooks::plan_for_new_run(state)?);
     let ticket = manager
         .begin_first(&run_id)
         .ok_or_else(|| CommandError::internal("the new run could not be started"))?;
@@ -535,6 +569,9 @@ fn spawn_drive_task(manager: &Arc<RunManager>, run_id: &str, ticket: DriveTicket
             let config = ticket.config;
             let out =
                 tauri::async_runtime::block_on(async { run(&config).await }).map(|o| o.results);
+            // Custom checks run here, on this blocking thread, before the run
+            // is reported finished (so results never appear without them).
+            crate::hooks::after_run(&manager, &rid, generation, &out);
             manager.finish(&rid, generation, out);
         }
     });
@@ -748,8 +785,47 @@ pub async fn get_results(
 }
 
 pub(crate) fn get_results_with(run_id: &str, state: &AppState) -> Result<ResultsDto, CommandError> {
+    if state.runs.phase(run_id).is_none() {
+        if let Some(opened) = state.opened_results(run_id)? {
+            return Ok(map_opened(run_id, &opened));
+        }
+    }
     let results = state.runs.results(run_id)?;
-    Ok(map_results(run_id, &results))
+    // Custom checks, when they ran: the folded results, the verdict that
+    // includes any custom failure, and the findings themselves.
+    match state.runs.hook_run(run_id)? {
+        None => Ok(map_results(run_id, &results)),
+        Some(hooks) => {
+            let mut dto = map_results(run_id, &hooks.results);
+            dto.verdict = verdict_string(hooks.displayed_verdict());
+            dto.custom_checks = Some(crate::hooks::CustomChecksDto::from_run(&hooks));
+            Ok(dto)
+        }
+    }
+}
+
+/// Map verified results that were opened from history or a file.  For a hook
+/// envelope the overall verdict is the worse of the results verdict and every
+/// custom-check finding, and each finding is listed as a warning, so a failed
+/// custom check can never show as PASS.
+pub(crate) fn map_opened(run_id: &str, opened: &crate::history::Opened) -> ResultsDto {
+    let mut dto = map_results(run_id, &opened.results);
+    if let Some(hooks) = &opened.hooks {
+        dto.verdict = verdict_string(opened.displayed_verdict());
+        for f in &hooks.custom_checks {
+            dto.warnings.push(format!(
+                "Custom check ({}): {}{}",
+                f.severity,
+                f.message,
+                f.table
+                    .as_deref()
+                    .map(|t| format!(" [{t}]"))
+                    .unwrap_or_default()
+            ));
+        }
+        dto.warnings.extend(hooks.warnings.iter().cloned());
+    }
+    dto
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +962,7 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
         mapping_hash: results.mapping_hash.clone(),
         results_sha256: results.results_sha256.clone(),
         connections: results.connections.clone(),
+        custom_checks: None,
     }
 }
 
@@ -1032,6 +1109,31 @@ mod tests {
     }
 
     // --- Pure mapping tests (no server) ---
+
+    #[test]
+    fn only_number_types_are_suggested_as_control_totals() {
+        for t in [
+            "numeric(18,2)",
+            "numeric",
+            "bigint",
+            "integer",
+            "double precision",
+            "money",
+            "real",
+        ] {
+            assert!(is_number_type(t), "{t}");
+        }
+        for t in [
+            "text",
+            "character varying(20)",
+            "date",
+            "timestamp without time zone",
+            "interval",
+            "bytea",
+        ] {
+            assert!(!is_number_type(t), "{t}");
+        }
+    }
 
     #[test]
     fn control_total_names_are_recognised() {

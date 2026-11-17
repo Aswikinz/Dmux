@@ -117,7 +117,16 @@ export interface Inventory {
   newServerVersion?: string;
 }
 
-export type MatchConfidence = 'exact' | 'case' | 'fuzzy';
+export type MatchConfidence = 'exact' | 'case' | 'fuzzy' | 'rule' | 'confirmed';
+
+/** A table or column in the old database, as separate parts so a name that
+ *  contains a dot is never split by guesswork. */
+export interface MappingItemRef {
+  schema: string;
+  table: string;
+  /** Present for a column. */
+  column?: string;
+}
 
 export interface MappingMatch {
   id: string;
@@ -126,7 +135,50 @@ export interface MappingMatch {
   confidence: MatchConfidence;
   /** User has approved this match. */
   approved: boolean;
+  /** Which old table or column this is, when the engine said (a real run). */
+  ref?: MappingItemRef;
+  /** New names the engine says could be the counterpart. */
+  candidates?: string[];
 }
+
+/** A guess at the new counterpart of an unmatched item.  Never used until the
+ *  user accepts it. */
+export interface MappingSuggestion {
+  /** The id of the queue item this applies to. */
+  id: string;
+  ref: MappingItemRef;
+  /** A bare table or column name on the new side. */
+  candidate: string;
+  /** How alike the names are, 0 to 100. */
+  confidence: number;
+}
+
+/** A table or column that exists only in the new database. */
+export interface UnmatchedNewItem {
+  id: string;
+  /** For a column, `table` is the old table's new counterpart. */
+  ref: MappingItemRef;
+}
+
+/** A rename rule.  Rules apply to table names only. */
+export interface MappingRule {
+  kind: 'schema_rename' | 'prefix_replace' | 'suffix_replace';
+  pattern: string;
+  target: string;
+}
+
+/** How many tables a set of rules would pair. */
+export interface RulePreview {
+  tablesTotal: number;
+  tablesByRules: number;
+  tablesMatched: number;
+}
+
+/** A change to the mapping, checked by the backend before it is applied. */
+export type MappingEdit =
+  | { kind: 'pair_table'; schema: string; table: string; newTable: string }
+  | { kind: 'pair_column'; schema: string; table: string; column: string; newColumn: string }
+  | { kind: 'ignore'; path: string; reason: string };
 
 export interface IgnoreItem {
   id: string;
@@ -135,8 +187,14 @@ export interface IgnoreItem {
 }
 
 export interface Mapping {
-  /** Rules such as old schema -> new schema or prefix renames. */
+  /** Rules such as old schema -> new schema or prefix renames, in words. */
   rules: string[];
+  /** The same rules in structured form (what the rule editor shows). */
+  ruleSpecs?: MappingRule[];
+  /** Guesses for unmatched items; used only when the user accepts one. */
+  suggestions?: MappingSuggestion[];
+  /** Items only the new database has: what a pairing picker can offer. */
+  unmatchedNew?: UnmatchedNewItem[];
   matches: MappingMatch[];
   /** Queue of items that need human attention. */
   needsAttention: MappingMatch[];
@@ -150,8 +208,13 @@ export interface TableCheck {
   schemaName: string;
   tableName: string;
   level: CheckLevel;
-  /** Column names proposed as control totals when level is counts or full-values. */
+  /** Control-total columns the user has confirmed.  Only these are checked. */
   controlTotalColumns?: string[];
+  /** Number columns Dmux suggests (names like amount or balance).  Nothing is
+   *  checked until the user ticks one. */
+  controlTotalSuggestions?: string[];
+  /** Size on the old database, in bytes, when known. */
+  sizeBytes?: number;
 }
 
 export interface CheckPlan {
@@ -339,6 +402,79 @@ export interface Results {
   warnings: string[];
   /** What was checked, run-wide.  Absent in browser-demo fixtures that do not model it. */
   runFacts?: RunFacts;
+  /** Present only when custom checks ran for this run.  `verdict` above already
+   *  includes any custom failure. */
+  customChecks?: CustomChecks;
+}
+
+export type CustomSeverity = 'info' | 'warning' | 'fail';
+
+export interface CustomFinding {
+  id: string;
+  severity: CustomSeverity;
+  /** Already stripped of control characters by the backend; shown as text. */
+  message: string;
+  table?: string;
+}
+
+/** What the custom checks (the user's Python scripts) reported for a run. */
+export interface CustomChecks {
+  findings: CustomFinding[];
+  /** Each script that ran, with the SHA-256 of the code that ran. */
+  scripts: { name: string; sha256: string }[];
+  /** Scripts that did not run, timed out or returned bad output. */
+  warnings: string[];
+}
+
+/** One script in the chosen custom-checks folder. */
+export interface ScriptEntry {
+  name: string;
+  /** False when Dmux refuses to run it; `reason` says why. */
+  usable: boolean;
+  reason?: string;
+}
+
+export interface FolderScan {
+  /** Set when the whole folder is refused or unreadable. */
+  folderProblem?: string;
+  scripts: ScriptEntry[];
+}
+
+/** The app settings the Settings screen edits.  Appearance lives in the UI. */
+export interface AppSettings {
+  customChecksEnabled: boolean;
+  /** Chosen with a native folder dialog opened by the backend. */
+  hooksFolder?: string;
+  folderScan?: FolderScan;
+  /** A Python chosen with a native file dialog; absent means automatic. */
+  pythonPath?: string;
+  pythonSource: 'chosen' | 'bundled' | 'auto';
+  /** The interpreter that would run now; absent when none can be found. */
+  pythonFound?: string;
+  timeoutSecs: number;
+  /** The honest warning shown wherever custom checks are on. */
+  warning: string;
+  /** The check level a new plan starts from ('suggested' keeps the engine's own). */
+  startingLevel: 'suggested' | 'structure' | 'counts' | 'full-values';
+  /** Parallel scans per side (at least 1). */
+  oldParallelism: number;
+  newParallelism: number;
+  /** Where the Report screen's "include row keys" box starts. */
+  includeKeysDefault: boolean;
+  appVersion: string;
+  /** Where Dmux keeps its data (read-only). */
+  dataDir: string;
+  licence: string;
+}
+
+/** What the webview may change.  It never sends a path. */
+export interface AppSettingsUpdate {
+  customChecksEnabled?: boolean;
+  timeoutSecs?: number;
+  startingLevel?: AppSettings['startingLevel'];
+  oldParallelism?: number;
+  newParallelism?: number;
+  includeKeysDefault?: boolean;
 }
 
 export type ReportFormat = 'pdf' | 'excel';
@@ -369,4 +505,36 @@ export interface RunDefinition {
   newProfile: ConnectionProfile;
   mapping: Mapping;
   plan: CheckPlan;
+}
+
+/** One finished run in the local history.  Metadata only: the verified results
+ *  are loaded on demand with `openHistoryEntry`. */
+export interface HistoryEntry {
+  id: string;
+  /** When the run started and finished, as ISO 8601 text (UTC). */
+  startedAt: string;
+  endedAt: string;
+  verdict: Verdict;
+  /** Whether column options were applied ("PASS (with options)"). */
+  optionsApplied: boolean;
+  /** Whether the run recorded its options. */
+  optionsRecorded: boolean;
+  /** The coverage line, e.g. "40 of 40 tables fully checked, ...". */
+  coverage: string;
+  oldLabel: string;
+  newLabel: string;
+  mappingHash: string;
+  definitionHash: string;
+  resultsSha256: string;
+}
+
+/** The outcome of "Open a results file": verified results, a dismissed dialog,
+ *  or a plain refusal (for example a file that was changed after Dmux wrote it). */
+export interface OpenResultsResult {
+  ok: boolean;
+  /** Present only when the file passed verification. */
+  results?: Results;
+  /** The user dismissed the open dialog; nothing was read. */
+  cancelled?: boolean;
+  error?: string;
 }

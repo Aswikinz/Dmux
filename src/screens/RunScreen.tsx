@@ -7,6 +7,7 @@ import { StatusBadge } from '../design/StatusBadge';
 import { ErrorCard } from '../design/ErrorCard';
 import { VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { formatDurationRange } from '../components/duration';
+import { HookWarning } from '../components/HookWarning';
 import type { Engine } from '../api/engine';
 import type { RunDefinition, RunProgress, Verdict } from '../api/contract';
 
@@ -33,6 +34,8 @@ export function RunScreen({
   // shows a neutral "finished" next to a FAIL the user has not seen yet.
   const [verdict, setVerdict] = useState<{ word: Verdict; label?: string } | null>(null);
   const [verdictError, setVerdictError] = useState<string | null>(null);
+  // Custom checks on: the user confirms the warning before the run starts.
+  const [gate, setGate] = useState<'loading' | 'ask' | 'go'>(progress ? 'go' : 'loading');
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -49,13 +52,31 @@ export function RunScreen({
         }
       }
     }
-    if (!progress) {
+    if (!progress && gate === 'go') {
       void start();
     }
     return () => {
       mounted = false;
     };
-  }, [engine, definition, progress, onProgressChange]);
+  }, [engine, definition, progress, onProgressChange, gate]);
+
+  useEffect(() => {
+    if (progress || gate !== 'loading') return;
+    let mounted = true;
+    engine
+      .getSettings()
+      .then((s) => {
+        if (mounted) setGate(s.customChecksEnabled ? 'ask' : 'go');
+      })
+      .catch(() => {
+        // If the setting cannot be read, the backend still decides; the run
+        // result shows whether custom checks ran.
+        if (mounted) setGate('go');
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [engine, progress, gate]);
 
   useEffect(() => {
     if (!progress || progress.overallState === 'done' || progress.overallState === 'cancelled') {
@@ -129,6 +150,24 @@ export function RunScreen({
     <div className="space-y-6">
       <ScreenHeader title="Run checks" subtitle="Dmux reads both databases and compares them. You can pause or cancel at any time." />
       {error && <ErrorCard title="Run error">{error}</ErrorCard>}
+      {!progress && gate === 'ask' && (
+        <Panel>
+          <h3 className="text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">
+            Custom checks are on
+          </h3>
+          <HookWarning className="mt-3">
+            After the comparison, the scripts in your custom checks folder will run. You can turn them off in Settings.
+          </HookWarning>
+          <div className="mt-4 flex gap-3">
+            <Button variant="secondary" onClick={onBack}>
+              Back
+            </Button>
+            <Button variant="primary" onClick={() => setGate('go')}>
+              Start with custom checks
+            </Button>
+          </div>
+        </Panel>
+      )}
       {progress && (
         <>
           <Panel>

@@ -64,7 +64,7 @@ A verification tool has one unforgivable failure: saying PASS when the data diff
 
 | Challenge | What goes wrong | How Dmux handles it |
 | --- | --- | --- |
-| The laptop cannot reach the database | Production databases sit behind jump servers | A command-line runner with the same engine runs on the jump server and renders the PDF and Excel reports from its results file; opening that file in the desktop app is planned after version 1.0 |
+| The laptop cannot reach the database | Production databases sit behind jump servers | A command-line runner with the same engine runs on the jump server and renders the PDF and Excel reports from its results file; the desktop app opens that file too, after the same SHA-256 check |
 | Locked-down PCs | Unsigned installers are blocked, users have no admin rights, machines are offline | Signed builds, a per-user installer, a portable build, an offline installer, no auto-update and no telemetry |
 | Old servers and odd logins | Self-signed certificates, a bank's private certificate authority, old encryption, Kerberos | Dmux accepts the bank's CA file and still checks the host name; otherwise it shows the certificate fingerprint to trust once; an unencrypted connection needs a visible choice that is recorded in the report; Kerberos login is not supported in version 1 |
 | Remote desktops and weak graphics | Blur effects stutter over remote desktop and on Linux | A "reduced effects" theme with solid panels switches on automatically when blur is slow |
@@ -221,7 +221,7 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 
 - `dmux capture`, `dmux compare` and `dmux run <definition file>` use the same engine as the app.
 - Exit codes are 0 for pass, 1 for fail and 2 for warnings, so runs can be scripted.
-- `dmux report` renders the PDF and Excel reports from a results file written on a jump server, after checking its SHA-256. Opening that file in the desktop app for review is planned after version 1.0.
+- `dmux report` renders the PDF and Excel reports from a results file written on a jump server, after checking its SHA-256. The desktop app opens the same file from its History screen, with the same check, and shows only verified results.
 
 ### 4.9 Python hooks
 
@@ -378,12 +378,13 @@ GitHub Actions checks every pull request, runs the heavy tests nightly, and buil
 
 | Platform | Package | Notes |
 | --- | --- | --- |
-| Windows | Setup `.exe` (per user, no admin rights) | Carries the offline WebView2 installer, for PCs with no internet |
+| Windows | Setup `.exe` (per user, no admin rights) | Downloads WebView2 if the PC lacks it. Carries its own Python for custom checks |
+| Windows | Offline setup `.exe` | The same installer with the offline WebView2 installer embedded (about 127 MB larger), for PCs with no internet. A separate file so the normal installer stays small |
 | Windows | `.msi` | For IT teams that deploy centrally |
-| Windows | Portable `.zip` | Runs with no install, for locked-down PCs |
+| Windows | Portable `.zip` | Runs with no install, for locked-down PCs. WebView2 must already be on the PC. Carries its own Python in a `python\` folder |
 | Linux | AppImage | One file; needs FUSE 2 on the machine |
 | Linux | `.deb` and `.rpm` | Ubuntu and Debian; Fedora and RHEL |
-| Linux | Flatpak bundle file | Attached to the release. A Flathub listing comes later, because Flathub requires fully offline builds from source |
+| Linux | Flatpak bundle file | Built from the release `.deb` on the GNOME runtime. Attached to the release. A Flathub listing comes later, because Flathub requires fully offline builds from source |
 | Both | `dmux` command-line binary | Static build, for jump servers |
 
 - Installers are built on GitHub's servers: Ubuntu 22.04 for wide Linux compatibility, and Windows. The Arch laptop builds only the development version.

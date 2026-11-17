@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>verify.dmux.desktop</id>
+  <name>Dmux</name>
+  <summary>Prove a PostgreSQL migration copied every row and value</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <description>
+    <p>Dmux compares an old and a new PostgreSQL database and shows, check by check, whether every row and value was copied. It only reads from your databases and never changes them.</p>
+  </description>
+  <url type="homepage">https://github.com/Aswikinz/Dmux</url>
+  <launchable type="desktop-id">verify.dmux.desktop.desktop</launchable>
+  <provides>
+    <binary>dmux-app</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

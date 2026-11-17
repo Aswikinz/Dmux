@@ -5,7 +5,31 @@ import { Button } from '../design/Button';
 import { MappingQueue } from '../components/MappingQueue';
 import { ErrorCard } from '../design/ErrorCard';
 import type { Engine } from '../api/engine';
-import type { Inventory, Mapping } from '../api/contract';
+import { RuleEditor } from '../components/RuleEditor';
+import type { PickerOption } from '../components/PairPicker';
+import type {
+  Inventory,
+  Mapping,
+  MappingEdit,
+  MappingMatch,
+  MappingRule,
+  MappingSuggestion,
+} from '../api/contract';
+
+/** The edit that pairs `item` with the new-side name `value`. */
+function pairEdit(item: MappingMatch, value: string): MappingEdit | null {
+  const ref = item.ref;
+  if (!ref) return null;
+  return ref.column === undefined
+    ? { kind: 'pair_table', schema: ref.schema, table: ref.table, newTable: value }
+    : {
+        kind: 'pair_column',
+        schema: ref.schema,
+        table: ref.table,
+        column: ref.column,
+        newColumn: value,
+      };
+}
 
 interface MapScreenProps {
   engine: Engine;
@@ -27,6 +51,8 @@ export function MapScreen({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -66,10 +92,65 @@ export function MapScreen({
     onMappingChange(next);
   };
 
+  /** Send changes to the engine, which checks every name against the live
+   *  databases.  A refusal is shown as it is and leaves the mapping alone. */
+  async function applyEdits(edits: MappingEdit[]) {
+    if (!mapping) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      onMappingChange(await engine.editMapping(mapping, edits));
+    } catch (e) {
+      setEditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  const handleAccept = (item: MappingMatch, suggestion: MappingSuggestion) => {
+    const edit = pairEdit(item, suggestion.candidate);
+    if (edit) void applyEdits([edit]);
+  };
+
+  const handlePick = (item: MappingMatch, value: string) => {
+    const edit = pairEdit(item, value);
+    if (edit) void applyEdits([edit]);
+  };
+
+  /** What the picker offers for an item: the new database's unmatched items of
+   *  the same kind, plus any candidates the engine named. */
+  const pickerOptions = (item: MappingMatch): PickerOption[] => {
+    const ref = item.ref;
+    if (!mapping || !ref) return [];
+    const names = new Set<string>();
+    for (const u of mapping.unmatchedNew ?? []) {
+      if (u.ref.schema !== ref.schema) continue;
+      if (ref.column === undefined && u.ref.column === undefined) names.add(u.ref.table);
+      if (ref.column !== undefined && u.ref.column !== undefined && u.ref.table === ref.table) {
+        names.add(u.ref.column);
+      }
+    }
+    for (const c of item.candidates ?? []) names.add(c);
+    return [...names].sort().map((n) => ({ value: n, label: n }));
+  };
+
+  const handlePreviewRules = (rules: MappingRule[]) => engine.previewRules(rules);
+
+  const handleApplyRules = async (rules: MappingRule[]) => {
+    setEditError(null);
+    onMappingChange(await engine.rebuildMapping(rules));
+  };
+
   const handleIgnore = (id: string, reason: string) => {
     if (!mapping) return;
     const item = mapping.needsAttention.find((m) => m.id === id);
     if (!item) return;
+    // An item the engine named is ignored in the engine's own mapping, so the
+    // run leaves it out; anything else is only noted here.
+    if (item.ref) {
+      void applyEdits([{ kind: 'ignore', path: item.id, reason }]);
+      return;
+    }
     const next: Mapping = {
       ...mapping,
       matches: mapping.matches.filter((m) => m.id !== id),
@@ -104,6 +185,14 @@ export function MapScreen({
       {mapping && (
         <>
           <Panel>
+            <h2 className="mb-2 text-base font-semibold">Rename rules</h2>
+            <RuleEditor
+              rules={mapping.ruleSpecs ?? []}
+              onPreview={handlePreviewRules}
+              onApply={handleApplyRules}
+            />
+          </Panel>
+          <Panel>
             <div className="mb-4 flex items-center justify-between">
               <div className="text-sm text-slate-600 dark:text-slate-300">
                 {mapping.matches.length} matched{' '}
@@ -113,11 +202,29 @@ export function MapScreen({
                 {saving ? 'Saving…' : 'Save mapping'}
               </Button>
             </div>
+            {editError && (
+              <ErrorCard title="That change was not made" className="mb-4">
+                {editError}
+              </ErrorCard>
+            )}
             <MappingQueue
               queue={mapping.needsAttention}
               onApprove={handleApprove}
               onIgnore={handleIgnore}
+              suggestions={mapping.suggestions}
+              onAcceptSuggestion={handleAccept}
+              pickerOptions={pickerOptions}
+              onPick={handlePick}
+              busy={editBusy}
             />
+            {(mapping.unmatchedNew?.length ?? 0) > 0 && (
+              <p className="mt-4 text-sm text-slate-600 dark:text-slate-300">
+                {mapping.unmatchedNew?.length === 1
+                  ? '1 item exists only in the new database.'
+                  : `${mapping.unmatchedNew?.length} items exist only in the new database.`}{' '}
+                They are offered when you choose a counterpart.
+              </p>
+            )}
             {mapping.ignored.length > 0 && (
               <div className="mt-4 rounded-lg border border-slate-200 p-3 dark:border-slate-700">
                 <h3 className="mb-2 text-sm font-semibold">Ignored</h3>

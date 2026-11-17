@@ -570,3 +570,221 @@ async fn domain_columns_use_the_base_rule_live() {
             .is_pass());
     }
 }
+
+// --- App-side hashing (PLAN 2.2) and huge-table ranges (PLAN 3.1) ---
+
+use super::apphash::{fetch_rows_app, fingerprint_app, values_by_key_hash_app};
+use super::fingerprint::{
+    fingerprint_range, merge_fingerprints, range_cuts, range_parts, RangeFilter, RangeType,
+};
+
+async fn app_fp(
+    t: &Transaction<'_>,
+    plan: &TablePlan,
+    side: Side,
+    src: &'static str,
+) -> Fingerprint {
+    fingerprint_app(t, plan, side, &Source::Derived(src), None, "m")
+        .await
+        .unwrap()
+}
+
+/// The app-side fingerprint is bit-identical to the server's, on both
+/// servers, for every fixture: accents in LATIN1, quotes and commas, empty
+/// versus NULL, bytea, floats, arrays, ranges, money, intervals, json and
+/// control totals; keyed and keyless.
+#[tokio::test]
+async fn app_side_hashing_equals_the_server_on_both_servers() {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    let gen_cols: Vec<_> = ["id", "v"]
+        .iter()
+        .map(|n| plan_column(&mapping(n, "text")).unwrap())
+        .collect();
+    let cases: Vec<(TablePlan, Side, &'static str)> = vec![
+        (accounts_plan(), Side::Old, ACC_A),
+        (accounts_plan(), Side::New, ACC_B),
+        (
+            TablePlan::new(gen_cols.clone(), vec![0], 2).unwrap(),
+            Side::Old,
+            GEN,
+        ),
+        (TablePlan::new(gen_cols, vec![], 2).unwrap(), Side::Old, GEN),
+        (types_plan(vec![0]), Side::Old, TYPES_OLD),
+        (types_plan(vec![0]), Side::New, TYPES_NEW),
+        (types_plan(vec![]), Side::Old, TYPES_OLD),
+        (types_plan(vec![]), Side::New, TYPES_NEW),
+    ];
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        for (plan, side, src) in &cases {
+            let server = fp(&t, plan, *side, src).await;
+            let app = app_fp(&t, plan, *side, src).await;
+            assert_eq!(
+                app, server,
+                "app-side hashing must equal the server for {src}"
+            );
+        }
+        t.rollback().await.unwrap();
+    }
+}
+
+/// App-side drill-down rows and changed-row values equal the server path.
+#[tokio::test]
+async fn app_side_drilldown_equals_the_server() {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    let plan = accounts_plan();
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        let a = fp(&t, &plan, Side::Old, ACC_A).await;
+        let b = fp(&t, &plan, Side::New, ACC_B).await;
+        let cmp = compare(SideOutcome::Ok(&a), SideOutcome::Ok(&b)).unwrap();
+        let buckets = cmp.drilldown_buckets();
+        for (side, src) in [(Side::Old, ACC_A), (Side::New, ACC_B)] {
+            let s = Source::Derived(src);
+            let mut server = fetch_rows(&t, &plan, side, &s, &buckets).await.unwrap();
+            let mut app = fetch_rows_app(&t, &plan, side, &s, &buckets).await.unwrap();
+            server.sort_by(|x, y| x.key_hash.cmp(&y.key_hash));
+            app.sort_by(|x, y| x.key_hash.cmp(&y.key_hash));
+            assert_eq!(app, server);
+            assert!(!app.is_empty());
+        }
+        // Changed-row values: the server path's changed_detail versus the app's.
+        let old_rows = fetch_rows(&t, &plan, Side::Old, &Source::Derived(ACC_A), &buckets)
+            .await
+            .unwrap();
+        let new_rows = fetch_rows(&t, &plan, Side::New, &Source::Derived(ACC_B), &buckets)
+            .await
+            .unwrap();
+        let d = classify(old_rows, new_rows);
+        let hashes: Vec<String> = d.changed.iter().map(|(o, _)| o.key_hash.clone()).collect();
+        let detail = changed_detail(
+            &t,
+            &t,
+            &plan,
+            &Source::Derived(ACC_A),
+            &Source::Derived(ACC_B),
+            &d.changed,
+        )
+        .await
+        .unwrap();
+        let app_old =
+            values_by_key_hash_app(&t, &plan, Side::Old, &Source::Derived(ACC_A), &hashes)
+                .await
+                .unwrap();
+        let app_new =
+            values_by_key_hash_app(&t, &plan, Side::New, &Source::Derived(ACC_B), &hashes)
+                .await
+                .unwrap();
+        for row in &detail {
+            assert_eq!(app_old[&row.key_hash], row.old);
+            assert_eq!(app_new[&row.key_hash], row.new);
+        }
+        t.rollback().await.unwrap();
+    }
+}
+
+const SPLIT: &str = r#"(SELECT g AS id, g::text AS v, date '2020-01-01' + g AS d, (g * 1.5)::numeric(10,2) AS amt, CASE WHEN g % 10 = 0 THEN NULL ELSE g END AS nk, timestamp '2021-03-04 05:06:07' + g * interval '37 minutes' AS ts, CASE WHEN g % 3 = 0 THEN 'x' END AS w FROM generate_series(1, 1000) g) AS t"#;
+
+fn split_plan(key: Vec<usize>, digits: u8) -> TablePlan {
+    let spec = [
+        ("id", "integer"),
+        ("v", "text"),
+        ("d", "date"),
+        ("amt", "numeric(10,2)"),
+        ("nk", "integer"),
+        ("ts", "timestamp without time zone"),
+        ("w", "text"),
+    ];
+    let cols = spec
+        .iter()
+        .map(|(n, ty)| {
+            plan_column(&ColumnMapping {
+                control_total: *n == "amt",
+                ..mapping(n, ty)
+            })
+            .unwrap()
+        })
+        .collect();
+    TablePlan::new(cols, key, digits).unwrap()
+}
+
+/// Splitting a table into ranges and summing the parts gives exactly the
+/// unsplit fingerprint, for integer, date, numeric, timestamp and a column
+/// with NULLs, with any number of parts, in both hashing modes.
+#[tokio::test]
+async fn range_parts_sum_to_the_whole_table() {
+    let Some((mut oc, mut nc)) = both().await else {
+        return;
+    };
+    let src = Source::Derived(SPLIT);
+    for c in [&mut oc, &mut nc] {
+        let t = session(c).await;
+        for key in [vec![0], vec![]] {
+            let plan = split_plan(key, 2);
+            let whole = fp(&t, &plan, Side::Old, SPLIT).await;
+            assert_eq!(whole.rows, 1000);
+            for (col, ty) in [
+                ("id", RangeType::Int4),
+                ("d", RangeType::Date),
+                ("amt", RangeType::Numeric),
+                ("nk", RangeType::Int4),
+                ("ts", RangeType::Timestamp),
+            ] {
+                for n in [2u32, 3, 7, 64] {
+                    let cuts = range_cuts(&t, &src, col, ty, n).await.unwrap();
+                    assert!(!cuts.is_empty() && cuts.len() < n as usize);
+                    let parts = range_parts(&cuts).unwrap();
+                    let mut server_parts = Vec::new();
+                    let mut app_parts = Vec::new();
+                    for part in parts {
+                        let r = RangeFilter {
+                            column: col.into(),
+                            ty,
+                            part,
+                        };
+                        server_parts.push(
+                            fingerprint_range(&t, &plan, Side::Old, &src, &r, "m")
+                                .await
+                                .unwrap(),
+                        );
+                        app_parts.push(
+                            fingerprint_app(&t, &plan, Side::Old, &src, Some(&r), "m")
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let merged = merge_fingerprints(&server_parts).unwrap();
+                    assert_eq!(merged, whole, "{col} in {n} parts (server)");
+                    assert_eq!(
+                        merge_fingerprints(&app_parts).unwrap(),
+                        whole,
+                        "{col} in {n} parts (app)"
+                    );
+                }
+            }
+        }
+        t.rollback().await.unwrap();
+    }
+}
+
+/// A column that is entirely NULL (or an empty table) gives no cuts, so the
+/// table is scanned whole rather than split into parts that miss rows.
+#[tokio::test]
+async fn no_cuts_for_an_all_null_column() {
+    let Some((mut oc, _)) = both().await else {
+        return;
+    };
+    let t = session(&mut oc).await;
+    let src = Source::Derived("(SELECT NULL::int AS k FROM generate_series(1, 5)) AS t");
+    let cuts = range_cuts(&t, &src, "k", RangeType::Int4, 4).await.unwrap();
+    assert!(cuts.is_empty());
+    assert!(range_parts(&cuts).is_none());
+    assert!(range_cuts(&t, &src, "k", RangeType::Int4, 1)
+        .await
+        .unwrap()
+        .is_empty());
+}

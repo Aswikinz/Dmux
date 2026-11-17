@@ -6,6 +6,8 @@ export default tseslint.config(
   {
     ignores: [
       'dist/**',
+      // Task working copies live inside the main checkout; they lint themselves.
+      '.worktrees/**',
       'node_modules/**',
       'target/**',
       'src-tauri/target/**',

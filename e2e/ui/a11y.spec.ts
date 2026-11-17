@@ -84,3 +84,68 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await check('report');
   });
 }
+
+/** The Settings page (every section), in both appearances. */
+for (const colorScheme of ['light', 'dark'] as const) {
+  test(`Settings is accessible in ${colorScheme} mode`, async ({ page }) => {
+    await page.emulateMedia({ colorScheme });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    for (const section of ['Appearance', 'Run defaults', 'Reports', 'Custom checks', 'About']) {
+      await expect(page.getByRole('heading', { name: section, exact: true })).toBeVisible();
+    }
+    // Show the folder list too: one script that runs and one that is refused.
+    await page.getByRole('button', { name: 'Choose folder…' }).click();
+    await expect(page.getByText(/Refused:/)).toBeVisible();
+    await page.waitForFunction(() =>
+      document.getAnimations().every((a) => a.playState !== 'running'),
+    );
+    const results = await new AxeBuilder({ page }).analyze();
+    const serious = results.violations.filter(
+      (v) => v.impact === 'serious' || v.impact === 'critical',
+    );
+    expect(
+      serious,
+      serious.map((v) => `${v.id}: ${v.nodes.map((n) => n.failureSummary).join(' | ')}`).join('\n'),
+    ).toEqual([]);
+  });
+}
+
+/** The History screen (list, run log, delete confirmation) in both appearances. */
+for (const colorScheme of ['light', 'dark'] as const) {
+  test(`the History screen is accessible in ${colorScheme} mode`, async ({ page }) => {
+    await page.emulateMedia({ colorScheme });
+    await page.goto('/');
+    const settle = () =>
+      page.waitForFunction(() =>
+        document.getAnimations().every((a) => a.playState !== 'running'),
+      );
+    const check = async (where: string) => {
+      await settle();
+      const results = await new AxeBuilder({ page }).analyze();
+      const serious = results.violations.filter(
+        (v) => v.impact === 'serious' || v.impact === 'critical',
+      );
+      expect(
+        serious,
+        `${where}: ` +
+          serious
+            .map((v) => `${v.id}: ${v.nodes.map((n) => n.failureSummary).join(' | ')}`)
+            .join('\n'),
+      ).toEqual([]);
+    };
+    await page.getByRole('navigation', { name: 'Library' }).getByRole('button', { name: 'History' }).click();
+    await expect(page.getByRole('heading', { name: 'History', exact: true })).toBeVisible();
+    await expect(page.getByText('2026-11-16 09:48 UTC')).toBeVisible();
+    await check('history list');
+
+    await page.getByRole('button', { name: /Show the run log/ }).first().click();
+    await expect(page.getByTestId('run-log-text')).toBeVisible();
+    await check('history run log');
+
+    await page.getByRole('button', { name: 'Delete all history' }).click();
+    await expect(page.getByRole('group', { name: 'Confirm deleting history' })).toBeVisible();
+    await check('history delete confirmation');
+  });
+}
