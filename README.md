@@ -1,4 +1,12 @@
+<p align="center">
+  <img src="src-tauri/icons/128x128.png" alt="Dmux app icon" width="128" />
+</p>
+
 # Dmux
+
+[![CI](https://github.com/Aswikinz/Dmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Aswikinz/Dmux/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Aswikinz/Dmux/branch/main/graph/badge.svg)](https://codecov.io/gh/Aswikinz/Dmux)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Aswikinz_Dmux&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Aswikinz_Dmux)
 
 Dmux proves a PostgreSQL migration copied every row and value. It connects
 read-only to an old and a new database, compares their structure and data, and
@@ -58,7 +66,19 @@ xvfb-run -a pnpm test:e2e       # Linux; on Windows just: pnpm test:e2e
 
 CI (`.github/workflows/ci.yml`) runs all of the above on Ubuntu 22.04 and
 Windows for every push and pull request, with every action pinned to a commit
-SHA.
+SHA. It also uploads Rust (`cargo llvm-cov --workspace --lcov`) and frontend
+(`pnpm test --coverage`) coverage to Codecov and scans with SonarCloud.
+Coverage thresholds are not enforced yet — the Phase 0 skeleton predates the
+real engine and UI code; PLAN.md section 9's gates arrive with them.
+
+## Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it checks the tag
+against the versions in `src-tauri/tauri.conf.json` and `package.json`, builds
+the Linux (deb, rpm, AppImage) and Windows (NSIS, MSI) installers plus static
+CLI binaries, attaches SHA-256 checksums and CycloneDX SBOMs, and publishes the
+release. Installers are **unsigned** until SignPath approval, so Windows
+SmartScreen warns; verify downloads against `SHA256SUMS`.
 
 ## Layout
 
