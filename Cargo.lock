@@ -1116,6 +1116,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dmux-engine",
+ "dmux-hooks",
  "serde",
  "serde_json",
  "tokio",
@@ -1141,6 +1142,19 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "dmux-hooks"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
