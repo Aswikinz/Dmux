@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Dmux pre-push guard (decision 11): refuse to push when any tracked file
+# name or content matches the private-name patterns. Patterns come from the
+# local Git config only (dmux.privateNamePattern), never from this file.
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+if [[ -z "$(git config dmux.privateNamePattern || true)" ]]; then
+  echo "push refused: git config dmux.privateNamePattern is not set (decision 11)" >&2
+  exit 1
+fi
+if ! (cd "$ROOT" && DMUX_PRIVATE_PATTERNS="$(git config dmux.privateNamePattern)" bash scripts/check-public-clean.sh >/dev/null); then
+  echo "push refused: a tracked file matches a private-name pattern; run scripts/check-public-clean.sh" >&2
+  exit 1
+fi
