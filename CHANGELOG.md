@@ -48,6 +48,32 @@ audit, so no audit finding still allows a false PASS.
 - Structure comparison no longer breaks on sequences at the 64-bit maximum, and long
   lists of differing rows are shown a page at a time.
 
+### Completing version 1
+
+- **Hardened servers:** where a server cannot run md5 (FIPS mode), Dmux hashes the rows
+  itself, with results identical to the server's, so either side can fall back.
+- **Huge tables** are split into ranges of a number or date key and scanned in parallel;
+  the parts add up exactly to the whole table.
+- **Saved connections** stay saved, with retry, edit and delete. **History** keeps every
+  finished check (verified before it is shown again), opens a results file from a jump
+  server, shows and saves the run log, and can be purged.
+- **Compare structure** shows the old and new databases side by side, aligned row by
+  row, searchable and fast with thousands of tables.
+- **Results** explain every table, including a PASS: what was compared, how each column
+  was compared, keys, buckets, spot check, change detection, control totals and why it
+  passed or failed, plus what was checked for the whole run.
+- **Map** shows fuzzy suggestions to accept, a picker to pair items by hand, and a rule
+  editor; **Choose checks** selects tables by schema, name or size and asks you to confirm
+  control-total columns.
+- **Run control:** a run window (for example 22:00 to 05:00), the computer kept awake
+  during a run, and live time remaining corrected as tables finish.
+- **Settings:** appearance, run defaults, report defaults, custom checks (Python scripts,
+  off by default, with an honest warning) and an About section.
+- **Installers:** a portable Windows zip, an offline installer that carries WebView2, a
+  Flatpak bundle, and Windows builds that ship their own Python for custom checks.
+- **Test playground:** an `edge_bank` database pair with dozens of edge cases to try by
+  hand (`testdata/edge_bank/`).
+
 ### Reports and documentation
 
 - The PDF prints the results hash and the capture hashes on page 1, with honest
