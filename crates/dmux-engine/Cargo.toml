@@ -29,3 +29,6 @@ rusqlite = { version = "0.43.0", features = ["bundled"] }
 
 [dev-dependencies]
 proptest = "1.12.0"
+# Generates throwaway X.509 certificates at test time so no private key is ever
+# committed to the repo (gitleaks and GitHub secret scanning must stay clean).
+rcgen = "0.14.10"
