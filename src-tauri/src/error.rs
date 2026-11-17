@@ -78,6 +78,12 @@ pub enum CommandError {
     #[error("{message}")]
     Keychain { message: String },
 
+    /// The saved password could not be removed from the keychain, so the
+    /// connection-detail change was not applied (the old password may still
+    /// exist and must not be reused against the new details).
+    #[error("could not remove the saved password; connection details were not changed")]
+    PasswordRemoveFailed,
+
     /// Something unexpected went wrong (no sensitive detail).
     #[error("{message}")]
     Internal { message: String },

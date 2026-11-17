@@ -119,19 +119,20 @@ impl PasswordStore for Keychain {
         }
     }
 
-    /// Remove a stored password (best-effort; deleting a non-entry is a no-op).
+    /// Remove a stored password.
+    ///
+    /// Fails closed: any error other than "no such entry" is returned so the
+    /// caller knows the credential may still exist.  This always attempts the
+    /// real OS delete — even after a previous operation marked the keychain
+    /// unusable — because the credential may have been stored before the flag
+    /// was set, and a stale password that survives a restart must never be
+    /// silently reused against changed connection details.
     fn delete(&mut self, profile_key: &str) -> Result<(), CommandError> {
-        if !self.available {
-            return Ok(());
-        }
         match Self::entry(profile_key)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => {
-                // Mark the keychain unusable so a later read never returns a
-                // stale password that failed to delete.
-                self.available = false;
-                Ok(())
-            }
+            Err(e) => Err(CommandError::Keychain {
+                message: e.to_string(),
+            }),
         }
     }
 }
@@ -141,6 +142,9 @@ impl PasswordStore for Keychain {
 #[cfg(test)]
 pub struct InMemoryPasswordStore {
     entries: HashMap<String, String>,
+    /// When set, `delete` returns an OS-style failure (leaving the entry in
+    /// place) to exercise the fail-closed path.
+    fail_delete: bool,
 }
 
 #[cfg(test)]
@@ -148,6 +152,16 @@ impl InMemoryPasswordStore {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            fail_delete: false,
+        }
+    }
+
+    /// Return a store whose `delete` always fails (simulating a keychain that
+    /// refuses to remove the credential).
+    pub fn with_failing_delete() -> Self {
+        Self {
+            entries: HashMap::new(),
+            fail_delete: true,
         }
     }
 
@@ -182,6 +196,13 @@ impl PasswordStore for InMemoryPasswordStore {
     }
 
     fn delete(&mut self, key: &str) -> Result<(), CommandError> {
+        if self.fail_delete {
+            return Err(CommandError::Keychain {
+                message: "simulated keychain delete failure".to_string(),
+            });
+        }
+        // Removing a missing entry is a no-op (success), mirroring the OS
+        // "no such entry" -> Ok mapping.
         self.entries.remove(key);
         Ok(())
     }

@@ -86,7 +86,13 @@ pub fn do_save_profile(
 
     let mut warning = None;
     if fields_changed && password.is_none() {
-        state.keychain()?.delete(&incoming.id)?;
+        // Fail closed: if the saved password cannot be removed, the old secret
+        // may still exist and must never be reused against the new details.
+        // Abort BEFORE `store.save` so the on-disk profile is left unchanged.
+        state
+            .keychain()?
+            .delete(&incoming.id)
+            .map_err(|_| CommandError::PasswordRemoveFailed)?;
         warning = Some(PASSWORD_REMOVED_MESSAGE.to_string());
     }
 
@@ -180,7 +186,7 @@ fn validate_profile(profile: &ProfileInput) -> Result<(), CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::InMemoryPasswordStore;
+    use crate::secrets::{InMemoryPasswordStore, PasswordStore};
     use crate::state::AppState;
 
     fn profile(overrides: impl FnOnce(&mut ProfileInput)) -> ProfileInput {
@@ -352,5 +358,51 @@ mod tests {
             "a brand-new profile has nothing to remove"
         );
         assert_eq!(saved_password(&s, "prod").unwrap(), "pw");
+    }
+
+    // --- Fail-closed password removal ---
+
+    fn failing_delete_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        AppState::with_password_store(path, Box::new(InMemoryPasswordStore::with_failing_delete()))
+            .expect("state")
+    }
+
+    #[test]
+    fn failed_password_removal_aborts_the_save_and_leaves_the_profile_unchanged() {
+        let s = failing_delete_state();
+        // Seed an existing profile with a stored password.
+        do_save_profile(profile(|_| {}), Some("s3cr3t".to_string()), &s).unwrap();
+
+        // Changing the host without a new password must try to delete the old
+        // password; when the delete fails, the whole save is aborted.
+        let err = do_save_profile(
+            profile(|p| p.host = "evil.example.com".to_string()),
+            None,
+            &s,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CommandError::PasswordRemoveFailed),
+            "got {err:?}"
+        );
+
+        // The on-disk profile is unchanged (still the original host).
+        let stored = s.store().unwrap().get("prod").unwrap().unwrap();
+        assert_eq!(stored.host, "127.0.0.1");
+
+        // The old password is still present (never reused, never silently left
+        // paired with a changed profile).
+        assert_eq!(saved_password(&s, "prod").unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn deleting_a_missing_entry_succeeds() {
+        let mut store = InMemoryPasswordStore::new();
+        // "No such entry" is success, matching the OS keychain's NoEntry -> Ok.
+        store.delete("never-saved").unwrap();
+        assert!(!store.contains("never-saved"));
     }
 }
