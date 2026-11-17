@@ -78,8 +78,11 @@ Pushing a `v*` tag runs `.github/workflows/release.yml`: it checks the tag
 against the versions in `src-tauri/tauri.conf.json` and `package.json`, builds
 the Linux (deb, rpm, AppImage) and Windows (NSIS, MSI) installers plus static
 CLI binaries, attaches SHA-256 checksums and CycloneDX SBOMs, and publishes the
-release. Installers are **unsigned** until SignPath approval, so Windows
-SmartScreen warns; verify downloads against `SHA256SUMS`.
+release. The checksums are signed keylessly with Sigstore (so they cannot be
+silently edited), and every published file carries a build-provenance
+attestation. Installers are **unsigned** until SignPath approval, so Windows
+SmartScreen warns. Before running a download, verify it — the exact commands are
+in [`SECURITY.md`](SECURITY.md).
 
 ## Layout
 

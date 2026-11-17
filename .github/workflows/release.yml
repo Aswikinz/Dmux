@@ -237,9 +237,13 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     # The only job that may write to the repository: gh release create below
-    # publishes the release. Everything before it stays read-only.
+    # publishes the release, the attestation step persists build provenance, and
+    # cosign signs SHA256SUMS with the workflow's GitHub OIDC identity. Everything
+    # before this job stays read-only (the top-level permissions block).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       # gh authenticates with the GH_TOKEN env below, and nothing here pushes
       # through git, so the checkout token is not needed in .git/config either.
@@ -326,11 +330,14 @@ jobs:
           # subdirectory (v0.0.1 hit "assets: Is a directory") is reported.
           echo "Subdirectories under artifacts/ (diagnostic; none expected):"
           find artifacts -mindepth 1 -maxdepth 1 -type d -print
-          # Top-level REGULAR files only, excluding SHA256SUMS itself. -print0
-          # / sort -z / xargs -0 keep odd filenames (spaces, leading dashes)
-          # intact; LC_ALL=C makes the ordering stable across runners.
+          # Top-level REGULAR files only, excluding SHA256SUMS itself and the
+          # cosign bundle (the bundle is written AFTER this step, but exclude it
+          # here too so no reordering can ever list a signature over the sums
+          # inside the sums). -print0 / sort -z / xargs -0 keep odd filenames
+          # (spaces, leading dashes) intact; LC_ALL=C makes the ordering stable
+          # across runners.
           mapfile -d '' files < <(find artifacts -mindepth 1 -maxdepth 1 -type f \
-            ! -name SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z)
+            ! -name SHA256SUMS ! -name SHA256SUMS.cosign.bundle -printf '%P\0' | LC_ALL=C sort -z)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::no files to checksum in artifacts/"
             exit 1
@@ -340,6 +347,29 @@ jobs:
             printf '%s\0' "${files[@]}" | xargs -0 sha256sum -- > SHA256SUMS
             sha256sum -c SHA256SUMS
           )
+
+      # Provenance (M8): attest every published artifact in one SLSA build
+      # provenance attestation. Runs AFTER SHA256SUMS is written, so the sums
+      # file is covered, and BEFORE the cosign bundle below exists, so the
+      # bundle (signature metadata, not a build output) is not double-counted.
+      # subject-path globs artifacts/ and the action attests each regular file.
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+      # Keyless signature over SHA256SUMS (M8): closes the "anyone who can edit
+      # the release can edit the sums" gap. cosign signs with the workflow's
+      # GitHub OIDC identity (id-token: write above), so the signature binds to
+      # this workflow on a v* tag, not to a long-lived key. The bundle is
+      # written AFTER SHA256SUMS and is not itself listed inside it.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3 (installs cosign v3.1.4)
+
+      - name: Sign SHA256SUMS keylessly (Sigstore)
+        run: |
+          cosign sign-blob --yes --bundle artifacts/SHA256SUMS.cosign.bundle artifacts/SHA256SUMS
+          # Fail closed: a zero-byte or missing bundle means signing did not run.
+          test -s artifacts/SHA256SUMS.cosign.bundle
 
       # Decision 14: PUBLISHED, not draft (no --draft). Decision 20: any v0.*
       # tag is a pre-release, so the flag is computed from the tag itself and
@@ -365,12 +395,15 @@ jobs:
 
           **Unsigned installers.** Windows SmartScreen will warn until
           code-signing approval lands (PLAN.md section 9). Verify every download
-          against `SHA256SUMS` before running it.
+          before running it: check the signature on `SHA256SUMS`, check the
+          file's checksum against it, then install — see `SECURITY.md`.
 
           Attached: Linux deb/rpm/AppImage installers, Windows NSIS/MSI
           installers (MSI when the build runner allows), static Linux and
-          Windows CLI binaries, SHA-256 checksums, and CycloneDX SBOMs for the
-          Rust workspace and the npm production dependencies.
+          Windows CLI binaries, SHA-256 checksums plus their Sigstore signature,
+          and CycloneDX SBOMs for the Rust workspace and the npm production
+          dependencies. Every attached file carries a build-provenance
+          attestation.
           EOF
           # The heredoc sits inside this indented run block, so strip that
           # indentation: Markdown would otherwise render the header as code.
@@ -379,8 +412,8 @@ jobs:
             -f tag_name="$TAG" --jq .body > generated.md
           cat header.md generated.md > notes.md
           # Attach top-level REGULAR files only (installers, CLI binaries,
-          # SBOMs, SHA256SUMS). A bare artifacts/* glob would hand directories
-          # to gh, which cannot upload them.
+          # SBOMs, SHA256SUMS and its Sigstore bundle). A bare artifacts/* glob
+          # would hand directories to gh, which cannot upload them.
           mapfile -d '' assets < <(find artifacts -mindepth 1 -maxdepth 1 -type f -print0 \
             | LC_ALL=C sort -z)
           if [ "${#assets[@]}" -eq 0 ]; then
