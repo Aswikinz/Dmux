@@ -737,13 +737,15 @@ async fn run_run(args: RunArgs) -> ExitCode {
 /// Fold the hook outcome into the typed results so the written verdict matches
 /// the exit code.
 ///
-/// - A `fail` finding turns a PASS into FAIL with reason "custom check <id>
-///   failed" recorded per finding.
+/// - A `fail` finding turns a PASS or an ENGINE-produced WARNING into FAIL with
+///   reason "custom check <id> failed" recorded per finding; a hook fail is
+///   more severe than a warning, so WARNING is treated like PASS here.
 /// - A hook warning (timeout / crash / invalid / uncollected output) without a
 ///   fail finding turns a PASS into WARNING with a recorded reason.
-/// - A fail finding never lowers an existing (already non-PASS) verdict back to
-///   PASS, and a warning never lowers a FAIL: the hook can only force the
-///   verdict off PASS, never mask a data or tool problem.
+/// - A fail finding never lowers an existing graver verdict (FAIL, TOOL_FAULT,
+///   CHANGED_DURING_CHECK, NEEDS_REVIEW, WIDELY_DIFFERENT) back toward PASS, and
+///   a warning never lowers a FAIL: the hook can only force the verdict off
+///   PASS, never mask a data or tool problem.
 fn apply_hook_verdict(
     results: &mut RunResults,
     has_fail: bool,
@@ -751,7 +753,9 @@ fn apply_hook_verdict(
     hook_results: &[dmux_hooks::HookResult],
 ) {
     if has_fail {
-        if results.verdict == Verdict::Pass {
+        // A hook `fail` must demote both a clean PASS and an engine WARNING; it
+        // must never raise a graver verdict.  Treat WARNING like PASS.
+        if matches!(results.verdict, Verdict::Pass | Verdict::Warning) {
             results.verdict = Verdict::Fail;
         }
         let fail_ids: Vec<String> = hook_results
@@ -1147,6 +1151,52 @@ mod tests {
         let mut tf = minimal_run_results(Verdict::ToolFault);
         apply_hook_verdict(&mut tf, true, false, &[fail]);
         assert_eq!(tf.verdict, Verdict::ToolFault);
+    }
+
+    #[test]
+    fn engine_warning_plus_custom_fail_yields_verdict_fail_and_exit_1() {
+        // Starting from a results file whose ENGINE verdict is WARNING (e.g. a
+        // SQL_ASCII flag), a custom-check fail must turn it into FAIL and exit 1,
+        // not stay WARNING / exit 2.
+        let fail = dmux_hooks::HookResult {
+            script_hash: "h".into(),
+            findings: vec![dmux_hooks::Finding {
+                id: "custom.total".into(),
+                severity: Severity::Fail,
+                table: None,
+                message: "over".into(),
+            }],
+            warnings: vec![],
+        };
+        let engine_warning = minimal_run_results(Verdict::Warning);
+        let mut results = engine_warning.clone();
+        apply_hook_verdict(&mut results, true, false, std::slice::from_ref(&fail));
+
+        // File verdict: WARNING ⇒ FAIL.
+        assert_eq!(results.verdict, Verdict::Fail);
+        assert!(
+            results
+                .warnings
+                .iter()
+                .any(|w| w == "custom check custom.total failed"),
+            "reason not recorded: {:?}",
+            results.warnings
+        );
+
+        // Exit code: a base WARNING (2) plus a fail finding ⇒ FAIL (1).
+        assert_eq!(hook_exit_code(true, false, EXIT_WARN), EXIT_FAIL);
+
+        // The results hash must be recomputed over the mutated file and change.
+        results.results_sha256 = dmux_engine::results::sha256_of(&results);
+        assert_ne!(
+            dmux_engine::results::sha256_of(&engine_warning),
+            results.results_sha256,
+            "the mutated file must carry a different digest"
+        );
+        assert_eq!(
+            dmux_engine::results::sha256_of(&results),
+            results.results_sha256
+        );
     }
 
     #[test]
