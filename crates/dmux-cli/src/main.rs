@@ -18,6 +18,7 @@ use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
 use dmux_hooks::{Finding, HookSpec, Severity};
+use dmux_report::verify::verify_results_file;
 
 /// PLAN.md 4.8 exit codes.
 const EXIT_PASS: u8 = 0;
@@ -46,6 +47,8 @@ enum Command {
     Compare(CompareArgs),
     /// Run a saved verification definition (TOML or JSON).
     Run(RunArgs),
+    /// Render the PDF summary, Excel detail and run log from a results file.
+    Report(ReportArgs),
     /// Run Python hooks over a results JSON file and print their findings.
     Hook(HookArgs),
 }
@@ -71,21 +74,51 @@ struct ConnArgs {
     allow_superuser: bool,
 }
 
+/// A connection-configuration error that carries **no secret-derived data**: each
+/// variant names only a field or an error kind, and [`ConfigError::message`]
+/// renders a fixed string.  A caller that prints the message can therefore never
+/// leak a password or any other user-supplied value (CodeQL rust/cleartext-logging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigError {
+    /// `--password-env <VAR>` names an environment variable that is not set.
+    PasswordEnvUnset,
+    /// `--tls disable` without a `--reason`.
+    TlsDisableNeedsReason,
+    /// `--tls disable` with an empty `--reason`.
+    TlsReasonEmpty,
+    /// `--tls fingerprint:<hex>` with an empty hex value.
+    TlsFingerprintEmpty,
+    /// An unrecognised `--tls` value.
+    TlsUnknown,
+    /// `--allow-superuser` without a non-empty `--reason`.
+    SuperuserNeedsReason,
+}
+
+impl ConfigError {
+    fn message(self) -> &'static str {
+        match self {
+            ConfigError::PasswordEnvUnset => "password environment variable is not set",
+            ConfigError::TlsDisableNeedsReason => "--reason <text> is required for --tls disable",
+            ConfigError::TlsReasonEmpty => "--reason <text> may not be empty",
+            ConfigError::TlsFingerprintEmpty => "--tls fingerprint:<hex> is missing the hex value",
+            ConfigError::TlsUnknown => {
+                "unknown --tls value (expected verify, fingerprint:<hex>, or disable)"
+            }
+            ConfigError::SuperuserNeedsReason => "--allow-superuser requires --reason <text>",
+        }
+    }
+}
+
 impl ConnArgs {
-    fn profile(&self) -> Result<ConnProfile, String> {
+    fn profile(&self) -> Result<ConnProfile, ConfigError> {
         let tls_mode = parse_tls_mode(&self.tls, &self.reason)?;
         let password = match self.password_env.as_deref().map(std::env::var) {
             Some(Ok(p)) => p,
-            Some(Err(_)) => {
-                return Err(format!(
-                    "password environment variable {} is not set",
-                    self.password_env.as_deref().unwrap_or_default()
-                ))
-            }
+            Some(Err(_)) => return Err(ConfigError::PasswordEnvUnset),
             None => String::new(),
         };
         if self.allow_superuser && !allow_superuser_requires_reason(&self.reason) {
-            return Err("--allow-superuser requires --reason <text>".to_string());
+            return Err(ConfigError::SuperuserNeedsReason);
         }
         Ok(ConnProfile::new(
             self.host.clone(),
@@ -185,29 +218,49 @@ struct HookArgs {
     python: Option<PathBuf>,
 }
 
-/// Parse the `--tls` mode string into a [`TlsMode`].
-fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, String> {
+/// Report arguments: render artefacts from a results file (PLAN.md 4.7).
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// The results JSON file written by `compare` / `run` (SHA-256 verified).
+    #[arg(long, value_name = "FILE")]
+    results: PathBuf,
+    /// Write the PDF summary to this path.
+    #[arg(long, value_name = "FILE")]
+    pdf: Option<PathBuf>,
+    /// Write the Excel detail workbook to this path.
+    #[arg(long, value_name = "FILE")]
+    xlsx: Option<PathBuf>,
+    /// Write the run log to this path (`.json` for JSON, text otherwise).
+    #[arg(long, value_name = "FILE")]
+    log: Option<PathBuf>,
+    /// Include key / covered-column names in the detail (default: off).
+    #[arg(long)]
+    include_keys: bool,
+}
+
+/// Parse the `--tls` mode string into a [`TlsMode`].  Errors are a
+/// [`ConfigError`] kind — never the raw value — so a caller never logs a
+/// user-controlled string.
+fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, ConfigError> {
     match tls {
         "verify" => Ok(TlsMode::VerifyFull),
         "disable" => {
             let reason = reason
                 .as_deref()
-                .ok_or("--reason <text> is required for --tls disable")?;
+                .ok_or(ConfigError::TlsDisableNeedsReason)?;
             if reason.trim().is_empty() {
-                return Err("--reason <text> may not be empty".to_string());
+                return Err(ConfigError::TlsReasonEmpty);
             }
             Ok(TlsMode::Disable(reason.to_string()))
         }
         _ => {
             if let Some(hex) = tls.strip_prefix("fingerprint:") {
                 if hex.is_empty() {
-                    return Err("--tls fingerprint:<hex> is missing the hex value".to_string());
+                    return Err(ConfigError::TlsFingerprintEmpty);
                 }
                 Ok(TlsMode::TrustFingerprint(hex.to_string()))
             } else {
-                Err(format!(
-                    "unknown --tls value: {tls} (expected verify, fingerprint:<hex>, or disable)"
-                ))
+                Err(ConfigError::TlsUnknown)
             }
         }
     }
@@ -236,6 +289,7 @@ async fn main() -> ExitCode {
         Command::Capture(args) => run_capture(args).await,
         Command::Compare(args) => run_compare(args).await,
         Command::Run(args) => run_run(args).await,
+        Command::Report(args) => run_report(args),
         Command::Hook(args) => run_hook(args).await,
     }
 }
@@ -244,7 +298,7 @@ async fn run_probe(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -292,7 +346,7 @@ async fn run_inventory(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -358,7 +412,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     let profile = match args.conn.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -371,7 +425,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     };
     let mapping = match args.mapping.as_ref() {
         Some(path) => {
-            let bytes = match fs::read(path) {
+            let bytes = match tokio::fs::read(path).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("dmux capture failed: {e}");
@@ -406,7 +460,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
         }
     };
 
-    if let Err(e) = write_fingerprint_file(&args.out, &file) {
+    if let Err(e) = write_fingerprint_file(&args.out, &file).await {
         eprintln!("dmux capture failed: {e}");
         return ExitCode::from(EXIT_FAIL);
     }
@@ -418,9 +472,15 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     ExitCode::from(EXIT_PASS)
 }
 
-fn write_fingerprint_file(path: &std::path::Path, file: &FingerprintFile) -> Result<(), String> {
+/// Write a fingerprint file without blocking the async runtime (Sonar S7493).
+async fn write_fingerprint_file(
+    path: &std::path::Path,
+    file: &FingerprintFile,
+) -> Result<(), String> {
     let bytes = file.clone().to_json().map_err(|e| e.to_string())?;
-    fs::write(path, bytes).map_err(|e| e.to_string())
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn run_compare(args: CompareArgs) -> ExitCode {
@@ -449,6 +509,56 @@ async fn run_compare(args: CompareArgs) -> ExitCode {
 
     emit_results(args.out.as_deref(), &outcome.results);
     ExitCode::from(outcome.exit_code)
+}
+
+/// Render the report artefacts from a results file, verifying its SHA-256 first
+/// (refuse tampered input — PLAN.md 2.4).
+fn run_report(args: ReportArgs) -> ExitCode {
+    // Verify the results file before rendering anything (refuse tampered input).
+    let verification = match verify_results_file(&args.results) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let options = dmux_report::ReportOptions {
+        include_keys: args.include_keys,
+    };
+    let layout = dmux_report::build_layout(&verification, &options);
+    let sha256 = verification.sha256;
+
+    if let Some(pdf) = args.pdf.as_deref() {
+        if let Err(e) = dmux_report::pdf::write_summary_layout(&layout, &sha256, pdf) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(xlsx) = args.xlsx.as_deref() {
+        if let Err(e) = dmux_report::xlsx::write_detail_layout(&layout, &sha256, xlsx) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(log) = args.log.as_deref() {
+        if let Err(e) = dmux_report::log::write_run_log(
+            &verification.results,
+            verification.hooks.as_ref(),
+            &options,
+            log,
+        ) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+
+    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() {
+        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx and/or --log)");
+        return ExitCode::from(EXIT_FAIL);
+    }
+
+    ExitCode::from(EXIT_PASS)
 }
 
 fn emit_results(path: Option<&std::path::Path>, results: &dmux_engine::results::RunResults) {
@@ -876,11 +986,11 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     };
 
     let conn_def_to_profile = |c: &ConnDef| -> Result<ConnProfile, String> {
-        let tls_mode = parse_tls_mode(&c.tls, &c.reason)?;
+        let tls_mode = parse_tls_mode(&c.tls, &c.reason).map_err(|e| e.message().to_string())?;
         let password = match (&c.password, &c.password_env) {
             (Some(p), _) => p.clone(),
             (None, Some(var)) => std::env::var(var)
-                .map_err(|_| format!("password environment variable {var} is not set"))?,
+                .map_err(|_| "password environment variable is not set".to_string())?,
             (None, None) => String::new(),
         };
         Ok(ConnProfile::new(
@@ -977,8 +1087,8 @@ fn minimal_run_results(verdict: Verdict) -> RunResults {
 mod tests {
     use super::{
         allow_superuser_requires_reason, apply_hook_verdict, hook_causes_non_pass, hook_exit_code,
-        load_definition, minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs,
-        Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        load_definition, minimal_run_results, parse_level, parse_tls_mode, Cli, Command,
+        ConfigError, ConnArgs, DiffArgs, Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
@@ -1036,6 +1146,21 @@ mod tests {
             Command::Compare(_)
         ));
         assert!(matches!(parse(&["run", "def.toml"]), Command::Run(_)));
+        assert!(matches!(
+            parse(&[
+                "report",
+                "--results",
+                "r.json",
+                "--pdf",
+                "out.pdf",
+                "--xlsx",
+                "out.xlsx",
+                "--log",
+                "out.txt",
+                "--include-keys"
+            ]),
+            Command::Report(_)
+        ));
     }
 
     #[test]
@@ -1062,6 +1187,37 @@ mod tests {
         assert!(!allow_superuser_requires_reason(&None));
         assert!(!allow_superuser_requires_reason(&Some("  ".into())));
         assert!(allow_superuser_requires_reason(&Some("lab".into())));
+    }
+
+    #[test]
+    fn config_error_never_leaks_a_password_or_user_value() {
+        // A live password lives in the environment while an unrelated config
+        // error is triggered.  The rendered message must be a fixed ConfigError
+        // string — never the password sentinel and never the user-supplied tls
+        // value (CodeQL rust/cleartext-logging).
+        const SENTINEL: &str = "SENTINEL-PASSWORD-982134";
+        std::env::set_var("DMUX_TEST_SENTINEL_PW", SENTINEL);
+        let args = ConnArgs {
+            host: "h".into(),
+            port: 5433,
+            db: "d".into(),
+            user: "u".into(),
+            password_env: Some("DMUX_TEST_SENTINEL_PW".into()),
+            tls: "SENTINEL-TLS-VALUE".into(),
+            reason: None,
+            allow_superuser: false,
+        };
+        let err = args.profile().unwrap_err();
+        assert_eq!(err, ConfigError::TlsUnknown);
+        let message = err.message();
+        assert!(
+            !message.contains(SENTINEL),
+            "password leaked into the error message: {message}"
+        );
+        assert!(
+            !message.contains("SENTINEL-TLS-VALUE"),
+            "user value leaked into the error message: {message}"
+        );
     }
 
     #[test]
