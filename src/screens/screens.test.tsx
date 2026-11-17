@@ -390,6 +390,13 @@ describe('CompareStructureScreen', () => {
     expect(await screen.findByText('Could not compare structure')).toBeDefined();
   });
 
+  it('names both databases above the side-by-side view', async () => {
+    wrap(<StructureHarness engine={createMockEngine()} />);
+    const oldName = await screen.findByTestId('old-database-name');
+    expect(oldName.textContent).toContain('Old database:');
+    expect(screen.getByTestId('new-database-name').textContent).toContain('New database:');
+  });
+
   it('shows a backend error as plain words, never [object Object]', async () => {
     const engine: Engine = {
       ...createMockEngine(),

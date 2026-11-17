@@ -99,6 +99,18 @@ export function CompareStructureScreen({
         <>
           <Panel className="flex flex-col gap-4">
             <div className="grid grid-cols-2 gap-4 text-sm">
+              <div data-testid="old-database-name">
+                <span className="font-medium">Old database:</span> {oldProfile.database}{' '}
+                <span className="text-slate-600 dark:text-slate-400">
+                  on {oldProfile.host}:{oldProfile.port}
+                </span>
+              </div>
+              <div data-testid="new-database-name">
+                <span className="font-medium">New database:</span> {newProfile.database}{' '}
+                <span className="text-slate-600 dark:text-slate-400">
+                  on {newProfile.host}:{newProfile.port}
+                </span>
+              </div>
               <div>
                 <span className="font-medium">Old encoding:</span> {inventory.oldEncoding}
               </div>
