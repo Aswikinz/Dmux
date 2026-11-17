@@ -1267,7 +1267,9 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "flate2",
+ "futures-util",
  "hex",
+ "md-5",
  "proptest",
  "rcgen",
  "rusqlite",

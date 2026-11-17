@@ -129,10 +129,51 @@ pub async fn timed_sample(
     }
     let plan = TablePlan::new(cols, vec![], DEFAULT_BUCKET_DIGITS)
         .map_err(|e| EstimateError::Build(e.to_string()))?;
-    let sql = sample_sql(&plan, schema, table)?;
+    // A server that cannot run md5() (FIPS mode) is hashed in the app during
+    // the run (PLAN 2.2), so time the same app-side row query here.
+    let sql = if md5_works(txn).await? {
+        sample_sql(&plan, schema, table)?
+    } else {
+        app_sample_sql(&plan, schema, table)?
+    };
     let start = Instant::now();
     txn.query(&sql, &[&(sample_rows as i64)]).await?;
     Ok(start.elapsed())
+}
+
+/// Whether the server can run `md5()`.  Checked inside a savepoint (allowed
+/// in a read-only transaction), so a FIPS refusal is rolled back and the
+/// transaction stays usable.
+async fn md5_works(txn: &Transaction<'_>) -> Result<bool, EstimateError> {
+    txn.batch_execute("SAVEPOINT dmux_md5_probe").await?;
+    match txn.query_opt("SELECT pg_catalog.md5('x')", &[]).await {
+        Ok(_) => {
+            txn.batch_execute("RELEASE SAVEPOINT dmux_md5_probe")
+                .await?;
+            Ok(true)
+        }
+        Err(_) => {
+            txn.batch_execute("ROLLBACK TO SAVEPOINT dmux_md5_probe")
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
+/// The app-side timing query: the normalised values Dmux hashes itself when
+/// the server has no md5, for a bound number of rows.
+fn app_sample_sql(plan: &TablePlan, schema: &str, table: &str) -> Result<String, EstimateError> {
+    let inner = crate::core::apphash::app_rows_sql(
+        plan,
+        Side::Old,
+        &Source::Table {
+            schema: schema.to_string(),
+            name: table.to_string(),
+        },
+        None,
+    )
+    .map_err(|e| EstimateError::Build(e.to_string()))?;
+    Ok(format!("{inner} LIMIT $1"))
 }
 
 /// The timed-sample query: the normalised row hash of every mapped column for a
@@ -239,5 +280,23 @@ mod tests {
         assert!(sql.contains("md5("), "the row hash is server-side: {sql}");
         assert!(sql.contains("LIMIT $1"), "the sample is bounded: {sql}");
         assert!(sql.contains("\"s\".\"t\""), "identifiers are quoted: {sql}");
+    }
+
+    #[test]
+    fn the_app_side_sample_has_no_server_md5_and_is_bounded() {
+        let cols = vec![plan_column(&ColumnMapping {
+            old_name: "doc".into(),
+            new_name: "doc".into(),
+            old_type: crate::core::normalise::PgType::Bytea,
+            new_type: crate::core::normalise::PgType::Bytea,
+            options: ColumnOptions::default(),
+            control_total: false,
+        })
+        .unwrap()];
+        let plan = TablePlan::new(cols, vec![], DEFAULT_BUCKET_DIGITS).unwrap();
+        let sql = app_sample_sql(&plan, "s", "t").unwrap();
+        assert!(!sql.contains("md5("), "{sql}");
+        assert!(sql.ends_with("LIMIT $1"), "{sql}");
+        assert!(sql.contains("\"s\".\"t\""), "{sql}");
     }
 }
