@@ -195,18 +195,36 @@ new one, before any data is compared.
 **Steps.**
 
 1. Wait for Dmux to read both structures. Large databases can take a minute.
-2. Look at the summary at the top: how many tables are missing on the new side, added,
-   changed, and how many match.
-3. Tick **Only problems** to hide what matches. Use the search box for a table name.
-4. Open a table to see its columns, keys, indexes and constraints side by side.
-5. Continue to **Map** when you have read the problems.
+2. Read the two headings: the old database is on the left and the new one on the right,
+   each with its server version and text encoding.
+3. Look at the line above the list: it says how many differences there are and how many
+   items you are looking at.
+4. Tick **Show only problems** to hide what matches. Type in the search box to find a
+   table, column, index or constraint by name, or by a word in its definition. Search
+   works across thousands of tables.
+5. Open a table (click the arrow beside its name, or press the right arrow key) to see its
+   columns, indexes and constraints.
+6. Continue to **Map** when you have read the problems.
 
-**What you see.** A tree of schemas and tables, with columns matched by name rather than
-by position. Red means missing on the new side, green means added, amber means changed.
+**What you see.** One line per item, with the same table, column, index or constraint on
+the same line on both sides. Items are matched by name, never by position. An item that
+exists on only one side leaves an empty, hatched gap on the other side with a plain
+message: "Not in the new database" means it is missing there, "Not in the old database"
+means it was added. A changed item shows what it was on the left and what it is now on the
+right, for example `numeric(18,2)` and `numeric(19,2)`. Every difference also carries a
+word (Missing, Added or Changed), so you never depend on colour: red is missing, green is
+added and amber is changed. Identical items are shown plainly. A group that is closed
+tells you how many differences are inside it.
+
+Use the arrow keys to move up and down the list, the right and left arrow keys to open
+and close a group, Home and End to jump to the first and last line, and Enter to open or
+close the highlighted group.
+
 Partitions of one table are folded under their parent so they count as one table. Warnings
 appear for things that are not errors but need a decision: a table left from an older
 version, a column type that no longer exists, a new table whose statistics have not been
-gathered yet.
+gathered yet. When the two text encodings differ, a note says so and explains that this is
+expected and needs no action.
 
 **If something goes wrong.**
 
@@ -218,8 +236,8 @@ gathered yet.
 - *The structure check fails to finish*: the login may lack rights on a schema. The
   administrator needs to run the login script for that schema.
 
-> **TODO (wiring):** screenshot of the diff tree with one red, one green and one amber
-> example; confirm how "review" is displayed.
+> **TODO (wiring):** screenshot of the side-by-side view with one missing, one added and
+> one changed item.
 
 ### 3. Map
 
@@ -376,12 +394,59 @@ table being written to by someone else shows "changed during check", never a tic
 3. Open a failing table to see the rows that are missing, extra or changed, with the
    differing columns side by side.
 4. Filter to problems only, and search for a table name.
-5. Continue to **Report** when you are ready to produce the signed document.
+5. Open **Details** on any table in **All tables**, or **Show details** on a failure card, to
+   see why that table got its verdict. This works for a table that passed as much as for
+   one that failed.
+6. Read **What was checked** at the bottom of the page.
+7. Continue to **Report** when you are ready to produce the signed document.
 
 **What you see.** The overall verdict first, then the tables with failures at the top.
 Rows that differ are shown on screen only: the report never contains row values, and it
 contains key values only if you tick that option. A table marked **Needs review** lists
 the columns a person must look at.
+
+**Table details.** The detail panel starts with one sentence, "Why this table passed" or
+"Why this table failed" (or "needs review" and so on), built only from facts Dmux
+recorded. Under it, in plain words:
+
+- *What was tested*: the check level and what it means. Structure only compares the
+  definition and reads no rows; counts and totals counts rows and adds up number columns;
+  full values compares every value of every compared column.
+- *Rows*: how many rows each database holds, and how many are missing, extra or changed.
+- *Key columns*: the columns rows were matched by, or a note that the table has no key and
+  was compared as a counted set.
+- *Buckets*: Dmux summarises rows in groups called buckets and compares each bucket as one
+  unit. The panel says how many buckets there were and how many differed.
+- *Spot check*: a second, independent method. Dmux fetches a sample of rows from both
+  databases and compares them value by value, then checks this agrees with the bucket
+  comparison. The panel says how many rows were compared. If the two methods disagree, the
+  table is a tool fault, not a data result.
+- *Columns compared*: every column with the rule used, for example "compared exactly as
+  text", "compared by its exact 8-byte binary form" or "rounded to 2 decimals because you
+  ticked that option".
+- *Control totals*: for each summed column, the total in the old database, the total in
+  the new one and whether they match.
+- *Change detection*: whether the insert, update and delete counters were the same before
+  and after the table was read. If change detection was not available (for example the
+  server setting `track_counts` is off, or the table is a foreign table), the panel says
+  so and why, and the table needs review rather than passing.
+- *Options and type notes*: every ticked option and every column whose type differs
+  between the two databases.
+- *Ignored columns*: each with the reason you gave.
+
+The panel never shows row values. Row keys appear only in the drill-down under **Show
+rows**. A table that was reused from an earlier run, compared from a saved file, or checked
+by structure only has fewer facts; the panel says which are not recorded and never fills
+the gap with a guess.
+
+**What was checked.** At the bottom of the page: how many tables were checked at each
+level, and for each database whether the connection was encrypted (and whether the
+certificate was verified), whether the login is read-only, whether it was a superuser login
+(with the reason you typed when you allowed it), and the server version and text encoding.
+It also shows the Dmux version, the fingerprint of the mapping and the results SHA-256. The
+SHA-256 detects accidental damage; to show the results were not altered, compare it with the
+value printed on the signed PDF report.
+
 
 **If something goes wrong.**
 

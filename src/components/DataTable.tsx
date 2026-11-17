@@ -37,8 +37,10 @@ export function DataTable<T extends object>({
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const parentRef = useRef<HTMLDivElement>(null);
 
-  // Memoised: a new array on every render looks like new data to the table,
-  // which resets its state and renders again, and so on without end.
+  // Memoised: react-table treats a new `data` array as new input and resets its
+  // state, so a fresh array on every render re-rendered the table forever once
+  // the real virtualizer was involved (clicking any button on Results froze the
+  // app).
   const filteredData = useMemo(
     () =>
       filterFn

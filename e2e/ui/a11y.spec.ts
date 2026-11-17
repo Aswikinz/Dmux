@@ -77,6 +77,9 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await cta('See results').click();
     await expect(page.getByRole('heading', { name: 'Failures' })).toBeVisible();
     await check('results');
+    await page.getByRole('button', { name: 'Show details for demo_bank.table_0001' }).click();
+    await expect(page.getByTestId('why-this-table')).toBeVisible();
+    await check('results detail');
     await cta('Report').click();
     await check('report');
   });

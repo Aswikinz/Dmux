@@ -13,6 +13,7 @@ use tauri::State;
 use dmux_engine::db::{probe_server, ReadOnlySession, TlsMode};
 use dmux_engine::inventory::{collect_inventory, DatabaseInventory};
 use dmux_engine::mapping::{self, Mapping};
+#[cfg(test)]
 use dmux_engine::schema_diff::{compare_inventories, SchemaDiff};
 
 use crate::error::{from_db_error, CommandError, PasswordMissing};
@@ -362,15 +363,18 @@ pub async fn compare_structure(
     new: ConnectInput,
     allow_superuser: Option<SuperuserOverride>,
     state: State<'_, AppState>,
-) -> Result<SchemaDiff, CommandError> {
+) -> Result<crate::commands::structure_view::StructureCompare, CommandError> {
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    structure_diff(&old, &new, allow, &state).await
+    let old_inv = collect(&old, allow, &state).await?;
+    let new_inv = collect(&new, allow, &state).await?;
+    Ok(crate::commands::structure_view::compare(&old_inv, &new_inv))
 }
 
-/// The body of [`compare_structure`], callable from tests without a Tauri
-/// `State`.
+/// The schema diff alone (what the command returned before the side-by-side
+/// rows), callable from tests without a Tauri `State`.
+#[cfg(test)]
 pub(crate) async fn structure_diff(
     old: &ConnectInput,
     new: &ConnectInput,

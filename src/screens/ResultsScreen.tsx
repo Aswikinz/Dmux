@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { StatusBadge } from '../design/StatusBadge';
 import { ErrorCard } from '../design/ErrorCard';
 import { DataTable } from '../components/DataTable';
+import { TableDetailPanel, WhatWasChecked } from '../components/TableDetailPanel';
 import { CustomChecksPanel } from '../components/CustomChecksPanel';
 import { LEVEL_LABELS, VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
@@ -151,7 +152,15 @@ function DrillDown({ rows }: { rows: DrillDownRow[] }) {
   );
 }
 
-function FailureCardItem({ card, onDrillDown }: { card: FailureCard; onDrillDown: () => void }) {
+function FailureCardItem({
+  card,
+  onDrillDown,
+  onDetails,
+}: {
+  card: FailureCard;
+  onDrillDown: () => void;
+  onDetails: () => void;
+}) {
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
       <div className="flex items-start justify-between gap-4">
@@ -164,9 +173,19 @@ function FailureCardItem({ card, onDrillDown }: { card: FailureCard; onDrillDown
         </div>
         <StatusBadge status={card.verdict} />
       </div>
-      <Button onClick={onDrillDown} variant="ghost" size="sm" className="mt-2">
-        Show rows
-      </Button>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <Button onClick={onDrillDown} variant="ghost" size="sm">
+          Show rows
+        </Button>
+        <Button
+          onClick={onDetails}
+          variant="ghost"
+          size="sm"
+          aria-label={`Show details for ${card.schemaName}.${card.tableName}`}
+        >
+          Show details
+        </Button>
+      </div>
     </div>
   );
 }
@@ -181,6 +200,8 @@ export function ResultsScreen({
 }: ResultsScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [expandedFailures, setExpandedFailures] = useState<Set<string>>(new Set());
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const detailHeading = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -204,6 +225,14 @@ export function ResultsScreen({
       mounted = false;
     };
   }, [engine, runId, results, onResultsChange]);
+
+  // Open the detail panel for a table and move focus to its heading.
+  useEffect(() => {
+    if (detailId !== null) {
+      detailHeading.current?.focus();
+      detailHeading.current?.scrollIntoView?.({ block: 'nearest' });
+    }
+  }, [detailId]);
 
   const tableColumns = useMemo(() => {
     const col = createColumnHelper<TableResult>();
@@ -232,6 +261,20 @@ export function ResultsScreen({
             </span>
           );
         },
+      }),
+      col.display({
+        id: 'details',
+        header: 'Details',
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setDetailId(row.original.tableId)}
+            aria-label={`Details for ${row.original.schemaName}.${row.original.tableName}`}
+          >
+            Details
+          </Button>
+        ),
       }),
     ] as ColumnDef<TableResult>[];
   }, []);
@@ -283,6 +326,7 @@ export function ResultsScreen({
                 <div key={card.id}>
                   <FailureCardItem
                     card={card}
+                    onDetails={() => setDetailId(card.tableId)}
                     onDrillDown={() =>
                       setExpandedFailures((prev) => {
                         const next = new Set(prev);
@@ -303,6 +347,13 @@ export function ResultsScreen({
         </Panel>
       )}
 
+      {(() => {
+        const open = results.tableResults.find((t) => t.tableId === detailId);
+        return open ? (
+          <TableDetailPanel ref={detailHeading} table={open} onClose={() => setDetailId(null)} />
+        ) : null;
+      })()}
+
       <Panel>
         <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">All tables</h3>
         <DataTable
@@ -311,6 +362,8 @@ export function ResultsScreen({
           filterPlaceholder="Filter by table name"
         />
       </Panel>
+
+      <WhatWasChecked results={results} />
 
       <div className="flex items-center justify-between">
         <Button onClick={onBack} variant="secondary">

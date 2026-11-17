@@ -191,6 +191,22 @@ pub struct TableResultDto {
     pub checked: bool,
     pub drill_down: Option<Vec<DrillDownRowDto>>,
     pub column_notes: Vec<ColumnNoteDto>,
+    /// Facts the Results detail panel explains a verdict from.  Everything
+    /// here is a count, a column name or a plain-language rule, never a value.
+    pub old_rows: Option<u64>,
+    pub new_rows: Option<u64>,
+    pub differing_buckets: Option<usize>,
+    pub missing_buckets: Option<usize>,
+    pub extra_buckets: Option<usize>,
+    pub missing_rows: Option<usize>,
+    pub extra_rows: Option<usize>,
+    pub changed_rows: Option<usize>,
+    /// The engine's own reasons this table got its verdict.
+    pub reasons: Vec<String>,
+    /// How the table was checked; absent for resumed or structure-only tables.
+    pub facts: Option<dmux_engine::results::TableFacts>,
+    /// Columns of this table that were ignored, each with its reason.
+    pub ignored_columns: Vec<IgnoredDto>,
 }
 
 /// Ignored item (path + required reason).
@@ -230,6 +246,12 @@ pub struct ResultsDto {
     pub options_recorded: bool,
     /// Run-level warnings (can-write, superuser, row-level security, ...).
     pub warnings: Vec<String>,
+    /// What was checked, run-wide: the tool, the mapping, the digest and how
+    /// each side was connected.  Never a password or a row value.
+    pub tool_version: String,
+    pub mapping_hash: String,
+    pub results_sha256: String,
+    pub connections: dmux_engine::results::Connections,
     /// Custom checks (Python scripts), present only when they ran for this run.
     /// The `verdict` above already includes any custom failure.
     pub custom_checks: Option<crate::hooks::CustomChecksDto>,
@@ -948,6 +970,26 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
                     note: n.note.clone(),
                 })
                 .collect(),
+            old_rows: t.old_rows,
+            new_rows: t.new_rows,
+            differing_buckets: t.differing_buckets,
+            missing_buckets: t.missing_buckets,
+            extra_buckets: t.extra_buckets,
+            missing_rows: t.missing_rows,
+            extra_rows: t.extra_rows,
+            changed_rows: t.changed_rows,
+            reasons: t.reasons.clone(),
+            facts: results.table_facts.get(path).cloned(),
+            ignored_columns: results
+                .ignored_items
+                .iter()
+                .filter(|i| i.path.starts_with(&format!("{path}.")))
+                .map(|i| IgnoredDto {
+                    id: i.path.clone(),
+                    name: i.path.clone(),
+                    reason: i.reason.clone(),
+                })
+                .collect(),
         });
     }
 
@@ -999,6 +1041,10 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
         options_applied: results.options_applied,
         options_recorded: dmux_engine::results::options_recorded(results),
         warnings: results.warnings.clone(),
+        tool_version: results.tool_version.clone(),
+        mapping_hash: results.mapping_hash.clone(),
+        results_sha256: results.results_sha256.clone(),
+        connections: results.connections.clone(),
         custom_checks: None,
     }
 }
@@ -1208,6 +1254,127 @@ mod tests {
         assert_eq!(split_path("t"), ("".to_string(), "t".to_string()));
     }
 
+    /// The facts the Results detail panel explains a table from reach the DTO
+    /// unchanged, and carry counts, names and rules only.
+    #[test]
+    fn map_results_carries_the_recorded_facts() {
+        use dmux_engine::results::{
+            ColumnRule, Connections, ControlTotalFact, IgnoredItem, SpotFact, TableFacts,
+            TableResult,
+        };
+        let mut r = RunResults {
+            tool_version: "9.9.9".into(),
+            mapping_hash: "map".into(),
+            results_sha256: "sha".into(),
+            connections: Connections::default(),
+            ..RunResults::default()
+        };
+        r.connections.old.superuser = true;
+        r.connections.old.superuser_reason = Some("rehearsal".into());
+        r.tables.insert(
+            "bank.accounts".into(),
+            TableResult {
+                table: "bank.accounts".into(),
+                level: CheckLevel::FullValues,
+                verdict: Verdict::Pass,
+                old_rows: Some(10),
+                new_rows: Some(10),
+                columns_covered: None,
+                differing_buckets: Some(0),
+                missing_buckets: Some(0),
+                extra_buckets: Some(0),
+                missing_rows: None,
+                extra_rows: None,
+                changed_rows: None,
+                reasons: vec!["spot check: 2 rows compared".into()],
+                column_notes: vec![],
+            },
+        );
+        r.table_facts.insert(
+            "bank.accounts".into(),
+            TableFacts {
+                key_columns: vec!["id".into()],
+                columns: vec![ColumnRule {
+                    column: "id".into(),
+                    rule: "compared as an exact whole number".into(),
+                }],
+                buckets_total: Some(256),
+                spot: Some(SpotFact {
+                    state: "agreed".into(),
+                    compared: Some(2),
+                    differing: Some(0),
+                    note: String::new(),
+                }),
+                change_detection_old: Some("available".into()),
+                change_detection_new: Some("available".into()),
+                changed_during_scan: Some(false),
+                control_totals: vec![ControlTotalFact {
+                    column: "amount".into(),
+                    old: "1.50".into(),
+                    new: "1.50".into(),
+                }],
+            },
+        );
+        r.ignored_items.push(IgnoredItem {
+            path: "bank.accounts.note".into(),
+            reason: "free text".into(),
+        });
+        r.ignored_items.push(IgnoredItem {
+            path: "bank.accounts_archive.note".into(),
+            reason: "another table".into(),
+        });
+        let dto = map_results("run-x", &r);
+        let t = &dto.table_results[0];
+        assert_eq!((t.old_rows, t.new_rows), (Some(10), Some(10)));
+        assert_eq!(t.differing_buckets, Some(0));
+        assert_eq!(t.reasons, vec!["spot check: 2 rows compared".to_string()]);
+        let f = t.facts.as_ref().expect("facts are mapped");
+        assert_eq!(f.buckets_total, Some(256));
+        assert_eq!(f.spot.as_ref().unwrap().state, "agreed");
+        assert_eq!(f.control_totals[0].column, "amount");
+        // Only this table's ignored columns, not a table whose name starts the same.
+        assert_eq!(t.ignored_columns.len(), 1);
+        assert_eq!(t.ignored_columns[0].reason, "free text");
+        assert_eq!(dto.tool_version, "9.9.9");
+        assert_eq!(dto.mapping_hash, "map");
+        assert_eq!(dto.results_sha256, "sha");
+        assert_eq!(
+            dto.connections.old.superuser_reason.as_deref(),
+            Some("rehearsal")
+        );
+        // The wire form uses the snake_case names the UI reads, and nothing else.
+        let v = serde_json::to_value(&dto).unwrap();
+        assert!(v["table_results"][0]["facts"]["key_columns"].is_array());
+        assert!(v["connections"]["old"]["superuser"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn map_results_has_no_facts_for_a_table_without_them() {
+        let mut r = RunResults::default();
+        r.tables.insert(
+            "s.t".into(),
+            dmux_engine::results::TableResult {
+                table: "s.t".into(),
+                level: CheckLevel::Structure,
+                verdict: Verdict::Pass,
+                old_rows: None,
+                new_rows: None,
+                columns_covered: None,
+                differing_buckets: None,
+                missing_buckets: None,
+                extra_buckets: None,
+                missing_rows: None,
+                extra_rows: None,
+                changed_rows: None,
+                reasons: vec![],
+                column_notes: vec![],
+            },
+        );
+        let dto = map_results("run-x", &r);
+        assert!(dto.table_results[0].facts.is_none());
+        assert!(dto.table_results[0].ignored_columns.is_empty());
+    }
+
     // --- Live tests (gated on the mock DBs; FAIL under CI when unset) ---
 
     /// A planted demo_bank run must surface FAIL, with the answer key's m01
@@ -1289,6 +1456,38 @@ mod tests {
         // The bank database has no tables here, so the engine reports a non-PASS
         // (never a fabricated clean PASS on nothing).
         assert_ne!(dto.verdict, "PASS", "an empty run must not pass");
+    }
+
+    /// A live demo_bank run records how every full-values table was checked:
+    /// key, rules, buckets, spot check, change detection and control totals.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_run_records_facts_for_every_scanned_table() {
+        let Some(old) = env_url("DMUX_TEST_DEMO_OLD_URL") else {
+            return;
+        };
+        let Some(new) = env_url("DMUX_TEST_DEMO_NEW_URL") else {
+            return;
+        };
+        let results = run_live(&old, &new).await;
+        let dto = map_results("run-test", &results);
+        let mut scanned = 0;
+        for t in &dto.table_results {
+            if t.level == CheckLevel::Structure || t.old_rows.is_none() {
+                continue;
+            }
+            scanned += 1;
+            let f = t
+                .facts
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no recorded facts", t.table_id));
+            assert!(f.change_detection_old.is_some(), "{}", t.table_id);
+            if t.level == CheckLevel::FullValues {
+                assert!(!f.columns.is_empty(), "{}: no column rules", t.table_id);
+                assert!(f.buckets_total.unwrap_or(0) > 0, "{}", t.table_id);
+                assert!(f.spot.is_some(), "{}: no spot check fact", t.table_id);
+            }
+        }
+        assert!(scanned > 0, "the demo run scans data-level tables");
     }
 
     // --- Live command lifecycle (gated on the large mock) ---

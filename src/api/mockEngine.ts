@@ -5,6 +5,7 @@ import type {
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
+  ConnectionFact,
   HistoryEntry,
   OpenResultsResult,
   CoverageSummary,
@@ -25,7 +26,9 @@ import type {
   RunProgress,
   SaveProfileResult,
   ServerInfo,
+  StructureRow,
   TableCheck,
+  TableFacts,
   TableProgress,
   TableResult,
   TableRunState,
@@ -148,6 +151,57 @@ const diffInventory = (): Inventory => ({
   oldCollation: 'C',
   newCollation: 'en_US.utf8',
 });
+
+/**
+ * A large inventory for the performance check: `tables` tables of five columns
+ * each, a column type changed on every 50th table, one table missing in the new
+ * database every 97th and one added every 101st.
+ */
+export const largeInventory = (tables: number): Inventory => {
+  const rows: StructureRow[] = [
+    { id: 'schema:bank', depth: 0, kind: 'schema', name: 'bank', status: 'same', old: 'present', new: 'present', expandable: true },
+  ];
+  for (let i = 0; i < tables; i += 1) {
+    const name = `table_${i.toString().padStart(5, '0')}`;
+    const id = `schema:bank/table:${name}`;
+    const missing = i % 97 === 96;
+    const added = i % 101 === 100;
+    rows.push({
+      id,
+      depth: 1,
+      kind: 'table',
+      name,
+      status: missing ? 'missing' : added ? 'added' : 'same',
+      old: added ? undefined : '5 columns, 1 indexes, 1 constraints',
+      new: missing ? undefined : '5 columns, 1 indexes, 1 constraints',
+      expandable: !missing && !added,
+    });
+    if (missing || added) continue;
+    for (const col of ['id', 'amount', 'posted_at', 'memo', 'branch']) {
+      const changed = col === 'amount' && i % 50 === 0;
+      rows.push({
+        id: `${id}/column:${col}`,
+        depth: 2,
+        kind: 'column',
+        name: col,
+        status: changed ? 'changed' : 'same',
+        old: col === 'amount' ? 'numeric(18,2)' : 'text',
+        new: col === 'amount' ? (changed ? 'numeric(19,2)' : 'numeric(18,2)') : 'text',
+        expandable: false,
+      });
+    }
+  }
+  return {
+    schemas: [],
+    rows,
+    oldEncoding: 'LATIN1',
+    newEncoding: 'UTF8',
+    oldCollation: 'C',
+    newCollation: 'en_US.utf8',
+    oldServerVersion: '9.6.24',
+    newServerVersion: '17.2',
+  };
+};
 
 const makeMapping = (inventory: Inventory): Mapping => {
   const matches: MappingMatch[] = [];
@@ -458,6 +512,48 @@ const makeIgnored = (count: number): IgnoreItem[] => {
   return items;
 };
 
+const mockConnection = (version: string, encoding: string): ConnectionFact => ({
+  tls: 'verified',
+  superuser: false,
+  canWrite: false,
+  serverVersion: version,
+  serverEncoding: encoding,
+});
+
+/** Realistic recorded facts for one scanned table (counts only, never values). */
+const makeFacts = (level: TableResult['level'], verdict: Verdict, failing: boolean): TableFacts | undefined => {
+  if (level === 'structure') return undefined;
+  const totals = [
+    {
+      column: 'amount',
+      old: '1482930.50',
+      new: failing ? '1482810.50' : '1482930.50',
+    },
+  ];
+  const base: TableFacts = {
+    keyColumns: [],
+    columns: [],
+    changeDetectionOld: 'available',
+    changeDetectionNew: 'available',
+    changedDuringScan: verdict === 'CHANGED_DURING_CHECK',
+    controlTotals: totals,
+  };
+  if (level === 'counts') return base;
+  return {
+    ...base,
+    keyColumns: ['id'],
+    bucketsTotal: 256,
+    spot: { state: 'agreed', compared: 200, differing: failing ? 3 : 0, note: '' },
+    columns: [
+      { column: 'id', rule: 'compared as an exact whole number' },
+      { column: 'name', rule: 'compared exactly as text' },
+      { column: 'amount', rule: 'compared as an exact decimal, digit for digit' },
+      { column: 'posted_at', rule: 'compared as an exact date or time value' },
+      { column: 'rate', rule: 'compared by its exact 8-byte binary form' },
+    ],
+  };
+};
+
 const makeResults = (fixture: string): Results => {
   const tableCount = fixture === 'scale' ? 1529 : 40;
   const coverage: CoverageSummary = {
@@ -556,14 +652,40 @@ const makeResults = (fixture: string): Results => {
       });
     }
 
+    const card = failures.find((f) => f.tableId === deterministicId('tbl', i));
+    const level: TableResult['level'] =
+      card?.level ?? (i % 7 === 0 ? 'full-values' : i % 4 === 0 ? 'counts' : 'structure');
+    const failing = verdict === 'FAIL' || verdict === 'WIDELY_DIFFERENT';
+    const oldRows = 1000 + i * 37;
+    const dataLevel = level !== 'structure';
     tableResults.push({
       tableId: deterministicId('tbl', i),
       schemaName: 'demo_bank',
       tableName: `table_${i.toString().padStart(4, '0')}`,
       verdict,
-      level: i % 7 === 0 ? 'full-values' : i % 4 === 0 ? 'counts' : 'structure',
+      level,
       checked: fixture !== 'cancelled',
       drillDown,
+      columnNotes:
+        i === 7
+          ? [{ column: 'branch_code', kind: 'type_changed', note: 'type changed from integer to text' }]
+          : undefined,
+      oldRows: dataLevel ? oldRows : undefined,
+      newRows: dataLevel ? (failing && i === 1 ? oldRows - 12 : oldRows) : undefined,
+      differingBuckets: level === 'full-values' ? (failing ? 3 : 0) : undefined,
+      missingBuckets: level === 'full-values' ? (failing ? 2 : 0) : undefined,
+      extraBuckets: level === 'full-values' ? 0 : undefined,
+      missingRows: failing ? 12 : undefined,
+      extraRows: failing ? 0 : undefined,
+      changedRows: failing ? 3 : undefined,
+      reasons:
+        verdict === 'PASS'
+          ? level === 'structure'
+            ? ['structure only: values were not compared']
+            : []
+          : failures.filter((f) => f.tableId === deterministicId('tbl', i)).map((f) => f.summary),
+      facts: makeFacts(level, verdict, failing),
+      ignoredColumns: i === 7 ? [{ id: 'demo_bank.table_0007.audit_note', name: 'audit_note', reason: 'free text, not migrated' }] : undefined,
     });
   }
 
@@ -594,6 +716,13 @@ const makeResults = (fixture: string): Results => {
     optionsApplied: false,
     optionsRecorded: true,
     warnings: [],
+    runFacts: {
+      toolVersion: '1.0.0 (mock)',
+      mappingHash: '3f2a9c1be0d84a7f6c55d2e1b9a0c4d87e6f1a2b3c4d5e6f708192a3b4c5d6e7',
+      resultsSha256: '9b1de4c07a52f3e86d4b0a1c2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f7',
+      oldConnection: mockConnection('9.6.24', 'LATIN1'),
+      newConnection: mockConnection('17.2', 'UTF8'),
+    },
   };
 };
 
@@ -787,10 +916,13 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       oldProfile: ConnectionProfile,
       newProfile: ConnectionProfile,
     ): Promise<Inventory> {
-      if (oldProfile.database === 'diff' || newProfile.database === 'diff') {
-        return diffInventory();
+      if (oldProfile.database === 'scale' || newProfile.database === 'scale') {
+        return largeInventory(2000);
       }
-      return baseInventory();
+      if (oldProfile.database === 'diff' || newProfile.database === 'diff') {
+        return { ...diffInventory(), oldServerVersion: '9.6 (mock)', newServerVersion: '17.0 (mock)' };
+      }
+      return { ...baseInventory(), oldServerVersion: '17.0 (mock)', newServerVersion: '17.0 (mock)' };
     },
 
     async buildMapping(inventory: Inventory): Promise<Mapping> {

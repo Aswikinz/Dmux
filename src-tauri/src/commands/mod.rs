@@ -19,3 +19,4 @@ pub mod mapping_edit;
 pub mod profiles;
 pub mod report;
 pub mod settings;
+pub mod structure_view;
