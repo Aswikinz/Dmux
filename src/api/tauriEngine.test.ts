@@ -695,6 +695,70 @@ describe('data half is wired to the backend', () => {
     }
   });
 
+  it('getResults maps options_applied and per-column notes', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-1',
+      verdict: 'PASS',
+      options_applied: true,
+      options_recorded: true,
+      warnings: ['the old database login can write'],
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [
+        {
+          table_id: 'demo_bank.accounts',
+          schema_name: 'demo_bank',
+          table_name: 'accounts',
+          verdict: 'PASS',
+          level: 'full_values',
+          checked: true,
+          drill_down: null,
+          column_notes: [{ column: 'balance', kind: 'option', note: 'round to 2 decimals' }],
+        },
+      ],
+    });
+
+    const results = await engine.getResults('run-1');
+    expect(results.optionsApplied).toBe(true);
+    expect(results.optionsRecorded).toBe(true);
+    expect(results.warnings).toEqual(['the old database login can write']);
+    expect(results.tableResults[0].columnNotes).toEqual([
+      { column: 'balance', kind: 'option', note: 'round to 2 decimals' },
+    ]);
+  });
+
+  it('getResults defaults options_recorded to false when the backend omits it', async () => {
+    // A v2-era backend (or results file) never records options: the adapter must
+    // say "options not recorded", never assume none were applied (never a bare
+    // PASS).  The field is absent here on purpose.
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({
+      run_id: 'run-v2',
+      verdict: 'PASS',
+      coverage: {
+        total_tables: 1,
+        full_values_tables: 1,
+        counts_tables: 0,
+        structure_tables: 0,
+        ignored_tables: 0,
+      },
+      ignored: [],
+      failures: [],
+      table_results: [],
+    });
+
+    const results = await engine.getResults('run-v2');
+    expect(results.optionsRecorded).toBe(false);
+  });
+
   it('pollRun / setRunPaused / cancelRun invoke their commands', async () => {
     const engine = createTauriEngine();
     const progress = {

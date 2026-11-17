@@ -76,7 +76,7 @@ A verification tool has one unforgivable failure: saying PASS when the data diff
 | Challenge | What goes wrong | How Dmux handles it |
 | --- | --- | --- |
 | A PASS that hides gaps | 200 ignored tables and a green tick | The coverage line and every ignored item, with its reason, sit on the report's first page |
-| Can the report be trusted later | A PDF can be edited | The report carries the run ID, tool version, mapping hash and a SHA-256 of the results file, and the run can be repeated from its saved definition. This is tamper-evident, not tamper-proof, and the report says so |
+| Can the report be trusted later | A PDF can be edited | The report carries the run ID, tool version, mapping hash and a SHA-256 of the results file, and the run can be repeated from its saved definition. These hashes detect corruption; they show tampering only when compared with the values printed on the signed PDF, and the report says so |
 | Nobody on the team can vouch for the code | The team is non-technical | The comparison core stays small and is explained in a plain-language "How Dmux decides" document; an independent database administrator reviews the method before first real use; the first real use runs alongside the existing manual checks |
 | Wrong time estimates | First run on unknown hardware | Estimates are shown as a range and corrected as each table finishes |
 

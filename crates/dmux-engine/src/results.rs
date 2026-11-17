@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::core::compare::Verdict as CoreVerdict;
+use crate::core::normalise::{Flag, OptionKind};
 use crate::estimate::Estimate;
 
 /// The run-level verdict vocabulary.  Serialises to the SCREAMING_SNAKE strings
@@ -88,6 +89,64 @@ pub struct IgnoredItem {
     pub reason: String,
 }
 
+/// One per-column note carried into the results (H2 / decision 23): a ticked
+/// option or a type-change flag, in plain language.  `kind` is a stable
+/// identifier for the flag; `note` is what the report prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ColumnNote {
+    pub column: String,
+    pub kind: String,
+    pub note: String,
+}
+
+/// Connection-safety record for one side of a run (audit M5 / PLAN 2.3, 6.2,
+/// 6.7).  Every field is a decision the signer must be able to see on page 1 of
+/// the report: how the connection was secured, whether the login was a
+/// superuser (and the recorded override), whether it could write, and what the
+/// server actually was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct ConnectionInfo {
+    /// `"verified"`, `"pinned"` or `"plaintext"`; empty for a side that was not
+    /// a live database (a saved fingerprint file).
+    pub tls: String,
+    /// The pinned certificate fingerprint when `tls == "pinned"`.
+    #[serde(default)]
+    pub tls_fingerprint: Option<String>,
+    /// The recorded reason for a plaintext connection.
+    #[serde(default)]
+    pub plaintext_reason: Option<String>,
+    pub superuser: bool,
+    /// Why a superuser was allowed (the run's override reason).
+    #[serde(default)]
+    pub superuser_reason: Option<String>,
+    pub can_write: bool,
+    /// Fixed, plain-language reasons the login can write (no object names, no
+    /// row data).  Empty when the login is read-only in every way checked.
+    #[serde(default)]
+    pub can_write_reasons: Vec<String>,
+    pub pooler_suspected: bool,
+    pub md5_available: bool,
+    pub server_version: String,
+    pub server_encoding: String,
+    /// Whether the login has `BYPASSRLS` (PostgreSQL 9.5+; `false` on 9.4).
+    #[serde(default)]
+    pub rolbypassrls: bool,
+    /// `schema.table` of every relation with row-level security enabled
+    /// (PostgreSQL 9.5+; empty on 9.4).
+    #[serde(default)]
+    pub rls_tables: Vec<String>,
+}
+
+/// The connection-safety record for both sides (audit M5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct Connections {
+    pub old: ConnectionInfo,
+    pub new: ConnectionInfo,
+}
+
 /// The result for one table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +170,11 @@ pub struct TableResult {
     pub changed_rows: Option<usize>,
     /// Per-column warnings/flags and reasons this table did not PASS.
     pub reasons: Vec<String>,
+    /// Per-column notes (ticked options and type-change flags), in stable order
+    /// (column, then kind).  Carried by the table result so a resumed table
+    /// keeps its notes (the resume store persists `TableResult`).
+    #[serde(default)]
+    pub column_notes: Vec<ColumnNote>,
 }
 
 /// One changed row with its differing columns (keys only; no non-key values).
@@ -246,6 +310,22 @@ pub struct RunResults {
     /// options, mapping hash) the results were produced from.
     #[serde(default)]
     pub definition_hash: String,
+    /// Connection-safety decisions per side (audit M5).
+    #[serde(default)]
+    pub connections: Connections,
+    /// Whether any column option was applied anywhere (H2 / decision 23).  When
+    /// the overall verdict is PASS and this is true, the report says
+    /// "PASS (with options)".
+    #[serde(default)]
+    pub options_applied: bool,
+    /// SHA-256 of the old-side capture file, present only when the old input
+    /// was a saved fingerprint file (audit M1).
+    #[serde(default)]
+    pub capture_sha256_old: Option<String>,
+    /// SHA-256 of the new-side capture file, present only when the new input
+    /// was a saved fingerprint file (audit M1).
+    #[serde(default)]
+    pub capture_sha256_new: Option<String>,
 }
 
 impl Default for RunResults {
@@ -277,12 +357,29 @@ impl Default for RunResults {
             table_elapsed_ms: BTreeMap::new(),
             resumed_tables: Vec::new(),
             definition_hash: String::new(),
+            connections: Connections::default(),
+            options_applied: false,
+            capture_sha256_old: None,
+            capture_sha256_new: None,
         }
     }
 }
 
 /// Results schema version this module writes.
-pub const RESULTS_VERSION: u32 = 2;
+pub const RESULTS_VERSION: u32 = 3;
+
+/// The results schema version at which per-column option notes (and the
+/// `options_applied` flag) were first recorded.  A file with an older
+/// `results_version` never recorded options, so a reader must say
+/// "options not recorded" rather than assume none were applied (a bare PASS).
+pub const OPTIONS_RECORDED_VERSION: u32 = 3;
+
+/// Whether a results file recorded per-column options (H2 / decision 23).
+/// Files with `results_version < OPTIONS_RECORDED_VERSION` carry no option
+/// notes, so their options are unknown, never "none".
+pub fn options_recorded(results: &RunResults) -> bool {
+    results.results_version >= OPTIONS_RECORDED_VERSION
+}
 
 /// The precedence order for combining verdicts: a run is PASS only when every
 /// contributing verdict is PASS.  Any non-PASS verdict pulls the run down;
@@ -357,6 +454,11 @@ pub fn add_table(results: &mut RunResults, table: TableResult) {
                     existing.reasons.push(r);
                 }
             }
+            for n in table.column_notes {
+                if !existing.column_notes.contains(&n) {
+                    existing.column_notes.push(n);
+                }
+            }
             existing.old_rows = existing.old_rows.or(table.old_rows);
             existing.new_rows = existing.new_rows.or(table.new_rows);
             existing.columns_covered = existing.columns_covered.take().or(table.columns_covered);
@@ -399,6 +501,81 @@ pub fn sha256_of(results: &RunResults) -> String {
     hex::encode(sha2::Sha256::digest(canonical.as_bytes()))
 }
 
+/// Plain-language notes for one column's planner flags (H2 / decision 23).
+/// The caller collects notes across columns and sorts by (column, kind) so the
+/// report order never depends on the server or on flag insertion order (rule 4).
+pub fn column_notes(column: &str, flags: &[Flag]) -> Vec<ColumnNote> {
+    flags.iter().map(|f| note_for(column, f)).collect()
+}
+
+/// The stable `kind` and plain-language `note` for one planner flag.
+fn note_for(column: &str, flag: &Flag) -> ColumnNote {
+    let (kind, note): (&str, String) = match flag {
+        Flag::TypeChanged { old, new } => {
+            ("type_changed", format!("type changed from {old} to {new}"))
+        }
+        Flag::JsonJsonbChange => (
+            "json_jsonb",
+            "json on one side, jsonb on the other (key order and duplicates are normalised)"
+                .to_string(),
+        ),
+        Flag::TimestampTzChange => (
+            "timestamp_tz",
+            "timestamp without time zone on one side, with time zone on the other".to_string(),
+        ),
+        Flag::CharVarcharChange => (
+            "char_varchar",
+            "char(n) on one side, varchar or text on the other".to_string(),
+        ),
+        Flag::NumericScaleRaised { scale } => (
+            "numeric_scale",
+            format!("both sides cast up to numeric scale {scale}"),
+        ),
+        Flag::NumericScaleUnchecked => (
+            "numeric_scale_unchecked",
+            "one numeric side is unconstrained, so the printed forms are compared as stored"
+                .to_string(),
+        ),
+        Flag::PrintedFormWarning { type_name } => (
+            "printed_form",
+            format!("type {type_name} is compared by a printed form that may depend on the server"),
+        ),
+        Flag::UnknownType { type_name } => (
+            "unknown_type",
+            format!("unrecognised type {type_name} is compared by its printed form"),
+        ),
+        Flag::OptionApplied(kind) => match kind {
+            OptionKind::IgnoreTrailingSpaces => ("option", "ignore trailing spaces".to_string()),
+            OptionKind::NullEqualsEmpty => ("option", "treat NULL as an empty value".to_string()),
+            OptionKind::DateOnly => ("option", "compare the date part only".to_string()),
+            OptionKind::Round(n) => ("option", format!("round to {n} decimals")),
+        },
+        Flag::DomainResolved { type_name } => (
+            "domain_resolved",
+            format!("domain {type_name} is compared by its base type"),
+        ),
+        Flag::NeedsReview { type_name } => (
+            "needs_review",
+            format!("type {type_name} is compared by a printed form that is not provably exact"),
+        ),
+    };
+    ColumnNote {
+        column: column.to_string(),
+        kind: kind.to_string(),
+        note,
+    }
+}
+
+/// Whether any table applied a column option (H2): drives the "PASS (with
+/// options)" wording on page 1 of the report.
+pub fn any_options_applied(results: &RunResults) -> bool {
+    results
+        .tables
+        .values()
+        .flat_map(|t| &t.column_notes)
+        .any(|n| n.kind == "option")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +596,7 @@ mod tests {
             extra_rows: None,
             changed_rows: None,
             reasons: vec![reason.into()],
+            column_notes: vec![],
         }
     }
 
@@ -533,10 +711,86 @@ mod tests {
             "table_elapsed_ms",
             "resumed_tables",
             "definition_hash",
+            "connections",
+            "options_applied",
+            "capture_sha256_old",
+            "capture_sha256_new",
         ] {
             o.remove(k);
         }
         let back: RunResults = serde_json::from_value(v).unwrap();
         assert_eq!(back.structure_only, 0);
+        assert!(!back.options_applied);
+        assert_eq!(back.connections, Connections::default());
+        assert_eq!(back.capture_sha256_old, None);
+    }
+
+    #[test]
+    fn column_notes_map_every_flag_and_serialise() {
+        use crate::core::normalise::PgType;
+        let m = crate::core::normalise::ColumnMapping {
+            old_name: "balance".into(),
+            new_name: "balance".into(),
+            old_type: PgType::Numeric(Some((18, 2))),
+            new_type: PgType::Numeric(Some((18, 4))),
+            options: crate::core::normalise::ColumnOptions {
+                round_decimals: Some(2),
+                ..Default::default()
+            },
+            control_total: false,
+        };
+        let plan = crate::core::normalise::plan_column(&m).unwrap();
+        let mut notes = column_notes("balance", &plan.flags);
+        notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+        assert!(notes
+            .iter()
+            .any(|n| n.kind == "option" && n.note == "round to 2 decimals"));
+        assert!(notes.iter().any(
+            |n| n.kind == "numeric_scale" && n.note == "both sides cast up to numeric scale 4"
+        ));
+        // A type change carries its note too (H2): the declared types differ.
+        assert!(notes
+            .iter()
+            .any(|n| n.kind == "type_changed" && n.note.contains("type changed from")));
+        // Stable order: within a column, notes sort by kind.
+        assert!(notes.windows(2).all(|w| w[0].kind <= w[1].kind));
+
+        let mut r = RunResults::default();
+        add_table(
+            &mut r,
+            TableResult {
+                column_notes: notes.clone(),
+                ..table("s.t", Verdict::Pass, "data equal")
+            },
+        );
+        assert!(any_options_applied(&r));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("round to 2 decimals"));
+    }
+
+    #[test]
+    fn add_table_merges_column_notes_fail_closed() {
+        let mut r = RunResults::default();
+        let note = ColumnNote {
+            column: "c".into(),
+            kind: "option".into(),
+            note: "round to 2 decimals".into(),
+        };
+        add_table(
+            &mut r,
+            TableResult {
+                column_notes: vec![note.clone()],
+                ..table("s.t", Verdict::Fail, "column missing")
+            },
+        );
+        add_table(
+            &mut r,
+            TableResult {
+                column_notes: vec![note],
+                ..table("s.t", Verdict::Pass, "data equal")
+            },
+        );
+        assert_eq!(r.tables["s.t"].column_notes.len(), 1);
+        assert_eq!(r.tables["s.t"].verdict, Verdict::Fail);
     }
 }

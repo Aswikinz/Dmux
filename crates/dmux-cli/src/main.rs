@@ -1143,6 +1143,7 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         old_parallelism,
         new_parallelism,
         allow_superuser: def.allow_superuser,
+        allow_superuser_reason: def.reason.clone(),
         export_keys: def.export_keys,
         resume_store: None,
         stats_settle,

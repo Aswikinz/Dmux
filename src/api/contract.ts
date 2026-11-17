@@ -191,6 +191,15 @@ export interface DrillDownRow {
   differingColumns?: string[];
 }
 
+/** A per-column note: a ticked option or a type-change flag (H2 / decision 23). */
+export interface ColumnNote {
+  column: string;
+  /** Stable identifier, e.g. "option", "type_changed". */
+  kind: string;
+  /** Plain-language note shown in the report. */
+  note: string;
+}
+
 export interface TableResult {
   tableId: string;
   schemaName: string;
@@ -199,6 +208,7 @@ export interface TableResult {
   level: CheckLevel;
   checked: boolean;
   drillDown?: DrillDownRow[];
+  columnNotes?: ColumnNote[];
 }
 
 export interface CoverageSummary {
@@ -217,6 +227,13 @@ export interface Results {
   ignored: IgnoreItem[];
   failures: FailureCard[];
   tableResults: TableResult[];
+  /** Whether any column option was applied: shows "PASS (with options)". */
+  optionsApplied: boolean;
+  /** Whether the results file recorded per-column options (schema >= 3).  When
+   *  false the UI shows "options not recorded", never a bare PASS. */
+  optionsRecorded: boolean;
+  /** Run-level warnings (can-write, superuser, row-level security, ...). */
+  warnings: string[];
 }
 
 export type ReportFormat = 'pdf' | 'excel';

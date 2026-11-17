@@ -20,6 +20,9 @@ interface StatusBadgeProps {
     | 'missing-in-new'
     | 'extra-in-new'
     | 'changed-values';
+  /** Optional override so the badge and any qualifier ("with options",
+   *  "options not recorded") are a single, consistent label. */
+  label?: string;
   className?: string;
 }
 
@@ -52,10 +55,11 @@ const config: Record<
   unknown: { icon: Info, label: 'Unknown', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
 };
 
-export function StatusBadge({ status, className }: StatusBadgeProps) {
+export function StatusBadge({ status, label, className }: StatusBadgeProps) {
   // An unrecognised verdict falls back to a neutral "Unknown", never PASS and
   // never "Idle". The engine's results JSON is untrusted input.
-  const { icon: Icon, label, classes } = config[status] ?? config.unknown;
+  const configEntry = config[status] ?? config.unknown;
+  const { icon: Icon, classes } = configEntry;
   return (
     <span
       className={cn(
@@ -65,7 +69,7 @@ export function StatusBadge({ status, className }: StatusBadgeProps) {
       )}
     >
       <Icon className="h-4 w-4" aria-hidden="true" />
-      {label}
+      {label ?? configEntry.label}
     </span>
   );
 }

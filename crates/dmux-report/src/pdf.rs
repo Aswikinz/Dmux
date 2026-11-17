@@ -8,7 +8,8 @@
 //! line, every failure, every ignored item with its reason, structure findings,
 //! the run identity (run ID, tool version, mapping hash, results SHA-256,
 //! definition hash), the "what a PASS does not prove" paragraph, the md5
-//! threat-model sentence (decision 10), the tamper-evident-not-proof sentence,
+//! threat-model sentence (decision 10), the hash-integrity sentence (audit M1 /
+//! decision 23),
 //! the hook custom checks with script hashes, and a sign-off block.  Per-table
 //! sections follow (verdict, level, counts, differences summary).  Text wraps at
 //! word boundaries and pages automatically.
@@ -69,7 +70,7 @@ pub fn write_summary_layout(
     path: &Path,
 ) -> Result<(), PdfError> {
     let bytes = render_bytes(layout, results_sha256)?;
-    std::fs::write(path, bytes)?;
+    crate::write_private(path, &bytes)?;
     Ok(())
 }
 
@@ -262,10 +263,24 @@ fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
 
     // Page 1: overall verdict, a word + text, never colour alone.
     runs.push(Run::Heading("Overall verdict".to_string()));
-    runs.push(Run::Bold(layout.verdict_word.clone()));
+    runs.push(Run::Bold(layout::verdict_display(
+        &layout.verdict_word,
+        layout.options_applied,
+        layout.options_recorded,
+    )));
 
     runs.push(Run::Heading("Coverage".to_string()));
     runs.push(Run::Body(layout.coverage_line.clone()));
+
+    if !layout.options_recorded {
+        runs.push(Run::Heading("Options applied".to_string()));
+        runs.push(Run::Body(layout::OPTIONS_NOT_RECORDED.to_string()));
+    } else if !layout.options_applied_lines.is_empty() {
+        runs.push(Run::Heading("Options applied".to_string()));
+        for line in &layout.options_applied_lines {
+            runs.push(Run::Body(line.clone()));
+        }
+    }
 
     runs.push(Run::Heading("Failures and findings".to_string()));
     let failures: Vec<&layout::TableSummary> = layout
@@ -334,11 +349,24 @@ fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
     if !layout.definition_hash.is_empty() {
         runs.push(labeled_run("Definition hash", &layout.definition_hash));
     }
+    if let Some(old) = &layout.capture_sha256_old {
+        runs.push(labeled_run("Old capture SHA-256", old));
+    }
+    if let Some(new) = &layout.capture_sha256_new {
+        runs.push(labeled_run("New capture SHA-256", new));
+    }
     if let Some(wls) = &layout.wal_start_lsn {
         runs.push(labeled_run("Write-ahead log start", wls));
     }
     if let Some(wle) = &layout.wal_end_lsn {
         runs.push(labeled_run("Write-ahead log end", wle));
+    }
+
+    if !layout.connections.is_empty() {
+        runs.push(Run::Heading("Connections".to_string()));
+        for line in &layout.connections {
+            runs.push(Run::Body(line.clone()));
+        }
     }
 
     runs.push(Run::Heading("What a PASS does not prove".to_string()));
@@ -383,6 +411,9 @@ fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
         }
         for word in &t.plain_words {
             runs.push(labeled_run("Note", word));
+        }
+        for note in &t.column_notes {
+            runs.push(labeled_run("Column note", note));
         }
         for ct in &t.control_totals {
             runs.push(labeled_run("Control total", ct));
@@ -508,6 +539,7 @@ mod tests {
                 extra_rows: Some(0),
                 changed_rows: Some(0),
                 reasons: vec!["row counts differ".into()],
+                column_notes: vec![],
             },
         );
         let details = BTreeMap::from([(
@@ -617,7 +649,7 @@ mod tests {
             "{texts:?}"
         );
         assert!(any_contains(&texts, "md5"));
-        assert!(any_contains(&texts, "tamper-evident, not tamper-proof"));
+        assert!(any_contains(&texts, "These hashes detect corruption"));
         assert!(any_contains(&texts, "Sign-off"));
         assert!(any_contains(&texts, "Signature"));
         assert!(any_contains(&texts, "Coverage"));
@@ -658,5 +690,28 @@ mod tests {
         let a = render_bytes(&layout, "abc").unwrap();
         let b = render_bytes(&layout, "abc").unwrap();
         assert_eq!(a, b, "PDF must be byte-deterministic");
+    }
+
+    #[test]
+    fn pdf_shows_pass_with_options_and_the_options_list() {
+        use dmux_engine::results::ColumnNote;
+        let mut r = fixture();
+        r.verdict = Verdict::Pass;
+        for t in r.tables.values_mut() {
+            t.verdict = Verdict::Pass;
+            t.reasons.clear();
+        }
+        r.tables.get_mut("demo_bank.accounts").unwrap().column_notes = vec![ColumnNote {
+            column: "balance".into(),
+            kind: "option".into(),
+            note: "round to 2 decimals".into(),
+        }];
+        r.options_applied = true;
+        let r = finalise(r);
+        let layout = build(&r, None, &ReportOptions::default());
+        let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
+        assert!(any_contains(&texts, "PASS (with options)"), "{texts:?}");
+        assert!(any_contains(&texts, "Options applied"), "{texts:?}");
+        assert!(any_contains(&texts, "round to 2 decimals"), "{texts:?}");
     }
 }

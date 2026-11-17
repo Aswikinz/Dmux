@@ -44,13 +44,14 @@ use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerd
 use crate::core::drilldown::{classify, fetch_rows};
 use crate::core::fingerprint::{fingerprint, Fingerprint, Side, Source, TablePlan};
 use crate::core::normalise::{plan_column, ColumnOptions};
-use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession};
+use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession, ServerInfo};
 use crate::estimate::{estimate_from_seconds, timed_sample, total_estimate, Estimate};
 use crate::inventory::{ConstraintKind, DatabaseInventory};
 use crate::mapping::Mapping;
-use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecInputs};
+use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecInputs, TableSpec};
 use crate::results::{
-    fresh_run_id, ChangedRowExport, CheckLevel, ControlTotalExport, RunResults, TableDetail,
+    fresh_run_id, ChangedRowExport, CheckLevel, ColumnNote, ConnectionInfo, Connections,
+    ControlTotalExport, RunResults, TableDetail,
 };
 use crate::store::{Loaded, RunKey, SideMark, Store, StoredTableResult};
 
@@ -81,6 +82,10 @@ pub struct RunConfig {
     /// Maximum concurrent scans on the new side (see the module docs).
     pub new_parallelism: usize,
     pub allow_superuser: bool,
+    /// The recorded reason for a superuser override, when one was accepted.
+    /// Recorded in the results `connections` block (audit M5); `None` when the
+    /// caller allowed a superuser without a recorded reason.
+    pub allow_superuser_reason: Option<String>,
     /// Put row keys of differing rows into the results (the user ticked export).
     pub export_keys: bool,
     /// An optional resume store path (see `crate::store`).
@@ -116,6 +121,7 @@ impl RunConfig {
             old_parallelism: 2,
             new_parallelism: 4,
             allow_superuser: false,
+            allow_superuser_reason: None,
             export_keys: false,
             resume_store: None,
             stats_settle: DEFAULT_STATS_SETTLE,
@@ -362,6 +368,101 @@ fn level_for(config: &RunConfig, path: &str) -> CheckLevel {
         .get(path)
         .copied()
         .unwrap_or(config.default_level)
+}
+
+/// The connection-safety record for one live side, from its profile's actual
+/// TLS mode and the probe's server information (audit M5).  The superuser
+/// override reason is the run-level override; `None` when no reason was
+/// recorded.
+pub(crate) fn connection_info(
+    profile: &ConnProfile,
+    info: &ServerInfo,
+    superuser_reason: Option<&str>,
+) -> ConnectionInfo {
+    let (tls, tls_fingerprint, plaintext_reason) = match &profile.tls_mode {
+        crate::db::TlsMode::VerifyFull => ("verified".to_string(), None, None),
+        crate::db::TlsMode::TrustFingerprint(fp) => ("pinned".to_string(), Some(fp.clone()), None),
+        crate::db::TlsMode::Disable(reason) => {
+            ("plaintext".to_string(), None, Some(reason.clone()))
+        }
+    };
+    ConnectionInfo {
+        tls,
+        tls_fingerprint,
+        plaintext_reason,
+        superuser: info.is_superuser,
+        superuser_reason: if info.is_superuser {
+            superuser_reason.map(str::to_string)
+        } else {
+            None
+        },
+        can_write: info.can_write,
+        can_write_reasons: info.can_write_reasons.clone(),
+        pooler_suspected: info.pooler_suspected,
+        md5_available: info.md5_available,
+        server_version: info.version_string.clone(),
+        server_encoding: info.encoding.clone(),
+        rolbypassrls: info.rolbypassrls,
+        rls_tables: info.rls_tables.clone(),
+    }
+}
+
+/// Record the plain-language run warnings the connection-safety decisions
+/// imply (audit M5, H1): a login that can write, a superuser login, and
+/// row-level security that Dmux refuses to read filtered.
+pub(crate) fn connection_warnings(
+    results: &mut RunResults,
+    old: &ConnectionInfo,
+    new: &ConnectionInfo,
+) {
+    for (side, info) in [("old", old), ("new", new)] {
+        if info.can_write {
+            let reasons = if info.can_write_reasons.is_empty() {
+                "it can write".to_string()
+            } else {
+                info.can_write_reasons.join("; ")
+            };
+            let w = format!(
+                "the {side} database login can write ({reasons}); the login should be read-only"
+            );
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+        if info.superuser {
+            let why = info
+                .superuser_reason
+                .as_deref()
+                .unwrap_or("no reason recorded");
+            let w = format!("the {side} database login is a superuser (override: {why})");
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+        if !info.rls_tables.is_empty() && !info.rolbypassrls {
+            let w = format!(
+                "the {side} database: {} tables use row-level security; Dmux refused to read them filtered",
+                info.rls_tables.len()
+            );
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+    }
+}
+
+/// Per-column notes for one table's plan, in stable (column, then kind) order
+/// (H2 / decision 23).  Re-planning is pure and cheap; a column that cannot be
+/// planned faults the table elsewhere and simply contributes no note here.
+pub(crate) fn collect_column_notes(spec: &TableSpec) -> Vec<ColumnNote> {
+    let mut notes: Vec<ColumnNote> = Vec::new();
+    for m in &spec.columns {
+        if let Ok(cp) = plan_column(m) {
+            notes.extend(crate::results::column_notes(&m.old_name, &cp.flags));
+        }
+    }
+    notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    notes
 }
 
 /// Run a comparison: live against live, file against live (either side), or
@@ -826,6 +927,24 @@ async fn run_live(
             .warnings
             .push("new database is SQL_ASCII; never a clean PASS on encoding (P19)".into());
     }
+    // Connection-safety decisions reach the results and page 1 of the report
+    // (audit M5): TLS state, superuser override and write access become plain
+    // warnings a signer can read.
+    let old_conn = connection_info(
+        old_profile,
+        &old_info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    let new_conn = connection_info(
+        new_profile,
+        &new_info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    connection_warnings(&mut b.results, &old_conn, &new_conn);
+    b.results.connections = Connections {
+        old: old_conn,
+        new: new_conn,
+    };
     b.results.wal_start_lsn = wal(&mut new_s, new_info.version_num).await;
     // What the counters are relative to (see `crate::consistency`).
     let epoch_old = epoch(&mut old_s).await;
@@ -1160,12 +1279,14 @@ async fn scan_pair(
         return fault(dup.to_string());
     }
 
+    let notes = collect_column_notes(&spec);
     let with_coverage = |e: Result<Evidence, RunError>| {
         e.map(|mut e| {
             e.dropped = spec.dropped.clone();
             e.added = spec.added.clone();
             e.ignored_columns = spec.ignored_columns.clone();
             e.columns_covered = Some(spec.columns_covered());
+            e.column_notes = notes.clone();
             e
         })
     };
@@ -1667,6 +1788,64 @@ mod tests {
         let mut with = c.clone();
         with.control = Some(std::sync::Arc::new(RunControl::new()));
         assert_eq!(definition_hash(&c), definition_hash(&with));
+    }
+
+    #[test]
+    fn connection_info_records_tls_superuser_and_write_access() {
+        let profile = ConnProfile::new(
+            "h",
+            5432,
+            "db",
+            "u",
+            format!("{:x}", std::process::id() ^ 0x5a5a),
+            crate::db::TlsMode::Disable("test network".to_string()),
+        );
+        let info = ServerInfo {
+            version_num: 170000,
+            version_string: "17.0".into(),
+            encoding: "UTF8".into(),
+            collation: "C".into(),
+            ctype: "C".into(),
+            lc_monetary: "C".into(),
+            is_superuser: true,
+            can_write: true,
+            pooler_suspected: true,
+            md5_available: false,
+            sql_ascii: false,
+            rolbypassrls: false,
+            rls_tables: vec!["s.accounts".into()],
+            can_write_reasons: vec!["has INSERT on at least one table".into()],
+        };
+        let c = connection_info(&profile, &info, Some("migration needs it"));
+        assert_eq!(c.tls, "plaintext");
+        assert_eq!(c.plaintext_reason.as_deref(), Some("test network"));
+        assert!(c.superuser);
+        assert_eq!(c.superuser_reason.as_deref(), Some("migration needs it"));
+        assert!(c.can_write);
+        assert_eq!(
+            c.can_write_reasons,
+            vec!["has INSERT on at least one table".to_string()]
+        );
+        assert!(!c.rolbypassrls);
+        assert_eq!(c.rls_tables, vec!["s.accounts".to_string()]);
+        assert!(c.pooler_suspected);
+        assert!(!c.md5_available);
+        assert_eq!(c.server_version, "17.0");
+        assert_eq!(c.server_encoding, "UTF8");
+
+        let mut r = RunResults::default();
+        connection_warnings(&mut r, &c, &ConnectionInfo::default());
+        assert!(r.warnings.iter().any(|w| w.contains("can write")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("has INSERT on at least one table")));
+        assert!(r.warnings.iter().any(|w| w.contains("superuser")));
+        assert!(r.warnings.iter().any(|w| w.contains("migration needs it")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("tables use row-level security")));
     }
 
     fn stopped_config() -> (RunConfig, std::sync::Arc<RunControl>) {
