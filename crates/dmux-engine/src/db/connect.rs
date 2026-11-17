@@ -205,7 +205,10 @@ fn build_config(
         .user(&profile.user)
         .password(&profile.password)
         .application_name("dmux")
-        .ssl_mode(ssl_mode);
+        .ssl_mode(ssl_mode)
+        // Second safety net: the session defaults to read-only, so even a query
+        // path that forgets the explicit READ ONLY transaction cannot write.
+        .options("-c default_transaction_read_only=on");
     config
 }
 
@@ -455,6 +458,11 @@ mod tests {
         );
         assert_eq!(config.get_user().expect("user set"), "dmux_dev");
         assert_eq!(config.get_dbname().expect("dbname set"), "bank");
+        assert_eq!(
+            config.get_options(),
+            Some("-c default_transaction_read_only=on"),
+            "the session must default to read-only as a second safety net"
+        );
     }
 
     #[tokio::test]

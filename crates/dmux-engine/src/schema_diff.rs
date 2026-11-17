@@ -527,17 +527,37 @@ fn diff_index(path: Vec<String>, old: &Index, new: &Index) -> Option<SchemaDiffE
 }
 
 fn diff_sequence(path: Vec<String>, old: &Sequence, new: &Sequence) -> Option<SchemaDiffEntry> {
-    // A value that could not be read is reported, never silently skipped.
-    if old.value_skipped || new.value_skipped {
+    // A sequence whose state could not be read (missing SELECT privilege) is
+    // reported, never silently skipped.
+    if old.unreadable || new.unreadable {
         return Some(SchemaDiffEntry::leaf(
             path,
             DiffStatus::Warning,
             format!(
-                "sequence {} last_value could not be read on one side; review required",
+                "sequence {} could not be read on one side; review required",
                 old.name
             ),
         ));
     }
+
+    // Rows migrated but the new sequence never advanced: the next value handed
+    // out would collide with migrated rows.  This is a real failure.
+    if old.is_called && !new.is_called {
+        return Some(SchemaDiffEntry::leaf(
+            path,
+            DiffStatus::Different,
+            format!(
+                "sequence {} was advanced on the old side but never called on the new side",
+                old.name
+            ),
+        ));
+    }
+
+    // Both never called: nothing to compare.
+    if !old.is_called && !new.is_called {
+        return None;
+    }
+
     match (old.last_value, new.last_value) {
         (Some(old_val), Some(new_val)) if new_val < old_val => Some(SchemaDiffEntry::leaf(
             path,
@@ -993,14 +1013,14 @@ mod tests {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
             last_value: Some(100),
-            value_skipped: false,
+            is_called: true,
             ..Sequence::default()
         };
         let new = Sequence {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
             last_value: Some(50),
-            value_skipped: false,
+            is_called: true,
             ..Sequence::default()
         };
         let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);
@@ -1008,18 +1028,63 @@ mod tests {
     }
 
     #[test]
-    fn skipped_sequence_value_is_warning_not_silent() {
+    fn sequence_advanced_old_but_never_called_new_is_different() {
+        // The classic "rows migrated, sequence not advanced" bug: the new side
+        // has the rows but its sequence was never used, so the next value would
+        // collide.  Must be a FAIL, not a warning.
         let old = Sequence {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
-            value_skipped: true,
+            last_value: Some(5000),
+            is_called: true,
+            ..Sequence::default()
+        };
+        let new = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            last_value: None,
+            is_called: false,
+            ..Sequence::default()
+        };
+        let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);
+        assert_eq!(diff.unwrap().status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn sequence_not_called_on_either_side_is_not_a_regression() {
+        // A never-called sequence on both sides must not be reported even though
+        // its last_value is absent.
+        let old = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            is_called: false,
+            ..Sequence::default()
+        };
+        let new = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            is_called: false,
+            ..Sequence::default()
+        };
+        let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn unreadable_sequence_is_warning_not_silent() {
+        let old = Sequence {
+            name: "seq".to_string(),
+            data_type: "bigint".to_string(),
+            last_value: Some(10),
+            is_called: true,
+            unreadable: true,
             ..Sequence::default()
         };
         let new = Sequence {
             name: "seq".to_string(),
             data_type: "bigint".to_string(),
             last_value: Some(10),
-            value_skipped: false,
+            is_called: true,
             ..Sequence::default()
         };
         let diff = diff_sequence(vec!["public".to_string(), "seq".to_string()], &old, &new);

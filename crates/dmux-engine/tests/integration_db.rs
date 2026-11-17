@@ -129,3 +129,36 @@ async fn probe_mock_login_is_superuser() {
         "the mock login is documented as a superuser"
     );
 }
+
+#[tokio::test]
+async fn read_only_safety_net_blocks_writes_outside_the_wrapper() {
+    let Some(url) = old_url() else {
+        return;
+    };
+    let profile = test_profile_from_url(&url);
+    // Mirror the engine's config (including the read-only safety-net option) and
+    // attempt a write WITHOUT going through the read-only wrapper: the
+    // session-level default_transaction_read_only must still reject it.
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&profile.host)
+        .port(profile.port)
+        .dbname(&profile.dbname)
+        .user(&profile.user)
+        .password(&profile.password)
+        .application_name("dmux")
+        .ssl_mode(tokio_postgres::config::SslMode::Disable)
+        .options("-c default_transaction_read_only=on");
+    let (client, conn) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let write = client
+        .execute("CREATE TABLE dmux_ro_safety_net(id int)", &[])
+        .await;
+    assert!(
+        write.is_err(),
+        "a write outside the read-only wrapper must still fail"
+    );
+}

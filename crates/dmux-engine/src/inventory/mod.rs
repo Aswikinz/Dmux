@@ -131,7 +131,12 @@ pub struct Sequence {
     pub increment: Option<i64>,
     pub last_value: Option<i64>,
     pub cycle: Option<bool>,
-    pub value_skipped: bool,
+    /// Whether the sequence has been advanced (`nextval` called at least once).
+    /// A sequence that was advanced on the old side but never called on the new
+    /// side means the migrated rows are not reflected in the sequence state.
+    pub is_called: bool,
+    /// Whether the sequence state could not be read (missing SELECT privilege).
+    pub unreadable: bool,
 }
 
 /// A view or materialised view.

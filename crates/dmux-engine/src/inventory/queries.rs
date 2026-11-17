@@ -271,12 +271,13 @@ pub(crate) async fn list_sequences<T: GenericClient>(
     version_num: i32,
 ) -> Result<Vec<SequenceInSchema>, InventoryError> {
     if version_num < 100000 {
-        // PostgreSQL < 10 has no pg_sequences view.  List the sequence names and
-        // read each last_value with a schema-qualified identifier (through the
+        // PostgreSQL < 10 has no pg_sequence catalog.  List names and the SELECT
+        // privilege, then read last_value + is_called per sequence (through the
         // quoting helper).  Sequences are always bigint before the `AS` clause.
         let rows = client
             .query(
-                "SELECT n.nspname AS schema_name, c.relname AS sequence_name \
+                "SELECT n.nspname AS schema_name, c.relname AS sequence_name, \
+                        pg_catalog.has_sequence_privilege(c.oid, 'SELECT') AS readable \
                  FROM pg_catalog.pg_class c \
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                  WHERE c.relkind = 'S' \
@@ -290,8 +291,19 @@ pub(crate) async fn list_sequences<T: GenericClient>(
         for row in rows {
             let schema_name = req_string(&row, 0)?;
             let name = req_string(&row, 1)?;
+            let readable = req_bool(&row, 2)?;
             let qualified = crate::ident::quote_qualified(&schema_name, &name)?;
-            let (last_value, value_skipped) = read_sequence_last_value(client, &qualified).await?;
+
+            let (last_value, is_called, unreadable) = if !readable {
+                (None, false, true)
+            } else {
+                match read_sequence_state(client, &qualified).await? {
+                    SeqState::Called(value) => (Some(value), true, false),
+                    SeqState::NotCalled => (None, false, false),
+                    SeqState::Unreadable => (None, false, true),
+                }
+            };
+
             out.push(SequenceInSchema {
                 schema_name,
                 sequence: Sequence {
@@ -303,27 +315,40 @@ pub(crate) async fn list_sequences<T: GenericClient>(
                     increment: None,
                     last_value,
                     cycle: None,
-                    value_skipped,
+                    is_called,
+                    unreadable,
                 },
             });
         }
         return Ok(out);
     }
 
+    // PostgreSQL 10+: pg_sequence has seqrelid for the privilege check and
+    // pg_sequence_last_value for the current value (NULL when never called).
     let rows = client
         .query(
-            "SELECT schemaname, sequencename, data_type::text, start_value, min_value, \
-                 max_value, increment_by, cycle, last_value \
-             FROM pg_catalog.pg_sequences \
-             WHERE schemaname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
-             ORDER BY schemaname, sequencename",
+            "SELECT n.nspname AS schema_name, c.relname AS sequence_name, \
+                    pg_catalog.format_type(s.seqtypid, NULL) AS data_type, \
+                    s.seqstart AS start_value, s.seqmin AS min_value, \
+                    s.seqmax AS max_value, s.seqincrement AS increment, \
+                    s.seqcycle AS cycle, \
+                    pg_catalog.pg_sequence_last_value(s.seqrelid) AS last_value, \
+                    pg_catalog.has_sequence_privilege(s.seqrelid, 'SELECT') AS readable \
+             FROM pg_catalog.pg_sequence s \
+             JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
+             ORDER BY n.nspname, c.relname",
             &[],
         )
         .await?;
 
     rows.into_iter()
         .map(|row| {
-            let last_value = row.try_get::<_, Option<i64>>(8)?;
+            let readable = req_bool(&row, 9)?;
+            let raw_last = row.try_get::<_, Option<i64>>(8)?;
+            let last_value = if readable { raw_last } else { None };
+            let is_called = readable && last_value.is_some();
             Ok(SequenceInSchema {
                 schema_name: req_string(&row, 0)?,
                 sequence: Sequence {
@@ -335,31 +360,46 @@ pub(crate) async fn list_sequences<T: GenericClient>(
                     increment: row.try_get::<_, Option<i64>>(6)?,
                     cycle: row.try_get::<_, Option<bool>>(7)?,
                     last_value,
-                    value_skipped: last_value.is_none(),
+                    is_called,
+                    unreadable: !readable,
                 },
             })
         })
         .collect()
 }
 
-/// Read one sequence's `last_value` inside a savepoint so an error on an
-/// uncalled sequence (`last_value is not yet defined`) never aborts the
-/// surrounding read-only transaction.
-async fn read_sequence_last_value<T: GenericClient>(
+/// The state of one sequence, read through the quoting helper.
+enum SeqState {
+    /// The sequence has been advanced and its last value is known.
+    Called(i64),
+    /// The sequence exists but has never been called.
+    NotCalled,
+    /// The state could not be read (privilege or an unexpected error).
+    Unreadable,
+}
+
+/// Read one sequence's `last_value` + `is_called` inside a savepoint so an
+/// error never aborts the surrounding read-only transaction.
+async fn read_sequence_state<T: GenericClient>(
     client: &mut T,
     qualified: &str,
-) -> Result<(Option<i64>, bool), InventoryError> {
-    let sql = format!("SELECT last_value FROM {qualified}");
+) -> Result<SeqState, InventoryError> {
+    let sql = format!("SELECT last_value, is_called FROM {qualified}");
     let sp = client.transaction().await?;
     match sp.query_opt(&sql, &[]).await {
         Ok(Some(row)) => {
-            let value = row.try_get::<_, Option<i64>>(0)?;
+            let value: i64 = row.try_get(0)?;
+            let called: bool = row.try_get(1)?;
             sp.commit().await?;
-            Ok((value, value.is_none()))
+            Ok(if called {
+                SeqState::Called(value)
+            } else {
+                SeqState::NotCalled
+            })
         }
         _ => {
             let _ = sp.rollback().await;
-            Ok((None, true))
+            Ok(SeqState::Unreadable)
         }
     }
 }
