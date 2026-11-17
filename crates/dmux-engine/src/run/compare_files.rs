@@ -30,14 +30,15 @@ use crate::fingerprint_file::{CapturedTable, FingerprintFile};
 use crate::inventory::DatabaseInventory;
 use crate::mapping::Mapping;
 use crate::plan::{build_table_spec, unknown_keys, LiveColumn, LiveTable, SpecInputs};
-use crate::results::{fresh_run_id, CheckLevel, Verdict};
+use crate::results::{fresh_run_id, CheckLevel, ColumnNote, ConnectionInfo, Connections, Verdict};
 
 use super::structure;
 use super::verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 use super::{
-    apply_replica, checkpoint, counters, definition_hash, epoch, epoch_changed, foreign_tables_set,
-    inventory, live_table, map_table, note_paused, register, replica, replica_outcome, scan_counts,
-    scan_fingerprint, settle, track_counts_on, wal, Input, RunConfig, RunError, RunOutcome,
+    apply_replica, checkpoint, connection_info, connection_warnings, counters, definition_hash,
+    epoch, epoch_changed, foreign_tables_set, inventory, live_table, map_table, note_paused,
+    register, replica, replica_outcome, scan_counts, scan_fingerprint, settle, track_counts_on,
+    wal, Input, RunConfig, RunError, RunOutcome,
 };
 
 /// The run warning when a side has no inventory to compare.
@@ -99,6 +100,10 @@ pub fn compare_two_files_with(
         definition_hash(config),
     );
     b.set_sql_ascii(old.server.sql_ascii || new.server.sql_ascii);
+    // Both inputs were capture files: record their SHA-256s for page 1 of the
+    // report (audit M1).  A file built in memory has no hash, so record None.
+    b.results.capture_sha256_old = (!old.sha256.is_empty()).then(|| old.sha256.clone());
+    b.results.capture_sha256_new = (!new.sha256.is_empty()).then(|| new.sha256.clone());
     if old.server.sql_ascii {
         b.results
             .warnings
@@ -185,11 +190,35 @@ fn captured_fp(t: &CapturedTable, mapping_hash: &str) -> Fingerprint {
     }
 }
 
+/// Per-column notes reconstructed from a captured table's own plan (its ticked
+/// options and type warnings), in stable (column, kind) order.  The two
+/// captures share one plan (enforced by [`plan_difference`]), so one side
+/// yields the notes (H2 / decision 23).
+fn captured_column_notes(cap: &CapturedTable) -> Vec<ColumnNote> {
+    let mut notes = Vec::new();
+    for (i, cname) in cap.columns.iter().enumerate() {
+        let m = ColumnMapping {
+            old_name: cname.clone(),
+            new_name: cname.clone(),
+            old_type: cap.column_types[i].clone(),
+            new_type: cap.column_types[i].clone(),
+            options: cap.options[i].clone(),
+            control_total: cap.control_columns.contains(cname),
+        };
+        if let Ok(cp) = plan_column(&m) {
+            notes.extend(crate::results::column_notes(cname, &cp.flags));
+        }
+    }
+    notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    notes
+}
+
 fn captured_pair(name: &str, o: &CapturedTable, n: &CapturedTable, mapping_hash: &str) -> Evidence {
     let mut e = Evidence::new(name, o.level, Outcome::Fault(String::new()));
     e.columns_covered = Some(o.columns.clone());
     e.notes.push(NO_LIVE.into());
     e.spot = Spot::NotRun("no live database".into());
+    e.column_notes = captured_column_notes(o);
     if o.columns != n.columns {
         let oc: BTreeSet<&String> = o.columns.iter().collect();
         let nc: BTreeSet<&String> = n.columns.iter().collect();
@@ -261,6 +290,28 @@ pub async fn compare_file_to_live(
             .warnings
             .push("the live database is SQL_ASCII (P19)".into());
     }
+    // The capture file's SHA-256 and the live side's connection-safety record
+    // reach page 1 of the report (audit M1 / M5).
+    if file_side == Side::Old && !file.sha256.is_empty() {
+        b.results.capture_sha256_old = Some(file.sha256.clone());
+    }
+    if file_side == Side::New && !file.sha256.is_empty() {
+        b.results.capture_sha256_new = Some(file.sha256.clone());
+    }
+    let live_conn = connection_info(
+        live_profile,
+        &info,
+        config.allow_superuser_reason.as_deref(),
+    );
+    let (old_conn, new_conn) = match file_side {
+        Side::Old => (ConnectionInfo::default(), live_conn),
+        Side::New => (live_conn, ConnectionInfo::default()),
+    };
+    connection_warnings(&mut b.results, &old_conn, &new_conn);
+    b.results.connections = Connections {
+        old: old_conn,
+        new: new_conn,
+    };
     b.results.wal_start_lsn = wal(&mut s, info.version_num).await;
     let epoch_start = epoch(&mut s).await;
 
@@ -633,9 +684,13 @@ async fn file_live_pair(
         .map(|(i, _)| i)
         .collect();
     let mut plans = Vec::with_capacity(cols.len());
-    for c in &cols {
+    let mut column_notes = Vec::with_capacity(cols.len());
+    for (c, cname) in cols.iter().zip(cap.columns.iter()) {
         match plan_column(c) {
-            Ok(p) => plans.push(p),
+            Ok(p) => {
+                column_notes.extend(crate::results::column_notes(cname, &p.flags));
+                plans.push(p);
+            }
             Err(err) => {
                 e.outcome =
                     Outcome::Fault(format!("column {} cannot be planned: {err}", c.old_name));
@@ -643,6 +698,8 @@ async fn file_live_pair(
             }
         }
     }
+    column_notes.sort_by(|a, b| a.column.cmp(&b.column).then_with(|| a.kind.cmp(&b.kind)));
+    e.column_notes = column_notes;
     let controls: Vec<String> = plans.iter().filter_map(|p| p.old_control.clone()).collect();
     let src = Source::Table {
         schema: live_schema.to_string(),

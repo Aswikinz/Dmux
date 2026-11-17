@@ -338,7 +338,8 @@ query sent.
   computed from the saved results file, so any later change to that file shows up. Re-run
   the saved definition to produce a second report with its own checksum and compare the two;
   if the data has not changed, the verdicts and coverage will match. The report says plainly
-  that this is tamper-evident, not tamper-proof.
+  that these hashes detect corruption and show tampering only when compared with the values
+  printed on the signed PDF.
 - *You need an older run*: open **Run history** below the steps, choose the run, and export
   again. History can be purged from the same place if the machine holds sensitive material.
 

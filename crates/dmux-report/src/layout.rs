@@ -12,7 +12,9 @@
 //! test plants sentinel strings into fixture fields, builds a layout, and scans
 //! the resulting PDF/XLSX text for those sentinels.
 
-use dmux_engine::results::{CheckLevel, RunResults, TableDetail, TableResult, Verdict};
+use dmux_engine::results::{
+    CheckLevel, ConnectionInfo, RunResults, TableDetail, TableResult, Verdict,
+};
 
 use crate::verify::HookEvidence;
 
@@ -69,6 +71,108 @@ pub fn verdict_word(v: Verdict) -> &'static str {
     }
 }
 
+/// The displayed overall verdict word.  A PASS is never bare when the results
+/// file could not vouch for options (decision 23): "(with options)" when at
+/// least one column option was applied, and "(options not recorded — older
+/// results file)" when the results schema predates option recording.
+pub fn verdict_display(word: &str, options_applied: bool, options_recorded: bool) -> String {
+    if word != "PASS" {
+        return word.to_string();
+    }
+    if !options_recorded {
+        return "PASS (options not recorded — older results file)".to_string();
+    }
+    if options_applied {
+        "PASS (with options)".to_string()
+    } else {
+        "PASS".to_string()
+    }
+}
+
+/// The "Options applied" body when options were never recorded: every report
+/// format and the log show this rather than assume none were applied.
+pub const OPTIONS_NOT_RECORDED: &str = "options not recorded (older results file)";
+
+/// Plain-language connection-safety lines for one side (audit M5, H1).  An empty
+/// `tls` means the side was not a live connection (a saved fingerprint file).
+fn connection_lines(side: &str, c: &ConnectionInfo) -> Vec<String> {
+    if c.tls.is_empty() {
+        return vec![format!("{side}: not a live connection")];
+    }
+    let tls = match c.tls.as_str() {
+        "pinned" => format!(
+            "TLS pinned (fingerprint {})",
+            c.tls_fingerprint.as_deref().unwrap_or("?")
+        ),
+        "plaintext" => format!(
+            "plaintext (reason: {})",
+            c.plaintext_reason
+                .as_deref()
+                .unwrap_or("no reason recorded")
+        ),
+        _ => "TLS verified".to_string(),
+    };
+    let mut lines = vec![format!(
+        "{side}: {tls}; PostgreSQL {}, encoding {}",
+        c.server_version, c.server_encoding
+    )];
+    if c.superuser {
+        let why = c
+            .superuser_reason
+            .as_deref()
+            .unwrap_or("no reason recorded");
+        lines.push(format!("{side}: superuser login (override reason: {why})"));
+    }
+    if c.can_write {
+        let reasons = if c.can_write_reasons.is_empty() {
+            "at least one table".to_string()
+        } else {
+            c.can_write_reasons.join("; ")
+        };
+        lines.push(format!("{side}: the login can write ({reasons})"));
+    }
+    if !c.rls_tables.is_empty() && !c.rolbypassrls {
+        lines.push(format!(
+            "{side}: {} tables use row-level security; Dmux refused to read them filtered",
+            c.rls_tables.len()
+        ));
+    }
+    if c.pooler_suspected {
+        lines.push(format!("{side}: a connection pooler is suspected"));
+    }
+    if !c.md5_available {
+        lines.push(format!("{side}: md5 is not available"));
+    }
+    lines
+}
+
+/// "table.column: option" lines for page 1, sorted (H2 / decision 23).
+fn option_lines(results: &RunResults) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (table, t) in &results.tables {
+        for n in &t.column_notes {
+            if n.kind == "option" {
+                lines.push(format!(
+                    "{}.{}: {}",
+                    sanitize(table),
+                    sanitize(&n.column),
+                    sanitize(&n.note)
+                ));
+            }
+        }
+    }
+    lines.sort();
+    lines
+}
+
+/// Connection-safety lines for both sides (audit M5), old then new.
+fn connection_lines_for(results: &RunResults) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.extend(connection_lines("old", &results.connections.old));
+    lines.extend(connection_lines("new", &results.connections.new));
+    lines
+}
+
 /// The check level in the plan's spelling.
 pub fn level_word(level: CheckLevel) -> &'static str {
     match level {
@@ -114,6 +218,9 @@ pub struct TableSummary {
     pub changed_columns: Vec<String>,
     pub plain_words: Vec<String>,
     pub control_totals: Vec<String>,
+    /// Per-column notes (ticked options and type-change flags), rendered as
+    /// "column: note" (H2 / decision 23).
+    pub column_notes: Vec<String>,
     /// Key material from the drill-down (changed-row keys, missing/extra keys),
     /// ONLY when `include_keys` is true.
     pub keyed_rows: Vec<String>,
@@ -198,6 +305,20 @@ pub struct Layout {
     pub structure_findings: Vec<StructureFindingLine>,
     pub suggestions: Vec<SuggestionLine>,
     pub definition_hash: String,
+    /// Whether the results file recorded per-column options (results schema
+    /// version >= 3).  When false, the reader says "options not recorded",
+    /// never a bare PASS or "no options".
+    pub options_recorded: bool,
+    /// Whether any column option was applied (H2): page 1 says
+    /// "PASS (with options)" when the overall verdict is PASS.
+    pub options_applied: bool,
+    /// "table.column: option" lines for page 1 (sorted).
+    pub options_applied_lines: Vec<String>,
+    /// Capture-file SHA-256s (present only for file inputs, audit M1).
+    pub capture_sha256_old: Option<String>,
+    pub capture_sha256_new: Option<String>,
+    /// Connection-safety lines for page 1 (audit M5).
+    pub connections: Vec<String>,
     /// Hook evidence (present only for an envelope).
     pub custom_checks: Vec<CustomCheck>,
     pub hook_scripts: Vec<HookScriptLine>,
@@ -352,6 +473,12 @@ pub fn build(
         hook_warnings: hooks
             .map(|h| h.warnings.iter().map(|w| sanitize(w)).collect())
             .unwrap_or_default(),
+        options_recorded: dmux_engine::results::options_recorded(results),
+        options_applied: results.options_applied,
+        options_applied_lines: option_lines(results),
+        capture_sha256_old: results.capture_sha256_old.as_deref().map(sanitize),
+        capture_sha256_new: results.capture_sha256_new.as_deref().map(sanitize),
+        connections: connection_lines_for(results),
     }
 }
 
@@ -422,6 +549,11 @@ fn summarise(tr: &TableResult, detail: Option<&TableDetail>, include_keys: bool)
                     .collect()
             })
             .unwrap_or_default(),
+        column_notes: tr
+            .column_notes
+            .iter()
+            .map(|n| format!("{}: {}", sanitize(&n.column), sanitize(&n.note)))
+            .collect(),
         keyed_rows,
     }
 }
@@ -448,11 +580,12 @@ could in principle craft rows that hash to the same code, and Dmux cannot \
 detect that. An independent database administrator reviews the method before \
 first real use.";
 
-/// The tamper-evident-not-proof sentence (PLAN.md 2.4).
+/// The hash-integrity sentence (audit M1 / decision 23): the hashes on page 1
+/// detect corruption; they show tampering only when compared with the values
+/// printed on the signed PDF.
 pub const TAMPER_EVIDENT_NOT_PROOF: &str = "\
-This report carries a run identifier, the tool version, the mapping hash and a \
-SHA-256 of the results file, so a later edit is detectable. That is \
-tamper-evident, not tamper-proof.";
+These hashes detect corruption. They show tampering only when compared with \
+the values printed on the signed PDF.";
 
 /// The plain sign-off block (name, role, date, signature lines), separated for
 /// easy testing.  The date is left blank for a person to complete at signing.
@@ -494,6 +627,7 @@ mod tests {
             extra_rows: None,
             changed_rows: None,
             reasons: vec![],
+            column_notes: vec![],
         }
     }
 
@@ -728,5 +862,109 @@ mod tests {
         assert_eq!(layout.structure_findings.len(), 1);
         assert_eq!(layout.structure_findings[0].message, "missing index");
         assert_eq!(layout.structure_findings[0].verdict, "FAIL");
+    }
+
+    #[test]
+    fn pass_with_options_and_connections_reach_the_layout() {
+        use dmux_engine::results::{ColumnNote, ConnectionInfo, Connections};
+        let mut r = fixture(Verdict::Pass);
+        r.options_applied = true;
+        r.tables.get_mut("demo_bank.accounts").unwrap().column_notes = vec![ColumnNote {
+            column: "balance".into(),
+            kind: "option".into(),
+            note: "round to 2 decimals".into(),
+        }];
+        r.connections = Connections {
+            old: ConnectionInfo {
+                tls: "plaintext".into(),
+                plaintext_reason: Some("test network".into()),
+                superuser: true,
+                superuser_reason: Some("migration needs it".into()),
+                can_write: true,
+                server_version: "17.0".into(),
+                server_encoding: "UTF8".into(),
+                ..ConnectionInfo::default()
+            },
+            new: ConnectionInfo::default(),
+        };
+        let layout = build(&r, None, &ReportOptions::default());
+        assert!(layout.options_applied);
+        assert!(layout.options_recorded);
+        assert_eq!(
+            verdict_display(
+                &layout.verdict_word,
+                layout.options_applied,
+                layout.options_recorded
+            ),
+            "PASS (with options)"
+        );
+        assert_eq!(
+            layout.options_applied_lines,
+            vec!["demo_bank.accounts.balance: round to 2 decimals"]
+        );
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("plaintext") && l.contains("test network")));
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("superuser") && l.contains("migration needs it")));
+        let notes = &layout
+            .tables
+            .iter()
+            .find(|t| t.table == "demo_bank.accounts")
+            .unwrap()
+            .column_notes;
+        assert_eq!(notes, &vec!["balance: round to 2 decimals".to_string()]);
+    }
+
+    #[test]
+    fn an_old_results_file_never_shows_a_bare_pass() {
+        // A v2 results file never recorded options, so a PASS must be qualified
+        // and the options line must say "not recorded", never "none" or a bare
+        // PASS (H2 / decision 23 / fix round).
+        let mut r = fixture(Verdict::Pass);
+        r.results_version = 2;
+        r.options_applied = false;
+        let layout = build(&r, None, &ReportOptions::default());
+        assert!(!layout.options_recorded);
+        assert_eq!(
+            verdict_display(
+                &layout.verdict_word,
+                layout.options_applied,
+                layout.options_recorded
+            ),
+            "PASS (options not recorded — older results file)"
+        );
+        assert!(layout.options_applied_lines.is_empty());
+    }
+
+    #[test]
+    fn rls_and_can_write_reasons_reach_the_connection_lines() {
+        use dmux_engine::results::Connections;
+        let mut r = fixture(Verdict::Fail);
+        r.connections = Connections {
+            old: ConnectionInfo {
+                tls: "verified".into(),
+                can_write: true,
+                can_write_reasons: vec!["has INSERT on at least one table".into()],
+                rolbypassrls: false,
+                rls_tables: vec!["s.accounts".into(), "s.audit_log".into()],
+                server_version: "17.0".into(),
+                server_encoding: "UTF8".into(),
+                ..ConnectionInfo::default()
+            },
+            new: ConnectionInfo::default(),
+        };
+        let layout = build(&r, None, &ReportOptions::default());
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("has INSERT on at least one table")));
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("2 tables use row-level security")));
     }
 }

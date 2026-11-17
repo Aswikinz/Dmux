@@ -31,7 +31,7 @@ use dmux_engine::mapping::Mapping;
 use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{run, Input, RunConfig};
 
-use crate::commands::gateway::{collect, drive, resolve, SuperuserOverride};
+use crate::commands::gateway::{collect, drive, resolve, validate_mapping, SuperuserOverride};
 use crate::error::{from_db_error, CommandError};
 use crate::run_manager::{DriveTicket, RunHandle, RunManager, RunPhase};
 use crate::state::AppState;
@@ -139,6 +139,16 @@ pub struct DrillDownRowDto {
     pub differing_columns: Option<Vec<String>>,
 }
 
+/// A per-column note (a ticked option or type-change flag), mirroring the
+/// contract's `ColumnNote` (H2 / decision 23).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ColumnNoteDto {
+    pub column: String,
+    pub kind: String,
+    pub note: String,
+}
+
 /// A failure card, mirroring the contract's `FailureCard`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +174,7 @@ pub struct TableResultDto {
     pub level: CheckLevel,
     pub checked: bool,
     pub drill_down: Option<Vec<DrillDownRowDto>>,
+    pub column_notes: Vec<ColumnNoteDto>,
 }
 
 /// Ignored item (path + required reason).
@@ -196,6 +207,13 @@ pub struct ResultsDto {
     pub ignored: Vec<IgnoredDto>,
     pub failures: Vec<FailureCardDto>,
     pub table_results: Vec<TableResultDto>,
+    /// Whether any column option was applied (H2): drives "PASS (with options)".
+    pub options_applied: bool,
+    /// Whether the results file recorded options (schema >= 3); when false the
+    /// UI says "options not recorded", never a bare PASS.
+    pub options_recorded: bool,
+    /// Run-level warnings (can-write, superuser, row-level security, ...).
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +449,18 @@ pub(crate) fn start_run_with(
         .allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
+    // The recorded reason behind a valid superuser override, threaded through
+    // the run so the engine records it in the results `connections` block
+    // (audit M5).  The plaintext reason is already carried by the resolved
+    // profile's TLS mode (TlsMode::Disable(reason)).
+    let allow_reason = input
+        .allow_superuser
+        .as_ref()
+        .and_then(SuperuserOverride::reason)
+        .map(str::to_string);
+    // The webview-supplied mapping is untrusted input (audit L7): validate it
+    // exactly like an imported mapping file before it drives the run.
+    let mapping = validate_mapping(&input.mapping)?;
     let old_profile = resolve(&input.old, state)?;
     let new_profile = resolve(&input.new, state)?;
     let old_parallelism = input.old_parallelism.unwrap_or(2);
@@ -446,13 +476,14 @@ pub(crate) fn start_run_with(
     let resume_store = crate::state::resume_store_path(state, &run_id)?;
 
     let config = RunConfig {
-        mapping: input.mapping.clone(),
+        mapping,
         default_level: input.default_level,
         levels: input.levels.clone(),
         control_total_columns: input.control_total_columns.into_iter().collect(),
         old_parallelism,
         new_parallelism,
         allow_superuser: allow,
+        allow_superuser_reason: allow_reason,
         export_keys,
         resume_store: Some(resume_store.clone()),
         ..RunConfig::new(Input::Live(old_profile), Input::Live(new_profile))
@@ -749,6 +780,15 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
             level: t.level,
             checked,
             drill_down: drill_down_for(path, results),
+            column_notes: t
+                .column_notes
+                .iter()
+                .map(|n| ColumnNoteDto {
+                    column: n.column.clone(),
+                    kind: n.kind.clone(),
+                    note: n.note.clone(),
+                })
+                .collect(),
         });
     }
 
@@ -797,6 +837,9 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
         ignored,
         failures,
         table_results,
+        options_applied: results.options_applied,
+        options_recorded: dmux_engine::results::options_recorded(results),
+        warnings: results.warnings.clone(),
     }
 }
 

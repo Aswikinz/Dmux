@@ -144,7 +144,8 @@ part of any verification tool.
   lower level. The coverage line and the list of ignored items are part of the verdict.
 - It does not make the report impossible to forge. The report carries the run
   identifier, the tool version, a code for the mapping used, and a SHA-256 code of the
-  results file, so a later edit is detectable. That is tamper-evident, not tamper-proof.
+  results file, so a later edit is detectable. These hashes detect corruption. They
+  show tampering only when compared with the values printed on the signed PDF.
 
 ## The one thing md5 cannot do
 

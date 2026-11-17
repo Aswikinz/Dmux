@@ -312,6 +312,7 @@ mod tests {
                     extra_rows: Some(0),
                     changed_rows: Some(0),
                     reasons: vec![],
+                    column_notes: vec![],
                 },
             )]),
             ignored_items: vec![],

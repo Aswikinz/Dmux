@@ -951,7 +951,9 @@ mod tests {
             .or_else(|| url.strip_prefix("postgresql://"))
             .expect("postgres:// URL");
         let (auth, hostportdb) = rest.split_once('@').unwrap_or(("", rest));
-        let (user, pass) = auth.split_once(':').unwrap_or((auth, ""));
+        let (user, pass) = auth
+            .split_once(':')
+            .expect("the live TLS test URL must carry user:password");
         let (hostport, db) = hostportdb
             .split_once('/')
             .unwrap_or((hostportdb, "postgres"));
