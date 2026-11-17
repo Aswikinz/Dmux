@@ -84,6 +84,9 @@ script can act on the result.
 > **TODO (packaging):** link the release page, the SHA-256 checksums and the software bill
 > of materials here once the release workflow publishes them.
 
+Before installing, check that the download is really this project's: see
+[Verifying a Dmux download](verify-download.md).
+
 ### First start
 
 1. Start Dmux. On Linux, run the AppImage after marking it executable, or start it from
