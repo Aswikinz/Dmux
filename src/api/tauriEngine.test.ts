@@ -898,3 +898,128 @@ function inventory(): Inventory {
     newCollation: 'C',
   };
 }
+
+describe('profiles and history are wired to the backend', () => {
+  it('listProfiles and deleteProfile call the backend and keep the CA file', async () => {
+    invoke.mockResolvedValueOnce([
+      {
+        id: 'p1',
+        label: 'Prod',
+        host: 'h',
+        port: 5432,
+        database: 'd',
+        user: 'u',
+        encryption: 'verify',
+        tls_fingerprint: null,
+        plaintext_reason: null,
+        ca_file: '/etc/ca.pem',
+      },
+    ]);
+    const engine = createTauriEngine();
+    const list = await engine.listProfiles();
+    expect(invoke).toHaveBeenCalledWith('list_profiles');
+    expect(list).toEqual([
+      expect.objectContaining({ id: 'p1', label: 'Prod', caFile: '/etc/ca.pem' }),
+    ]);
+    invoke.mockResolvedValueOnce(true);
+    expect(await engine.deleteProfile('p1')).toBe(true);
+    expect(invoke).toHaveBeenCalledWith('delete_profile', { id: 'p1' });
+  });
+
+  it('listHistory maps rows, turning seconds into ISO dates', async () => {
+    invoke.mockResolvedValueOnce([
+      {
+        id: 'run-1',
+        started_at: 1_700_000_000,
+        ended_at: 1_700_000_600,
+        verdict: 'FAIL',
+        options_applied: false,
+        options_recorded: true,
+        coverage_line: '1 of 1 tables fully checked',
+        old_label: 'Old',
+        new_label: 'New',
+        mapping_hash: 'mh',
+        definition_hash: 'dh',
+        results_sha256: 'sha',
+      },
+      { id: 'run-2', started_at: 0, ended_at: 0, verdict: 'something odd', options_applied: false,
+        options_recorded: false, coverage_line: '', old_label: '', new_label: '',
+        mapping_hash: '', definition_hash: '', results_sha256: '' },
+    ]);
+    const engine = createTauriEngine();
+    const rows = await engine.listHistory();
+    expect(invoke).toHaveBeenCalledWith('list_history');
+    expect(rows[0]).toMatchObject({
+      id: 'run-1',
+      startedAt: '2023-11-14T22:13:20.000Z',
+      verdict: 'FAIL',
+      coverage: '1 of 1 tables fully checked',
+      resultsSha256: 'sha',
+    });
+    // An unknown verdict is never PASS.
+    expect(rows[1].verdict).toBe('TOOL_FAULT');
+  });
+
+  const rawResults = {
+    run_id: 'run-opened',
+    verdict: 'FAIL',
+    coverage: {
+      total_tables: 1,
+      full_values_tables: 1,
+      counts_tables: 0,
+      structure_tables: 0,
+      ignored_tables: 0,
+    },
+    ignored: [],
+    failures: [],
+    table_results: [],
+    options_applied: false,
+    options_recorded: true,
+    warnings: [],
+  };
+
+  it('openHistoryEntry sends only the id and maps the verified results', async () => {
+    invoke.mockResolvedValueOnce(rawResults);
+    const results = await createTauriEngine().openHistoryEntry('run-1');
+    expect(invoke).toHaveBeenCalledWith('open_history_entry', { id: 'run-1' });
+    expect(results.runId).toBe('run-opened');
+    expect(results.verdict).toBe('FAIL');
+  });
+
+  it('openResultsFile maps opened, cancelled and refused outcomes, with no path sent', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce({ status: 'opened', results: rawResults });
+    const opened = await engine.openResultsFile();
+    expect(invoke).toHaveBeenCalledWith('open_results_file');
+    expect(opened.ok).toBe(true);
+    expect(opened.results?.runId).toBe('run-opened');
+
+    invoke.mockResolvedValueOnce({ status: 'cancelled' });
+    expect(await engine.openResultsFile()).toEqual({ ok: false, cancelled: true });
+
+    invoke.mockRejectedValueOnce({ kind: 'report', message: 'changed since Dmux wrote it' });
+    const refused = await engine.openResultsFile();
+    expect(refused.ok).toBe(false);
+    expect(refused.results).toBeUndefined();
+    expect(refused.error).toContain('changed since Dmux wrote it');
+  });
+
+  it('history log, save log and purge call the backend', async () => {
+    const engine = createTauriEngine();
+    invoke.mockResolvedValueOnce('Dmux run log\n');
+    expect(await engine.getHistoryLog('run-1')).toBe('Dmux run log\n');
+    expect(invoke).toHaveBeenCalledWith('get_history_log', { id: 'run-1' });
+
+    invoke.mockResolvedValueOnce({ status: 'saved', path: '/home/u/log.txt' });
+    expect(await engine.saveHistoryLog('run-1')).toEqual({ ok: true, filePath: '/home/u/log.txt' });
+    expect(invoke).toHaveBeenCalledWith('save_history_log', { id: 'run-1' });
+    invoke.mockResolvedValueOnce({ status: 'cancelled' });
+    expect(await engine.saveHistoryLog('run-1')).toEqual({ ok: false, cancelled: true });
+    invoke.mockRejectedValueOnce({ kind: 'report', message: 'could not be written' });
+    expect((await engine.saveHistoryLog('run-1')).error).toContain('could not be written');
+
+    invoke.mockResolvedValueOnce(3);
+    expect(await engine.purgeHistory()).toBe(3);
+    expect(invoke).toHaveBeenCalledWith('purge_history');
+  });
+});

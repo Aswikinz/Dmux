@@ -24,6 +24,12 @@ fn main() {
             "cancel_run",
             "get_results",
             "export_report",
+            "list_history",
+            "open_history_entry",
+            "open_results_file",
+            "get_history_log",
+            "save_history_log",
+            "purge_history",
         ]),
     ))
     .expect("failed to run tauri build script");

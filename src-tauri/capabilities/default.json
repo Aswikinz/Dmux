@@ -22,6 +22,12 @@
     "allow-set-run-paused",
     "allow-cancel-run",
     "allow-get-results",
-    "allow-export-report"
+    "allow-export-report",
+    "allow-list-history",
+    "allow-open-history-entry",
+    "allow-open-results-file",
+    "allow-get-history-log",
+    "allow-save-history-log",
+    "allow-purge-history"
   ]
 }

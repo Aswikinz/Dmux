@@ -3,6 +3,8 @@ import type {
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
+  HistoryEntry,
+  OpenResultsResult,
   CoverageSummary,
   DrillDownRow,
   FailureCard,
@@ -475,9 +477,46 @@ export const fixtureNames: FixtureName[] = [
   'cancelled',
 ];
 
+/** Two stable history entries so the History screen has something to show. */
+const seedHistory = (): HistoryEntry[] => [
+  {
+    id: 'run-fail-hist-0002',
+    startedAt: '2026-11-16T09:12:00Z',
+    endedAt: '2026-11-16T09:48:30Z',
+    verdict: 'FAIL',
+    optionsApplied: false,
+    optionsRecorded: true,
+    coverage: fixtures.fail.coverage
+      ? `${fixtures.fail.coverage.fullValuesTables} of ${fixtures.fail.coverage.totalTables} tables fully checked, ${fixtures.fail.coverage.countsTables} counts only, ${fixtures.fail.coverage.structureTables} structure only, ${fixtures.fail.coverage.ignoredTables} ignored`
+      : '',
+    oldLabel: 'Old database',
+    newLabel: 'New database',
+    mappingHash: 'mock-map-2',
+    definitionHash: 'mock-def-2',
+    resultsSha256: 'mock-sha-2',
+  },
+  {
+    id: 'run-pass-hist-0001',
+    startedAt: '2026-11-15T14:00:00Z',
+    endedAt: '2026-11-15T14:21:10Z',
+    verdict: 'PASS',
+    optionsApplied: false,
+    optionsRecorded: true,
+    coverage: `${fixtures.pass.coverage.fullValuesTables} of ${fixtures.pass.coverage.totalTables} tables fully checked, ${fixtures.pass.coverage.countsTables} counts only, ${fixtures.pass.coverage.structureTables} structure only, ${fixtures.pass.coverage.ignoredTables} ignored`,
+    oldLabel: 'Old database',
+    newLabel: 'New database',
+    mappingHash: 'mock-map-1',
+    definitionHash: 'mock-def-1',
+    resultsSha256: 'mock-sha-1',
+  },
+];
+
 export interface MockEngineOptions {
   /** Force a fixture for results; otherwise the engine uses the runId suffix. */
   forcedFixture?: FixtureName;
+  /** What "Open a results file" does in the mock: open a verified file
+   *  (default), report a dismissed dialog, or refuse a changed file. */
+  openFile?: 'opened' | 'cancelled' | 'tampered';
 }
 
 /**
@@ -493,6 +532,9 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
   // the backend's "password lives in the keychain, not in the profile" shape so
   // `saveProfile` / `profileHasPassword` behave like the real engine.
   const savedPasswords = new Map<string, string>();
+  const savedProfiles = new Map<string, ConnectionProfile>();
+  let history = seedHistory();
+  let openedCount = 0;
 
   return {
     setSuperuserOverride(override): void {
@@ -560,12 +602,22 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       if (password) {
         savedPasswords.set(profile.id, password);
       }
+      savedProfiles.set(profile.id, { ...profile });
       // The mock always has a working keychain, so there is no warning.
       return { profile };
     },
 
     async profileHasPassword(id: string): Promise<boolean> {
       return savedPasswords.has(id);
+    },
+
+    async listProfiles(): Promise<ConnectionProfile[]> {
+      return [...savedProfiles.values()].sort((a, b) => a.label.localeCompare(b.label));
+    },
+
+    async deleteProfile(id: string): Promise<boolean> {
+      savedPasswords.delete(id);
+      return savedProfiles.delete(id);
     },
 
     async compareStructure(
@@ -636,6 +688,63 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       // so the "saved to …" message stays meaningful.
       const ext = request.format === 'pdf' ? 'pdf' : 'xlsx';
       return { ok: true, filePath: `chosen-location/dmux-${request.runId}.${ext}` };
+    },
+
+    async listHistory(): Promise<HistoryEntry[]> {
+      return history.map((h) => ({ ...h }));
+    },
+
+    async openHistoryEntry(id: string): Promise<Results> {
+      const entry = history.find((h) => h.id === id);
+      if (!entry) {
+        throw new Error('That run is not in the history.');
+      }
+      openedCount += 1;
+      const fixture = extractFixture(entry.id);
+      return { ...fixtures[fixture], runId: `run-${fixture}-opened-${openedCount}` };
+    },
+
+    async openResultsFile(): Promise<OpenResultsResult> {
+      if (options.openFile === 'cancelled') {
+        return { ok: false, cancelled: true };
+      }
+      if (options.openFile === 'tampered') {
+        return {
+          ok: false,
+          error:
+            'This results file has been changed since Dmux wrote it, so it cannot be trusted and is not shown.',
+        };
+      }
+      openedCount += 1;
+      return { ok: true, results: { ...fixtures.fail, runId: `run-fail-opened-${openedCount}` } };
+    },
+
+    async getHistoryLog(id: string): Promise<string> {
+      const entry = history.find((h) => h.id === id);
+      if (!entry) {
+        throw new Error('That run is not in the history.');
+      }
+      return [
+        'Dmux run log',
+        'tool_version: 0.0.1-mock',
+        `run_id: ${entry.id}`,
+        `mapping_hash: ${entry.mappingHash}`,
+        `definition_hash: ${entry.definitionHash}`,
+        `verdict: ${entry.verdict}`,
+        `coverage: ${entry.coverage}`,
+        `results_sha256: ${entry.resultsSha256}`,
+        '',
+      ].join('\n');
+    },
+
+    async saveHistoryLog(id: string): Promise<ReportResult> {
+      return { ok: true, filePath: `chosen-location/dmux-${id}-log.txt` };
+    },
+
+    async purgeHistory(): Promise<number> {
+      const removed = history.length;
+      history = [];
+      return removed;
     },
 
     async getVersion(): Promise<string> {

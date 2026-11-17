@@ -3,6 +3,7 @@
 
 mod commands;
 mod error;
+mod history;
 mod run_manager;
 mod secrets;
 mod state;
@@ -48,6 +49,12 @@ fn main() {
             commands::data::cancel_run,
             commands::data::get_results,
             commands::report::export_report,
+            commands::history::list_history,
+            commands::history::open_history_entry,
+            commands::history::open_results_file,
+            commands::history::get_history_log,
+            commands::history::save_history_log,
+            commands::history::purge_history,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());

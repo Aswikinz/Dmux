@@ -66,6 +66,24 @@ pub enum ExportReportResult {
     Cancelled,
 }
 
+/// The verified results of a run id: a live run's own results (re-verified), or
+/// results the app verified when opening a history entry or a results file
+/// (registered under a fresh id).  Never anything the webview sent.
+pub(crate) fn verification_for(
+    run_id: &str,
+    state: &AppState,
+) -> Result<dmux_report::Verification, CommandError> {
+    if state.runs.phase(run_id).is_none() {
+        if let Some(opened) = state.opened_results(run_id)? {
+            return Ok(opened.to_verification());
+        }
+    }
+    let results = state.runs.results(run_id)?;
+    dmux_report::verify::verify_results(&results).map_err(|e| CommandError::Report {
+        message: format!("the run's results cannot be reported: {e}"),
+    })
+}
+
 /// The verified layout and digest for a finished run, from app state only.
 /// A run that is unknown, still running, stopped or failed is refused with
 /// the run manager's typed error.
@@ -74,11 +92,7 @@ pub(crate) fn verified_layout(
     include_keys: bool,
     state: &AppState,
 ) -> Result<(Layout, String), CommandError> {
-    let results = state.runs.results(run_id)?;
-    let verification =
-        dmux_report::verify::verify_results(&results).map_err(|e| CommandError::Report {
-            message: format!("the run's results cannot be reported: {e}"),
-        })?;
+    let verification = verification_for(run_id, state)?;
     let layout = dmux_report::build_layout(&verification, &ReportOptions { include_keys });
     Ok((layout, verification.sha256))
 }

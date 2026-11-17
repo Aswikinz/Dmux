@@ -154,7 +154,8 @@ dmux report --results results.json --pdf report.pdf --xlsx report.xlsx
 ```
 
 `dmux capture` and `dmux compare` save a database's fingerprint to a file and compare it
-later, for upgrades where both databases are never online together. See the
+later, for upgrades where both databases are never online together. The desktop app can open
+the results file from its History screen and checks it the same way `dmux report` does. See the
 [user guide](docs/guide/user-guide.md) for every option.
 
 ## Build from source

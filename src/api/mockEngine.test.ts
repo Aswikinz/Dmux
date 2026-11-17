@@ -180,3 +180,48 @@ describe('fixtures', () => {
     }
   });
 });
+
+describe('mock profiles and history', () => {
+  it('lists saved profiles and forgets a deleted one with its password', async () => {
+    const engine = createMockEngine();
+    const profile = {
+      id: 'p1',
+      label: 'B',
+      host: 'h',
+      port: 5432,
+      database: 'd',
+      user: 'u',
+      encryption: 'verify' as const,
+    };
+    await engine.saveProfile(profile, 'x');
+    await engine.saveProfile({ ...profile, id: 'p0', label: 'A' });
+    expect((await engine.listProfiles()).map((p) => p.id)).toEqual(['p0', 'p1']);
+    expect(await engine.deleteProfile('p1')).toBe(true);
+    expect(await engine.deleteProfile('p1')).toBe(false);
+    expect(await engine.profileHasPassword('p1')).toBe(false);
+  });
+
+  it('keeps a history that can be opened, logged and purged', async () => {
+    const engine = createMockEngine();
+    const rows = await engine.listHistory();
+    expect(rows.length).toBe(2);
+    const opened = await engine.openHistoryEntry(rows[0].id);
+    expect(opened.verdict).toBe(rows[0].verdict);
+    await expect(engine.openHistoryEntry('nope')).rejects.toThrow();
+    expect(await engine.getHistoryLog(rows[0].id)).toContain('Dmux run log');
+    expect((await engine.saveHistoryLog(rows[0].id)).ok).toBe(true);
+    expect(await engine.purgeHistory()).toBe(2);
+    expect(await engine.listHistory()).toEqual([]);
+  });
+
+  it('opens a results file, or reports a dismissed or refused one', async () => {
+    expect((await createMockEngine().openResultsFile()).results?.verdict).toBe('FAIL');
+    expect(await createMockEngine({ openFile: 'cancelled' }).openResultsFile()).toEqual({
+      ok: false,
+      cancelled: true,
+    });
+    const refused = await createMockEngine({ openFile: 'tampered' }).openResultsFile();
+    expect(refused.ok).toBe(false);
+    expect(refused.results).toBeUndefined();
+  });
+});

@@ -273,3 +273,35 @@ export interface RunDefinition {
   mapping: Mapping;
   plan: CheckPlan;
 }
+
+/** One finished run in the local history.  Metadata only: the verified results
+ *  are loaded on demand with `openHistoryEntry`. */
+export interface HistoryEntry {
+  id: string;
+  /** When the run started and finished, as ISO 8601 text (UTC). */
+  startedAt: string;
+  endedAt: string;
+  verdict: Verdict;
+  /** Whether column options were applied ("PASS (with options)"). */
+  optionsApplied: boolean;
+  /** Whether the run recorded its options. */
+  optionsRecorded: boolean;
+  /** The coverage line, e.g. "40 of 40 tables fully checked, ...". */
+  coverage: string;
+  oldLabel: string;
+  newLabel: string;
+  mappingHash: string;
+  definitionHash: string;
+  resultsSha256: string;
+}
+
+/** The outcome of "Open a results file": verified results, a dismissed dialog,
+ *  or a plain refusal (for example a file that was changed after Dmux wrote it). */
+export interface OpenResultsResult {
+  ok: boolean;
+  /** Present only when the file passed verification. */
+  results?: Results;
+  /** The user dismissed the open dialog; nothing was read. */
+  cancelled?: boolean;
+  error?: string;
+}

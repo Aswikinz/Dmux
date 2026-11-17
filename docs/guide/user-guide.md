@@ -80,7 +80,7 @@ server when the laptop cannot reach the database. It runs `dmux capture`, `dmux 
 and `dmux run <definition file>`, and writes a results file. Turn that file into the PDF
 and Excel reports with `dmux report --results results.json --pdf report.pdf --xlsx
 report.xlsx`; it checks the file's SHA-256 first and refuses a file that was edited.
-(Opening a results file in the desktop app is planned but not in this version.) Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
+You can also open that results file in the desktop app (see "History" below), which checks it the same way and shows the verdict and findings. Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
 script can act on the result.
 
 A run definition file names the databases and the checks; it never holds a database
@@ -141,6 +141,15 @@ anything else happens.
    Dmux then trusts certificates from that authority as well as the public ones, and still
    checks the server's host name.
 4. Press **Test connection** on each side, then **Continue**.
+
+**Saved connections.** A connection that tests successfully is saved automatically, so you
+do not have to enter it again. The card under it says **Saved**, when it was last tested,
+and where its password is: in your system keychain, or only in memory until you close the
+app. Each side has a list, **Saved connections**, to fill the form from one you saved
+before. The card also has **Retry connection** (test again without retyping the password),
+**Edit** (go to the details) and **Delete connection** (asks first, and also deletes the
+saved password). If you change the details of a saved connection, the card says so; type
+the password again to test the new details.
 
 **What you see.** For each server: its version, its text encoding, whether the connection
 is encrypted, whether the login can write or is a superuser, and whether a connection
@@ -378,8 +387,21 @@ options ticked and every query sent.
 
 ## Below the steps: history, scripts and settings
 
-- **Run history.** Every run, with its verdict, coverage and date. Open one to review or
-  re-export it, or to repeat it from its saved definition.
+- **History.** Press **History** in the sidebar, below the steps. Every finished check is
+  listed with its date, verdict, coverage and the two databases. **Open results** shows that
+  check on the Results screen again, and from there the Report screen can export it as a
+  PDF or Excel file. Before showing a stored check, Dmux verifies its file; if the file was
+  changed since Dmux wrote it, Dmux says so and shows nothing. **Run log** shows what the
+  check recorded as plain text, and **Save run log** saves it where you choose.
+- **Open a results file.** The **Open a results file** button on the History screen opens a
+  results file, for example one written by the command-line version on a jump server. Dmux
+  checks it exactly as `dmux report` does (its SHA-256, and that a PASS does not hide a
+  failing table). A file that fails the check is refused with a plain message and nothing
+  is shown. Files larger than 64 MiB are refused.
+- **Delete local history.** The **Delete all history** button, after a confirmation, deletes
+  every stored results file and the history list on this computer. Saved connections are
+  kept. Reports and files you saved elsewhere are not touched. Stored results files are
+  readable only by you, and hold counts, names and hashes, never row values.
 - **Scripts.** Optional custom checks, written in Python by the bank's own team. A custom check
   runs with your full permissions. Only run scripts you trust. Dmux strips the
   environment and never hands a script the database passwords or connections, but it does
