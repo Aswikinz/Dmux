@@ -22,6 +22,10 @@ coverage/
 e2e/logs/
 e2e/artifacts/
 
+# Playwright UI test artifacts
+test-results/
+playwright-report/
+
 # Local noise
 *.log
 .DS_Store
