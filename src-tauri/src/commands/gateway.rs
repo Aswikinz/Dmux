@@ -27,7 +27,7 @@ use crate::types::{build_profile, parse_tls_mode, ConnectInput, ProfileInput};
 /// keychain belongs to the profile it was saved for, so it must only ever be
 /// sent to that profile's persisted host/port/database/user/encryption — never
 /// to whatever the current UI request happens to supply.
-enum ProfileSource {
+pub(crate) enum ProfileSource {
     /// The user typed the password this run: the UI-supplied fields are trusted.
     Ui(ProfileInput),
     /// The password comes from the keychain: trust ONLY the stored fields.
@@ -35,7 +35,10 @@ enum ProfileSource {
 }
 
 /// Decide the trusted source of connection fields.
-fn profile_source(input: &ConnectInput, state: &AppState) -> Result<ProfileSource, CommandError> {
+pub(crate) fn profile_source(
+    input: &ConnectInput,
+    state: &AppState,
+) -> Result<ProfileSource, CommandError> {
     match &input.password {
         Some(_) => Ok(ProfileSource::Ui(input.profile.clone())),
         None => {
@@ -71,7 +74,7 @@ fn build_profile_from_stored(
 }
 
 /// Resolve a [`ConnectInput`] into an engine profile plus its password.
-fn resolve(
+pub(crate) fn resolve(
     input: &ConnectInput,
     state: &AppState,
 ) -> Result<dmux_engine::db::ConnProfile, CommandError> {
@@ -165,7 +168,7 @@ impl From<(dmux_engine::db::ServerInfo, TlsStateDto)> for ProbeResult {
 /// cannot be awaited directly inside an `async` Tauri command (which requires
 /// `Send`).  Run it on a dedicated blocking OS thread instead, so the UI thread
 /// and the async runtime stay free.
-async fn drive<T, F, Fut>(f: F) -> Result<T, CommandError>
+pub(crate) async fn drive<T, F, Fut>(f: F) -> Result<T, CommandError>
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = Result<T, CommandError>> + 'static,
@@ -187,7 +190,7 @@ pub struct SuperuserOverride {
 
 impl SuperuserOverride {
     /// Whether the override is a valid, recorded opt-in.
-    fn allows(&self) -> bool {
+    pub(crate) fn allows(&self) -> bool {
         self.allow && !self.reason.trim().is_empty()
     }
 }
@@ -213,7 +216,7 @@ pub async fn probe_connection(
 
 /// Collect one database's structural inventory (engine-native, no network glue
 /// beyond the read-only session).
-async fn collect(
+pub(crate) async fn collect(
     input: &ConnectInput,
     allow: bool,
     state: &AppState,

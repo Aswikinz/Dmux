@@ -959,6 +959,7 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         export_keys: def.export_keys,
         resume_store: None,
         stats_settle,
+        control: None,
     })
 }
 

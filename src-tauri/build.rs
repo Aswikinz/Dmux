@@ -18,6 +18,12 @@ fn main() {
             "export_mapping",
             "import_mapping",
             "get_version",
+            "build_check_plan",
+            "start_run",
+            "poll_run",
+            "set_run_paused",
+            "cancel_run",
+            "get_results",
         ]),
     ))
     .expect("failed to run tauri build script");

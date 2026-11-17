@@ -88,26 +88,25 @@ pub struct RunConfig {
     /// during the run have been flushed into the server statistics (see
     /// `crate::consistency`).  Default 2 s; definition key `stats_settle_ms`.
     pub stats_settle: std::time::Duration,
+    /// Pause/cancel switch (see [`RunControl`]); `None` runs to completion.
+    pub control: Option<std::sync::Arc<RunControl>>,
 }
 
 /// The default [`RunConfig::stats_settle`].
 pub const DEFAULT_STATS_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-impl Default for RunConfig {
-    fn default() -> Self {
-        let local = |port| {
-            ConnProfile::new(
-                "127.0.0.1",
-                port,
-                "bank",
-                "dmux_dev",
-                "",
-                crate::db::TlsMode::Disable("default".to_string()),
-            )
-        };
+impl RunConfig {
+    /// A configuration comparing `old` with `new`: the identity mapping, full
+    /// values for every table, no control totals or options, parallel-scan
+    /// maxima 2 (old) and 4 (new), superusers refused, no exported keys, no
+    /// resume store, the default stats settle and no run control.
+    ///
+    /// There is deliberately no `Default`: a run always names its own
+    /// connections, so no built-in host, login or TLS choice can ship.
+    pub fn new(old: Input, new: Input) -> Self {
         Self {
-            old: Input::Live(local(5433)),
-            new: Input::Live(local(5434)),
+            old,
+            new,
             mapping: Mapping::new(),
             default_level: CheckLevel::FullValues,
             levels: BTreeMap::new(),
@@ -119,7 +118,113 @@ impl Default for RunConfig {
             export_keys: false,
             resume_store: None,
             stats_settle: DEFAULT_STATS_SETTLE,
+            control: None,
         }
+    }
+}
+
+/// The stop switch for a running comparison (PLAN.md 4.6: pause and cancel
+/// really stop).
+///
+/// The caller keeps an `Arc` and hands a clone to [`RunConfig::control`].
+/// The run registers the cancel token of every session it opens and checks the
+/// stop flag before each table, before each scan and between the drill-down
+/// and spot-check queries.  [`RunControl::stop`] sets the flag and returns the
+/// registered tokens so the caller can cancel the statements in flight on the
+/// server; the run then returns [`RunError::Cancelled`], never results.
+/// Tables finished before the stop stay in the resume store.
+#[derive(Default)]
+pub struct RunControl {
+    stopped: std::sync::atomic::AtomicBool,
+    tokens: std::sync::Mutex<Vec<crate::db::CancelToken>>,
+}
+
+impl std::fmt::Debug for RunControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunControl")
+            .field("stopped", &self.is_stopped())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a stop was requested.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Request a stop.  Returns every registered cancel token; the caller
+    /// sends each one (`CancelToken::cancel`) to stop the server-side query.
+    pub fn stop(&self) -> Vec<crate::db::CancelToken> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.tokens()
+    }
+
+    /// Register a session's cancel token.  A session registered after a stop
+    /// is cancelled by the run's next stop check, before it queries.
+    pub fn register(&self, token: crate::db::CancelToken) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(token);
+    }
+
+    /// The registered cancel tokens.
+    pub fn tokens(&self) -> Vec<crate::db::CancelToken> {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many sessions are registered.
+    pub fn registered(&self) -> usize {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// Whether the run was asked to stop.
+pub(crate) fn stopped(config: &RunConfig) -> bool {
+    config.control.as_ref().is_some_and(|c| c.is_stopped())
+}
+
+/// `Err(RunError::Cancelled)` once a stop was requested.
+pub(crate) fn checkpoint(config: &RunConfig) -> Result<(), RunError> {
+    if stopped(config) {
+        Err(RunError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Register a freshly opened session with the run control, then check the
+/// stop flag (a stop that raced the open is honoured before any query).
+pub(crate) fn register(config: &RunConfig, s: &ReadOnlySession) -> Result<(), RunError> {
+    if let Some(c) = &config.control {
+        c.register(s.cancel_token());
+    }
+    checkpoint(config)
+}
+
+/// Sleep for `d`, waking early (with `Err(Cancelled)`) on a stop.
+pub(crate) async fn settle(config: &RunConfig, d: std::time::Duration) -> Result<(), RunError> {
+    let step = std::time::Duration::from_millis(50);
+    let end = Instant::now() + d;
+    loop {
+        checkpoint(config)?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        tokio::time::sleep(step.min(end - now)).await;
     }
 }
 
@@ -144,6 +249,10 @@ pub enum RunError {
     Config(String),
     #[error("a full run needs both sides live")]
     NeedsLive,
+    /// The run was stopped through its [`RunControl`] (pause or cancel).  No
+    /// results exist; finished tables remain in the resume store.
+    #[error("the run was stopped before it finished")]
+    Cancelled,
 }
 
 impl From<tokio_postgres::Error> for RunError {
@@ -567,17 +676,19 @@ pub(crate) fn note_paused(results: &mut RunResults, side: &str, d: &ReplicaDecis
 }
 
 async fn snapshot(
+    config: &RunConfig,
     old_s: &mut ReadOnlySession,
     new_s: &mut ReadOnlySession,
     pairs: &[Pair],
-) -> BTreeMap<String, CounterPair> {
+) -> Result<BTreeMap<String, CounterPair>, RunError> {
     let mut out = BTreeMap::new();
     for p in pairs.iter().filter(|p| p.level != CheckLevel::Structure) {
+        checkpoint(config)?;
         let o = counters(old_s, &p.old.0, &p.old.1).await;
         let n = counters(new_s, &p.new.0, &p.new.1).await;
         out.insert(p.path.clone(), o.ok().zip(n.ok()));
     }
-    out
+    Ok(out)
 }
 
 /// Size-on-disk plus a timed LIMIT sample per side (PLAN.md 4.5).
@@ -643,10 +754,17 @@ async fn run_live(
     let mapping_hash = config.mapping.mapping_hash.clone();
     let def_hash = definition_hash(config);
 
+    // The probes use short-lived sessions of their own; the stop flag is
+    // checked around them.  Every session the run keeps is registered.
+    checkpoint(config)?;
     let old_info = probe_server(old_profile, config.allow_superuser).await?;
+    checkpoint(config)?;
     let new_info = probe_server(new_profile, config.allow_superuser).await?;
+    checkpoint(config)?;
     let mut old_s = ReadOnlySession::open(old_profile, config.allow_superuser).await?;
+    register(config, &old_s)?;
     let mut new_s = ReadOnlySession::open(new_profile, config.allow_superuser).await?;
+    register(config, &new_s)?;
 
     // Resume store: bound to this run's key; the run id survives resumes.
     let store = match config.resume_store.as_deref() {
@@ -683,8 +801,12 @@ async fn run_live(
     let epoch_new = epoch(&mut new_s).await;
 
     // Structure: both inventories, compared after the mapping is applied.
-    let old_inv = inventory(&mut old_s).await?;
-    let new_inv = inventory(&mut new_s).await?;
+    checkpoint(config)?;
+    let old_inv = inventory(&mut old_s).await;
+    checkpoint(config)?;
+    let new_inv = inventory(&mut new_s).await;
+    checkpoint(config)?;
+    let (old_inv, new_inv) = (old_inv?, new_inv?);
     let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
 
     // Pair every old table with its mapped new table.
@@ -745,13 +867,17 @@ async fn run_live(
         }
     }
 
+    checkpoint(config)?;
     let (total, per) = estimates(&mut old_s, &mut new_s, &pairs).await;
+    checkpoint(config)?;
     b.results.estimate = total;
     b.results.table_estimates = per;
 
-    let before = snapshot(&mut old_s, &mut new_s, &pairs).await;
+    let before = snapshot(config, &mut old_s, &mut new_s, &pairs).await?;
 
     for p in &pairs {
+        // Stop before each table: finished tables are already in the store.
+        checkpoint(config)?;
         let started = Instant::now();
         if p.level == CheckLevel::Structure {
             let mine: Vec<_> = findings
@@ -807,7 +933,10 @@ async fn run_live(
             &mapping_hash,
             &mut b.results,
         )
-        .await;
+        .await?;
+        // A stop during the last query (which the server cancelled) must
+        // never be recorded or stored as this table's result.
+        checkpoint(config)?;
 
         // Replica replay during this table's scans (counters are blind there).
         let ro_after = replica(&mut old_s, old_info.version_num).await;
@@ -823,6 +952,7 @@ async fn run_live(
         // Per-table change check, and the marks stored for resume.
         let ao = counters(&mut old_s, &p.old.0, &p.old.1).await;
         let an = counters(&mut new_s, &p.new.0, &p.new.1).await;
+        checkpoint(config)?;
         match (ao, an) {
             (Ok(ao), Ok(an)) => {
                 if bo.moved(&ao) || bn.moved(&an) {
@@ -860,8 +990,8 @@ async fn run_live(
     // Run-level change sweep: any table that moved since the first snapshot is
     // CHANGED_DURING_CHECK, never PASS.  Unreadable counters count as moved.
     // Wait first, so writes made during the run reach the statistics.
-    tokio::time::sleep(config.stats_settle).await;
-    let after = snapshot(&mut old_s, &mut new_s, &pairs).await;
+    settle(config, config.stats_settle).await?;
+    let after = snapshot(config, &mut old_s, &mut new_s, &pairs).await?;
     // A restart or stats reset during the run makes every counter comparison
     // meaningless: every scanned table is treated as changed.
     let epoch_moved = epoch_changed(&epoch_old, &epoch(&mut old_s).await)
@@ -879,12 +1009,15 @@ async fn run_live(
     }
 
     b.results.wal_end_lsn = wal(&mut new_s, new_info.version_num).await;
+    // A stop that arrived during the last reads still wins: no results.
+    checkpoint(config)?;
     Ok(b.finish())
 }
 
 /// Scan one paired table at its level and return the evidence.  Detail for
 /// the report (changed columns, exported keys, differing control totals) goes
-/// into `results.details`.
+/// into `results.details`.  The stop flag is checked before every query;
+/// a stop is `Err(RunError::Cancelled)`, never a table result.
 async fn scan_pair(
     config: &RunConfig,
     old_s: &mut ReadOnlySession,
@@ -892,16 +1025,21 @@ async fn scan_pair(
     p: &Pair,
     mapping_hash: &str,
     results: &mut RunResults,
-) -> Evidence {
-    let fault = |why: String| Evidence::new(&p.path, p.level, Outcome::Fault(why));
-    let old_live = match live_table(old_s, &p.old.0, &p.old.1).await {
+) -> Result<Evidence, RunError> {
+    let fault = |why: String| Ok(Evidence::new(&p.path, p.level, Outcome::Fault(why)));
+    checkpoint(config)?;
+    let old_live = live_table(old_s, &p.old.0, &p.old.1).await;
+    checkpoint(config)?;
+    let old_live = match old_live {
         Ok(Some(t)) => t,
         Ok(None) => {
             return fault("the table disappeared from the old database during the run".into())
         }
         Err(e) => return fault(format!("the old table could not be read: {e}")),
     };
-    let new_live = match live_table(new_s, &p.new.0, &p.new.1).await {
+    let new_live = live_table(new_s, &p.new.0, &p.new.1).await;
+    checkpoint(config)?;
+    let new_live = match new_live {
         Ok(Some(t)) => t,
         Ok(None) => {
             return fault("the table disappeared from the new database during the run".into())
@@ -922,12 +1060,14 @@ async fn scan_pair(
         },
     );
 
-    let with_coverage = |mut e: Evidence| {
-        e.dropped = spec.dropped.clone();
-        e.added = spec.added.clone();
-        e.ignored_columns = spec.ignored_columns.clone();
-        e.columns_covered = Some(spec.columns_covered());
-        e
+    let with_coverage = |e: Result<Evidence, RunError>| {
+        e.map(|mut e| {
+            e.dropped = spec.dropped.clone();
+            e.added = spec.added.clone();
+            e.ignored_columns = spec.ignored_columns.clone();
+            e.columns_covered = Some(spec.columns_covered());
+            e
+        })
     };
     if spec.columns.is_empty() {
         return with_coverage(fault(
@@ -966,12 +1106,15 @@ async fn scan_pair(
                     }
                 }
             }
+            checkpoint(config)?;
             let o = scan_counts(old_s, &p.old.0, &p.old.1, &old_controls).await;
+            checkpoint(config)?;
             let n = scan_counts(new_s, &p.new.0, &p.new.1, &new_controls).await;
+            checkpoint(config)?;
             match (o, n) {
                 (Ok((orows, ototals)), Ok((nrows, ntotals))) => {
                     export_control_totals(results, &p.path, &control_names, &ototals, &ntotals);
-                    with_coverage(Evidence::new(
+                    with_coverage(Ok(Evidence::new(
                         &p.path,
                         p.level,
                         Outcome::Counts(CountsComparison {
@@ -980,7 +1123,7 @@ async fn scan_pair(
                             old_totals: ototals,
                             new_totals: ntotals,
                         }),
-                    ))
+                    )))
                 }
                 (Err(e), _) | (_, Err(e)) => {
                     with_coverage(fault(format!("count scan failed: {e}")))
@@ -992,8 +1135,11 @@ async fn scan_pair(
                 Ok(plan) => plan,
                 Err(e) => return with_coverage(fault(format!("the plan cannot be built: {e}"))),
             };
+            checkpoint(config)?;
             let ofp = scan_fingerprint(old_s, &plan, Side::Old, &old_src, mapping_hash).await;
+            checkpoint(config)?;
             let nfp = scan_fingerprint(new_s, &plan, Side::New, &new_src, mapping_hash).await;
+            checkpoint(config)?;
             let (ofp, nfp) = match (ofp, nfp) {
                 (Ok(a), Ok(b)) => (a, b),
                 (Err(e), _) | (_, Err(e)) => {
@@ -1022,11 +1168,11 @@ async fn scan_pair(
                 &nfp.control_totals,
             );
 
-            let mut e = with_coverage(Evidence::new(
+            let mut e = with_coverage(Ok(Evidence::new(
                 &p.path,
                 p.level,
                 Outcome::Full(comparison.clone()),
-            ));
+            )))?;
             drill(
                 config,
                 old_s,
@@ -1040,13 +1186,13 @@ async fn scan_pair(
                 &mut e,
                 results,
             )
-            .await;
+            .await?;
             e.spot = if plan.is_keyed() {
-                spot_check(old_s, new_s, &plan, &old_src, &new_src, &comparison).await
+                spot_check(config, old_s, new_s, &plan, &old_src, &new_src, &comparison).await?
             } else {
                 Spot::NotRun("the table has no key; it is compared as a counted set".into())
             };
-            e
+            Ok(e)
         }
     }
 }
@@ -1092,15 +1238,16 @@ async fn drill(
     table: &str,
     e: &mut Evidence,
     results: &mut RunResults,
-) {
+) -> Result<(), RunError> {
     if comparison.non_equal().is_empty() || comparison.verdict == CoreVerdict::Error {
-        return;
+        return Ok(());
     }
     let buckets = comparison.drilldown_buckets();
-    let (o, n) = (
-        drill_rows(old_s, plan, Side::Old, old_src, &buckets).await,
-        drill_rows(new_s, plan, Side::New, new_src, &buckets).await,
-    );
+    checkpoint(config)?;
+    let o = drill_rows(old_s, plan, Side::Old, old_src, &buckets).await;
+    checkpoint(config)?;
+    let n = drill_rows(new_s, plan, Side::New, new_src, &buckets).await;
+    checkpoint(config)?;
     let (o, n) = match (o, n) {
         (Ok(o), Ok(n)) => (o, n),
         (Err(why), _) | (_, Err(why)) => {
@@ -1108,7 +1255,7 @@ async fn drill(
                 crate::results::Verdict::ToolFault,
                 format!("the drill-down scan failed: {why}"),
             ));
-            return;
+            return Ok(());
         }
     };
     let d = classify(o, n);
@@ -1130,8 +1277,11 @@ async fn drill(
             .len()
             .min(crate::core::drilldown::CHANGED_DETAIL_LIMIT)];
         let hashes: Vec<String> = take.iter().map(|(o, _)| o.key_hash.clone()).collect();
+        checkpoint(config)?;
         let ov = drill_values(old_s, plan, Side::Old, old_src, &hashes).await;
+        checkpoint(config)?;
         let nv = drill_values(new_s, plan, Side::New, new_src, &hashes).await;
+        checkpoint(config)?;
         match (ov, nv) {
             (Ok(ov), Ok(nv)) => {
                 let mut all_cols = BTreeSet::new();
@@ -1175,6 +1325,7 @@ async fn drill(
     entry.missing_keys = detail.missing_keys;
     entry.extra_keys = detail.extra_keys;
     entry.plain_words = detail.plain_words;
+    Ok(())
 }
 
 /// The independent spot check: 200 rows by key hash from each side, compared
@@ -1182,21 +1333,23 @@ async fn drill(
 /// query that fails is a disagreement (the check could not vouch for the hash
 /// path), never a silent skip.
 async fn spot_check(
+    config: &RunConfig,
     old_s: &mut ReadOnlySession,
     new_s: &mut ReadOnlySession,
     plan: &TablePlan,
     old_src: &Source,
     new_src: &Source,
     comparison: &Comparison,
-) -> Spot {
+) -> Result<Spot, RunError> {
     let failed = |why: String| Spot::Disagrees(format!("the spot check could not run: {why}"));
-    let (so, sn) = (
-        spot_sample(old_s, plan, Side::Old, old_src).await,
-        spot_sample(new_s, plan, Side::New, new_src).await,
-    );
+    checkpoint(config)?;
+    let so = spot_sample(old_s, plan, Side::Old, old_src).await;
+    checkpoint(config)?;
+    let sn = spot_sample(new_s, plan, Side::New, new_src).await;
+    checkpoint(config)?;
     let (so, sn) = match (so, sn) {
         (Ok(a), Ok(b)) => (a, b),
-        (Err(e), _) | (_, Err(e)) => return failed(e),
+        (Err(e), _) | (_, Err(e)) => return Ok(failed(e)),
     };
     let khs: Vec<String> = so
         .iter()
@@ -1205,22 +1358,54 @@ async fn spot_check(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let (o, n) = (
-        spot_fetch(old_s, plan, Side::Old, old_src, &khs).await,
-        spot_fetch(new_s, plan, Side::New, new_src, &khs).await,
-    );
-    match (o, n) {
+    let o = spot_fetch(old_s, plan, Side::Old, old_src, &khs).await;
+    checkpoint(config)?;
+    let n = spot_fetch(new_s, plan, Side::New, new_src, &khs).await;
+    checkpoint(config)?;
+    Ok(match (o, n) {
         (Ok(o), Ok(n)) => {
             let non_equal: BTreeSet<u32> = comparison.non_equal().into_iter().collect();
             spot::judge(plan.bucket_digits(), &non_equal, &o, &n)
         }
         (Err(e), _) | (_, Err(e)) => failed(e),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only connections.  Nothing here ships: the password is built at run
+    /// time (from `DMUX_TEST_OLD_URL` when set), never written in the source.
+    fn test_password() -> String {
+        std::env::var("DMUX_TEST_OLD_URL")
+            .ok()
+            .and_then(|u| {
+                let creds = u
+                    .strip_prefix("postgres://")?
+                    .split_once('@')?
+                    .0
+                    .to_string();
+                Some(creds.split_once(':')?.1.to_string())
+            })
+            .unwrap_or_else(|| format!("unused-{}", std::process::id()))
+    }
+
+    /// A live-to-live configuration against local mock ports, for unit tests that
+    /// never need a server (or that must fail to reach one).
+    fn mock_config() -> RunConfig {
+        let local = |port| {
+            Input::Live(ConnProfile::new(
+                "127.0.0.1",
+                port,
+                "bank",
+                "dmux_dev",
+                test_password(),
+                crate::db::TlsMode::Disable("unit test: no server".to_string()),
+            ))
+        };
+        RunConfig::new(local(5433), local(5434))
+    }
     use crate::mapping::{Rule, RuleKind, SchemaMapping, TableMapping};
 
     #[test]
@@ -1346,10 +1531,10 @@ mod tests {
 
     #[test]
     fn the_definition_hash_ignores_passwords_but_not_scope() {
-        let base = RunConfig::default();
+        let base = mock_config();
         let mut pw = base.clone();
         if let Input::Live(p) = &mut pw.old {
-            p.password = "something else".into();
+            p.password = format!("{}-changed", test_password());
         }
         assert_eq!(definition_hash(&base), definition_hash(&pw));
         let mut lvl = base.clone();
@@ -1366,8 +1551,101 @@ mod tests {
     async fn parallel_limits_below_one_are_rejected() {
         let c = RunConfig {
             old_parallelism: 0,
-            ..RunConfig::default()
+            ..mock_config()
         };
         assert!(matches!(run(&c).await, Err(RunError::Config(_))));
+    }
+
+    #[test]
+    fn a_new_config_names_its_connections_and_runs_to_completion() {
+        let c = mock_config();
+        assert!(c.control.is_none());
+        assert_eq!((c.old_parallelism, c.new_parallelism), (2, 4));
+        assert!(!c.allow_superuser && !c.export_keys);
+        assert_eq!(c.stats_settle, DEFAULT_STATS_SETTLE);
+        // The control is not part of what a run is.
+        let mut with = c.clone();
+        with.control = Some(std::sync::Arc::new(RunControl::new()));
+        assert_eq!(definition_hash(&c), definition_hash(&with));
+    }
+
+    fn stopped_config() -> (RunConfig, std::sync::Arc<RunControl>) {
+        let ctl = std::sync::Arc::new(RunControl::new());
+        let c = RunConfig {
+            control: Some(ctl.clone()),
+            ..mock_config()
+        };
+        (c, ctl)
+    }
+
+    #[test]
+    fn checkpoints_follow_the_stop_flag() {
+        let (c, ctl) = stopped_config();
+        assert!(checkpoint(&c).is_ok());
+        assert!(
+            checkpoint(&mock_config()).is_ok(),
+            "no control: never stops"
+        );
+        assert!(ctl.stop().is_empty(), "nothing registered yet");
+        assert!(ctl.is_stopped());
+        assert!(matches!(checkpoint(&c), Err(RunError::Cancelled)));
+        // Stopping twice is harmless.
+        ctl.stop();
+        assert!(matches!(checkpoint(&c), Err(RunError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_run_returns_cancelled_and_never_connects() {
+        // The mock profile points at a port nothing listens on: a run that
+        // tried to connect would fail with a database error instead.
+        let (mut c, ctl) = stopped_config();
+        let closed = |i: &mut Input| {
+            if let Input::Live(p) = i {
+                p.port = 1;
+            }
+        };
+        closed(&mut c.old);
+        closed(&mut c.new);
+        ctl.stop();
+        assert!(matches!(run(&c).await, Err(RunError::Cancelled)));
+        // The file-against-live path honours it the same way.
+        let file = crate::fingerprint_file::FingerprintFile {
+            format_version: crate::fingerprint_file::FINGERPRINT_VERSION,
+            tool_version: String::new(),
+            mapping_hash: c.mapping.mapping_hash.clone(),
+            server: crate::fingerprint_file::CapturedServer {
+                version_num: 170000,
+                version_string: "17".into(),
+                encoding: "UTF8".into(),
+                collation: "C".into(),
+                sql_ascii: false,
+            },
+            tables: vec![],
+            inventory: None,
+            sha256: String::new(),
+        };
+        let fl = RunConfig {
+            old: Input::File(file),
+            ..c.clone()
+        };
+        assert!(matches!(run(&fl).await, Err(RunError::Cancelled)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_settle_wait_wakes_on_a_stop() {
+        let (c, ctl) = stopped_config();
+        let started = Instant::now();
+        let (r, _) = tokio::join!(settle(&c, std::time::Duration::from_secs(30)), async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ctl.stop();
+        });
+        assert!(matches!(r, Err(RunError::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Without a stop it waits the full time.
+        let started = Instant::now();
+        settle(&mock_config(), std::time::Duration::from_millis(120))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(120));
     }
 }

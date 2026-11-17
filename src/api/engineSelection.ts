@@ -2,7 +2,8 @@
  * Pick the right engine for the current runtime.
  *
  * - Inside the Tauri desktop app the real engine (`createTauriEngine`) talks to
- *   the Rust backend for the structure half; the data half is stubbed (throws).
+ *   the Rust backend for both the structure and data halves (only report export
+ *   is still a typed NOT_AVAILABLE until T024).
  * - In a browser / Vitest / Playwright the mock is used, so UI tests stay
  *   deterministic and never touch a database.
  * - A test may force a mock fixture through `window.__dmuxForcedFixture`, but
@@ -54,7 +55,7 @@ export function forcedFixture(): string | undefined {
  *
  * Order of precedence:
  *   1. a forced fixture (test/dev only, never inside Tauri) → deterministic mock;
- *   2. inside Tauri → the real engine (data half stubbed until T022);
+ *   2. inside Tauri → the real engine;
  *   3. otherwise (browser / Vitest / Playwright) → the deterministic mock.
  */
 export function resolveEngine(): Engine {
