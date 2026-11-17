@@ -3,10 +3,10 @@
  *
  * Structure half (Connect / Compare structure / Map) calls the backend commands
  * and maps their serde (snake_case) JSON onto the frontend contract.  The data
- * half (checks / run / results / report) is NOT implemented yet — until T022
- * lands those methods throw a typed `EngineError` so the UI shows a plain
- * notice instead of a fabricated verdict.  A false PASS is the worst bug this
- * project can have, so nothing here ever invents one.
+ * half (checks / run / results) also calls the backend; each method maps the
+ * engine's serde output strictly.  Report export is still a typed `EngineError`
+ * (NOT_AVAILABLE) until T024.  A false PASS is the worst bug this project can
+ * have, so nothing here ever invents one.
  *
  * Every mapping is strict: an unknown status or verdict is treated as a
  * non-PASS result, never silently coerced to "same" or "PASS".
@@ -15,9 +15,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Engine } from './engine';
 import type {
+  CheckLevel,
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
+  CoverageSummary,
+  DrillDownRow,
+  FailureCard,
   Inventory,
   Mapping,
   MappingMatch,
@@ -25,9 +29,14 @@ import type {
   MatchConfidence,
   ReportResult,
   Results,
+  RunDefinition,
   RunProgress,
   SchemaDiffNode,
   ServerInfo,
+  TableCheck,
+  TableProgress,
+  TableResult,
+  TableRunState,
   TlsState,
   Verdict,
 } from './contract';
@@ -40,6 +49,21 @@ export class EngineError extends Error {
   ) {
     super(message);
     this.name = 'EngineError';
+  }
+}
+
+/**
+ * The engine run stopped with an error (backend `overall_state: "failed"`).
+ * `kind` is the backend's typed error kind; the run has no results.  It is
+ * thrown from every progress call so the UI shows the error, never "running".
+ */
+export class RunFailedError extends Error {
+  constructor(
+    readonly kind: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RunFailedError';
   }
 }
 
@@ -184,6 +208,106 @@ interface BackendProfile {
   encryption: EncryptionField;
   tls_fingerprint: string | null;
   plaintext_reason: string | null;
+}
+
+/** The engine's `CheckLevel` serialises as snake_case (`counts_and_totals`, ...). */
+type EngineLevel = 'structure' | 'counts_and_totals' | 'full_values';
+
+/** `build_check_plan` -> `CheckPlanDto`. */
+interface RawTableCheck {
+  table_id: string;
+  schema_name: string;
+  table_name: string;
+  level: EngineLevel;
+  control_total_columns: string[] | null;
+}
+
+interface RawCheckPlan {
+  tables: RawTableCheck[];
+  presets: string[];
+  estimate_seconds_min: number;
+  estimate_seconds_max: number;
+}
+
+/** `start_run` -> `StartRunResult`. */
+interface RawStartRun {
+  run_id: string;
+}
+
+/** `poll_run` -> `RunProgressDto`. */
+interface RawTableProgress {
+  table_id: string;
+  schema_name: string;
+  table_name: string;
+  state: string;
+  progress_percent: number;
+  eta_seconds: number | null;
+}
+
+interface RawRunError {
+  kind: string;
+  message?: string;
+}
+
+interface RawRunProgress {
+  run_id: string;
+  overall_state: string;
+  /** Present when `overall_state` is `failed`: the typed engine error. */
+  error?: RawRunError | null;
+  tables: RawTableProgress[];
+  eta_seconds_min: number | null;
+  eta_seconds_max: number | null;
+}
+
+/** `get_results` -> `ResultsDto`. */
+interface RawDrillDownRow {
+  key: string;
+  kind: string;
+  differing_columns: string[] | null;
+}
+
+interface RawFailureCard {
+  id: string;
+  table_id: string;
+  schema_name: string;
+  table_name: string;
+  level: EngineLevel;
+  verdict: string;
+  summary: string;
+  detail: string;
+}
+
+interface RawTableResult {
+  table_id: string;
+  schema_name: string;
+  table_name: string;
+  verdict: string;
+  level: EngineLevel;
+  checked: boolean;
+  drill_down: RawDrillDownRow[] | null;
+}
+
+interface RawIgnored {
+  id: string;
+  name: string;
+  reason: string;
+}
+
+interface RawCoverage {
+  total_tables: number;
+  full_values_tables: number;
+  counts_tables: number;
+  structure_tables: number;
+  ignored_tables: number;
+}
+
+interface RawResults {
+  run_id: string;
+  verdict: string;
+  coverage: RawCoverage;
+  ignored: RawIgnored[];
+  failures: RawFailureCard[];
+  table_results: RawTableResult[];
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +574,73 @@ function toServerInfo(raw: RawServerInfo): ServerInfo {
   };
 }
 
+/** Map the engine's snake_case check level onto the contract level. */
+export function mapLevel(raw: EngineLevel): CheckLevel {
+  switch (raw) {
+    case 'structure':
+      return 'structure';
+    case 'counts_and_totals':
+      return 'counts';
+    case 'full_values':
+      return 'full-values';
+  }
+}
+
+/** Map the contract check level onto the engine's snake_case level. */
+export function toEngineLevel(level: CheckLevel): EngineLevel {
+  switch (level) {
+    case 'structure':
+      return 'structure';
+    case 'counts':
+      return 'counts_and_totals';
+    case 'full-values':
+      return 'full_values';
+  }
+}
+
+/** Map a per-table progress state string onto the contract `TableRunState`. */
+export function mapTableState(raw: string): TableRunState {
+  switch (raw) {
+    case 'running':
+      return 'running';
+    case 'paused':
+      return 'paused';
+    case 'done':
+      return 'done';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'changed-during-check':
+      return 'changed-during-check';
+    default:
+      return 'queued';
+  }
+}
+
+/** Map the run's overall state string onto the contract's union. */
+export function mapOverallState(raw: string): RunProgress['overallState'] {
+  switch (raw) {
+    case 'paused':
+      return 'paused';
+    case 'done':
+      return 'done';
+    case 'cancelled':
+      return 'cancelled';
+    default:
+      return 'running';
+  }
+}
+
+/** Map a drill-down row kind (from the engine, always one of these three). */
+function mapDrillKind(kind: string): DrillDownRow['kind'] {
+  if (kind === 'extra') return 'extra';
+  if (kind === 'changed') return 'changed';
+  // "missing" and any unknown value both render as missing-in-new (never PASS);
+  // the engine only emits these three, but stay conservative.
+  return 'missing';
+}
+
 /** Turn a thrown (serde-tagged) backend error into a readable string. */
 function describeError(error: unknown): string {
   const e = error as Partial<RawCommandError>;
@@ -472,19 +663,131 @@ function describeError(error: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// Data-half mapping (engine -> contract), all strict.
+// ---------------------------------------------------------------------------
+
+/** Fold the contract `CheckPlan` into the engine's `levels` map + control totals. */
+function planToLevels(plan: CheckPlan): {
+  levels: Record<string, EngineLevel>;
+  controlTotalColumns: string[];
+} {
+  const levels: Record<string, EngineLevel> = {};
+  const controls = new Set<string>();
+  for (const table of plan.tables) {
+    const path = `${table.schemaName}.${table.tableName}`;
+    levels[path] = toEngineLevel(table.level);
+    for (const column of table.controlTotalColumns ?? []) {
+      controls.add(column);
+    }
+  }
+  return { levels, controlTotalColumns: [...controls] };
+}
+
+function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
+  const tables: TableCheck[] = raw.tables.map((t) => ({
+    tableId: t.table_id,
+    schemaName: t.schema_name,
+    tableName: t.table_name,
+    level: mapLevel(t.level),
+    controlTotalColumns: t.control_total_columns ?? undefined,
+  }));
+  return {
+    tables,
+    presets: raw.presets,
+    estimateSecondsMin: raw.estimate_seconds_min,
+    estimateSecondsMax: raw.estimate_seconds_max,
+  };
+}
+
+function translateProgress(raw: RawRunProgress): RunProgress {
+  if (raw.overall_state === 'failed') {
+    const kind = raw.error?.kind ?? 'run_failed';
+    const why = raw.error?.message ?? 'no detail was reported';
+    throw new RunFailedError(kind, `The run failed and has no results: ${why}`);
+  }
+  const tables: TableProgress[] = raw.tables.map((t) => ({
+    tableId: t.table_id,
+    schemaName: t.schema_name,
+    tableName: t.table_name,
+    state: mapTableState(t.state),
+    progressPercent: t.progress_percent,
+    etaSeconds: t.eta_seconds ?? undefined,
+  }));
+  return {
+    runId: raw.run_id,
+    overallState: mapOverallState(raw.overall_state),
+    tables,
+    etaSecondsMin: raw.eta_seconds_min ?? undefined,
+    etaSecondsMax: raw.eta_seconds_max ?? undefined,
+  };
+}
+
+function translateResults(raw: RawResults): Results {
+  const coverage: CoverageSummary = {
+    totalTables: raw.coverage.total_tables,
+    fullValuesTables: raw.coverage.full_values_tables,
+    countsTables: raw.coverage.counts_tables,
+    structureTables: raw.coverage.structure_tables,
+    ignoredTables: raw.coverage.ignored_tables,
+  };
+
+  const ignored: IgnoreItem[] = raw.ignored.map((i) => ({
+    id: i.id,
+    name: i.name,
+    reason: i.reason,
+  }));
+
+  const failures: FailureCard[] = raw.failures.map((f) => ({
+    id: f.id,
+    tableId: f.table_id,
+    schemaName: f.schema_name,
+    tableName: f.table_name,
+    level: mapLevel(f.level),
+    verdict: mapVerdict(f.verdict),
+    summary: f.summary,
+    detail: f.detail,
+  }));
+
+  const tableResults: TableResult[] = raw.table_results.map((t) => ({
+    tableId: t.table_id,
+    schemaName: t.schema_name,
+    tableName: t.table_name,
+    verdict: mapVerdict(t.verdict),
+    level: mapLevel(t.level),
+    checked: t.checked,
+    drillDown: t.drill_down?.map((d) => ({
+      key: d.key,
+      kind: mapDrillKind(d.kind),
+      differingColumns: d.differing_columns ?? undefined,
+    })),
+  }));
+
+  return {
+    runId: raw.run_id,
+    verdict: mapVerdict(raw.verdict),
+    coverage,
+    ignored,
+    failures,
+    tableResults,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The engine.
 // ---------------------------------------------------------------------------
 
 /**
  * Create the Tauri-backed engine.
  *
- * Structure methods call the backend; data methods throw a typed `EngineError`
- * (NOT_AVAILABLE) until T022 wires them — never fabricating a verdict.
+ * Structure and data methods call the backend and map its serde output strictly;
+ * only report export still throws a typed `EngineError` (NOT_AVAILABLE) until
+ * T024 — never fabricating a verdict.
  *
  * The flow is linear (connect -> compare -> map), so the adapter remembers the
  * profiles used by `compareStructure` and reuses them in `buildMapping`, which
  * the backend computes against the two live databases.  The raw engine mapping
- * produced by `build_mapping` is kept for `saveMapping`.
+ * produced by `build_mapping` is kept for `saveMapping` and the data-half
+ * commands.
  */
 export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
@@ -558,27 +861,67 @@ export function createTauriEngine(): Engine {
       return { hash: exported.hash, json: exported.json };
     },
 
-    // --- Data half: not available until T022 (never fabricate a verdict). ---
+    // --- Data half: wired to the real engine (never fabricate a verdict). ---
 
-    buildCheckPlan(): Promise<CheckPlan> {
-      return notAvailable();
+    async buildCheckPlan(): Promise<CheckPlan> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before buildCheckPlan');
+      }
+      if (!lastRawMapping) {
+        throw new Error('buildMapping must run before buildCheckPlan');
+      }
+      const raw = await invoke<RawCheckPlan>('build_check_plan', {
+        old: toConnectInput(lastOldProfile),
+        new: toConnectInput(lastNewProfile),
+        mapping: lastRawMapping,
+      });
+      return translateCheckPlan(raw);
     },
-    startRun(): Promise<RunProgress> {
-      return notAvailable();
+
+    async startRun(definition: RunDefinition): Promise<RunProgress> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before startRun');
+      }
+      if (!lastRawMapping) {
+        throw new Error('buildMapping must run before startRun');
+      }
+      const { levels, controlTotalColumns } = planToLevels(definition.plan);
+      const started = await invoke<RawStartRun>('start_run', {
+        input: {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          mapping: lastRawMapping,
+          levels,
+          default_level: 'full_values',
+          control_total_columns: controlTotalColumns,
+        },
+      });
+      return { runId: started.run_id, overallState: 'running', tables: [] };
     },
-    pollRun(): Promise<RunProgress> {
-      return notAvailable();
+
+    async pollRun(runId: string): Promise<RunProgress> {
+      const raw = await invoke<RawRunProgress>('poll_run', { runId });
+      return translateProgress(raw);
     },
-    setRunPaused(): Promise<RunProgress> {
-      return notAvailable();
+
+    async setRunPaused(runId: string, paused: boolean): Promise<RunProgress> {
+      const raw = await invoke<RawRunProgress>('set_run_paused', { runId, paused });
+      return translateProgress(raw);
     },
-    cancelRun(): Promise<RunProgress> {
-      return notAvailable();
+
+    async cancelRun(runId: string): Promise<RunProgress> {
+      const raw = await invoke<RawRunProgress>('cancel_run', { runId });
+      return translateProgress(raw);
     },
-    getResults(): Promise<Results> {
-      return notAvailable();
+
+    async getResults(runId: string): Promise<Results> {
+      const raw = await invoke<RawResults>('get_results', { runId });
+      return translateResults(raw);
     },
+
     exportReport(): Promise<ReportResult> {
+      // Report export lands with T024; until then it is a typed NOT_AVAILABLE,
+      // never a fabricated report or verdict.
       return notAvailable();
     },
     async getVersion(): Promise<string> {

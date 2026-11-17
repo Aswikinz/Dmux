@@ -16,7 +16,12 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [ignoreReason, setIgnoreReason] = useState('');
   const [ignoringId, setIgnoringId] = useState<string | null>(null);
+  // Whether the ignore prompt was opened with the keyboard (Delete/Backspace),
+  // so we only move focus for keyboard users, not mouse users (a11y rule:
+  // no autoFocus that yanks focus away from a pointer interaction).
+  const [ignoringViaKeyboard, setIgnoringViaKeyboard] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const ignoreInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setSelectedIndex((prev) => Math.min(prev, Math.max(0, queue.length - 1)));
@@ -46,6 +51,7 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
         if (!ignoringId) {
+          setIgnoringViaKeyboard(true);
           setIgnoringId(queue[selectedIndex]?.id ?? null);
         }
       } else if (e.key === 'Escape') {
@@ -64,6 +70,16 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
       el.scrollIntoView({ block: 'nearest' });
     }
   }, [selectedIndex]);
+
+  // Move focus to the reason input only when the ignore prompt was opened with
+  // the keyboard, so keyboard navigation stays complete without stealing focus
+  // from a mouse click (replaces autoFocus, a11y rule S9379).
+  useEffect(() => {
+    if (ignoringViaKeyboard && ignoringId) {
+      ignoreInputRef.current?.focus();
+      setIgnoringViaKeyboard(false);
+    }
+  }, [ignoringViaKeyboard, ignoringId]);
 
   if (queue.length === 0) {
     return (
@@ -119,13 +135,13 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
                   {isIgnoring ? (
                     <>
                       <input
+                        ref={ignoreInputRef}
                         type="text"
                         value={ignoreReason}
                         onChange={(e) => setIgnoreReason(e.target.value)}
                         placeholder="Reason for ignoring (required)"
                         aria-label="Reason for ignoring"
                         className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
-                        autoFocus
                       />
                       <Button
                         size="sm"

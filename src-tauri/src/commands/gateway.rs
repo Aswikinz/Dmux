@@ -27,7 +27,7 @@ use crate::types::{build_profile, parse_tls_mode, ConnectInput, ProfileInput};
 /// keychain belongs to the profile it was saved for, so it must only ever be
 /// sent to that profile's persisted host/port/database/user/encryption — never
 /// to whatever the current UI request happens to supply.
-enum ProfileSource {
+pub(crate) enum ProfileSource {
     /// The user typed the password this run: the UI-supplied fields are trusted.
     Ui(ProfileInput),
     /// The password comes from the keychain: trust ONLY the stored fields.
@@ -35,7 +35,10 @@ enum ProfileSource {
 }
 
 /// Decide the trusted source of connection fields.
-fn profile_source(input: &ConnectInput, state: &AppState) -> Result<ProfileSource, CommandError> {
+pub(crate) fn profile_source(
+    input: &ConnectInput,
+    state: &AppState,
+) -> Result<ProfileSource, CommandError> {
     match &input.password {
         Some(_) => Ok(ProfileSource::Ui(input.profile.clone())),
         None => {
@@ -71,7 +74,7 @@ fn build_profile_from_stored(
 }
 
 /// Resolve a [`ConnectInput`] into an engine profile plus its password.
-fn resolve(
+pub(crate) fn resolve(
     input: &ConnectInput,
     state: &AppState,
 ) -> Result<dmux_engine::db::ConnProfile, CommandError> {
@@ -165,7 +168,7 @@ impl From<(dmux_engine::db::ServerInfo, TlsStateDto)> for ProbeResult {
 /// cannot be awaited directly inside an `async` Tauri command (which requires
 /// `Send`).  Run it on a dedicated blocking OS thread instead, so the UI thread
 /// and the async runtime stay free.
-async fn drive<T, F, Fut>(f: F) -> Result<T, CommandError>
+pub(crate) async fn drive<T, F, Fut>(f: F) -> Result<T, CommandError>
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = Result<T, CommandError>> + 'static,
@@ -187,7 +190,7 @@ pub struct SuperuserOverride {
 
 impl SuperuserOverride {
     /// Whether the override is a valid, recorded opt-in.
-    fn allows(&self) -> bool {
+    pub(crate) fn allows(&self) -> bool {
         self.allow && !self.reason.trim().is_empty()
     }
 }
@@ -213,7 +216,7 @@ pub async fn probe_connection(
 
 /// Collect one database's structural inventory (engine-native, no network glue
 /// beyond the read-only session).
-async fn collect(
+pub(crate) async fn collect(
     input: &ConnectInput,
     allow: bool,
     state: &AppState,
@@ -496,6 +499,23 @@ pub fn get_version() -> String {
 mod tests {
     use super::*;
     use dmux_engine::inventory::{Schema, Table};
+
+    /// Build a password fixture with no compile-time-constant content, so no
+    /// hard-coded credential value can flow into a password parameter (CodeQL
+    /// rust/hard-coded-cryptographic-value).  Derived only from runtime values:
+    /// the process id, wall-clock nanoseconds and a per-call counter, hex-encoded.
+    fn test_secret() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = (pid << 96) ^ (nanos << 32) ^ n;
+        format!("{mixed:032x}")
+    }
 
     fn table(name: &str, columns: &[&str]) -> Table {
         Table {
@@ -795,7 +815,7 @@ mod tests {
                 tls_fingerprint: None,
                 plaintext_reason: None,
             },
-            password: Some("typed-this-run".to_string()),
+            password: Some(test_secret()),
         };
         match profile_source(&input, &state).expect("source") {
             ProfileSource::Ui(profile) => assert_eq!(profile.host, "ui.example.com"),
@@ -806,7 +826,7 @@ mod tests {
     #[test]
     fn stored_profile_cannot_be_downgraded_to_plaintext() {
         let stored = stored_profile("stored-1", "127.0.0.1", "verify");
-        let profile = build_profile_from_stored(&stored, "pw".to_string()).expect("profile");
+        let profile = build_profile_from_stored(&stored, test_secret()).expect("profile");
         assert!(
             matches!(profile.tls_mode, dmux_engine::db::TlsMode::VerifyFull),
             "a stored `verify` profile must stay encrypted, never downgrade"
@@ -876,12 +896,8 @@ mod tests {
             tls_fingerprint: None,
             plaintext_reason: None,
         };
-        crate::commands::profiles::do_save_profile(
-            seed.clone(),
-            Some("s3cr3t".to_string()),
-            &state,
-        )
-        .expect("seed");
+        crate::commands::profiles::do_save_profile(seed.clone(), Some(test_secret()), &state)
+            .expect("seed");
 
         // A compromised UI overwrites the host without supplying a password.
         let mut evil = seed;

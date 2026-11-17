@@ -3,6 +3,7 @@
 
 mod commands;
 mod error;
+mod run_manager;
 mod secrets;
 mod state;
 mod store;
@@ -38,6 +39,12 @@ fn main() {
             commands::gateway::export_mapping,
             commands::gateway::import_mapping,
             commands::gateway::get_version,
+            commands::data::build_check_plan,
+            commands::data::start_run,
+            commands::data::poll_run,
+            commands::data::set_run_paused,
+            commands::data::cancel_run,
+            commands::data::get_results,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());

@@ -13,7 +13,7 @@ use dmux_engine::fingerprint_file::FingerprintFile;
 use dmux_engine::mapping::{IgnoredItem as MapIgnored, Mapping};
 use dmux_engine::results::{CheckLevel, IgnoredItem, RunResults, Verdict};
 use dmux_engine::run::capture::{capture, CaptureOptions};
-use dmux_engine::run::{run, Input, RunConfig};
+use dmux_engine::run::{run, Input, RunConfig, RunControl, RunError};
 use dmux_engine::store::{Loaded, Store};
 
 fn env_url(name: &str) -> Option<String> {
@@ -55,11 +55,9 @@ fn profiles() -> Option<(ConnProfile, ConnProfile)> {
 
 fn config(old: Input, new: Input, level: CheckLevel) -> RunConfig {
     RunConfig {
-        old,
-        new,
         default_level: level,
         allow_superuser: true,
-        ..RunConfig::default()
+        ..RunConfig::new(old, new)
     }
 }
 
@@ -432,4 +430,57 @@ async fn counters_cover_partitions_and_record_storage() {
     assert!(entries.iter().all(|e| e.split_once(':').is_some()));
     // The rows live in the partitions: their inserts count for the parent.
     assert!(c.n_tup_ins > 0, "{c:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_mid_run_is_cancelled_keeps_finished_tables_and_resumes() {
+    let Some((old, new)) = profiles() else { return };
+    let path = temp("stop");
+    let _ = std::fs::remove_file(&path);
+    let ctl = std::sync::Arc::new(RunControl::new());
+    let mut c = config(Input::Live(old), Input::Live(new), CheckLevel::FullValues);
+    c.resume_store = Some(path.clone());
+    c.control = Some(ctl.clone());
+
+    // Stop as soon as the run has stored its first finished table, and cancel
+    // whatever the server is running at that moment.
+    let stopper = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let done = Store::open(&path)
+                .and_then(|s| s.finished_tables())
+                .map(|t| t.len())
+                .unwrap_or(0);
+            if done >= 1 {
+                assert_eq!(ctl.registered(), 2, "both run sessions are registered");
+                for t in ctl.stop() {
+                    let _ = t.cancel().await;
+                }
+                return;
+            }
+        }
+    };
+    let (out, ()) = tokio::join!(run(&c), stopper);
+    assert!(
+        matches!(out, Err(RunError::Cancelled)),
+        "a stopped run never returns results: {:?}",
+        out.map(|o| o.results.verdict)
+    );
+    let kept = Store::open(&path).unwrap().finished_tables().unwrap();
+    assert!(!kept.is_empty(), "finished tables stay in the store");
+
+    // Resume without a stop: the kept tables are reused and the run completes.
+    c.control = Some(std::sync::Arc::new(RunControl::new()));
+    let r = go(&c).await;
+    for t in &kept {
+        if r.tables[t].verdict != Verdict::ToolFault {
+            assert!(r.resumed_tables.contains(t), "{t} reused on resume");
+        }
+    }
+    assert_eq!(
+        r.verdict,
+        Verdict::Fail,
+        "the planted differences still fail"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

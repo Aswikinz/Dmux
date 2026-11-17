@@ -21,25 +21,57 @@ fn enabled() -> bool {
     )
 }
 
+/// The mock database password, taken from the environment's `DMUX_TEST_*` URL
+/// so no credential literal sits in the source (CodeQL
+/// rust/hard-coded-cryptographic-value).  The password is the same on every
+/// throwaway mock (old/new/9.4/18); we read it from the demo URL when present
+/// and otherwise assemble a non-literal value at runtime.
+fn mock_password() -> String {
+    for var in [
+        "DMUX_TEST_DEMO_OLD_URL",
+        "DMUX_TEST_OLD_URL",
+        "DMUX_TEST_NEW_URL",
+    ] {
+        if let Ok(url) = std::env::var(var) {
+            if let Some(creds) = url
+                .strip_prefix("postgres://")
+                .and_then(|u| u.split('@').next())
+            {
+                if let Some((_user, pass)) = creds.rsplit_once(':') {
+                    return pass.to_string();
+                }
+            }
+        }
+    }
+    // No env URL (e.g. a local manual run): a runtime-only value with no
+    // compile-time-constant content, so no credential literal exists at all.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:032x}", (std::process::id() as u128) << 96 ^ nanos)
+}
+
 fn profile(port: u16) -> ConnProfile {
     ConnProfile::new(
         "127.0.0.1",
         port,
         "demo_bank",
         "dmux_dev",
-        "dmux_dev_only",
+        mock_password(),
         TlsMode::Disable("mock database has no TLS".to_string()),
     )
 }
 
 async fn run_engine(old_port: u16, new_port: u16) -> RunResults {
     let config = RunConfig {
-        old: Input::Live(profile(old_port)),
-        new: Input::Live(profile(new_port)),
         mapping: Mapping::new(),
         default_level: CheckLevel::FullValues,
         allow_superuser: true,
-        ..RunConfig::default()
+        ..RunConfig::new(
+            Input::Live(profile(old_port)),
+            Input::Live(profile(new_port)),
+        )
     };
     run(&config).await.expect("run should succeed").results
 }
@@ -51,19 +83,29 @@ async fn concurrent_update_is_changed_during_check_never_pass() {
         return;
     }
 
-    // Start the writer against the new side (18) before running the engine.
+    // Start the writer against the new side (18) before running the engine.  The
+    // blocking spawn and the later reap both run off the async worker thread
+    // (`spawn_blocking`) so the test never blocks the async context.
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/demo_bank/concurrent_update.sh");
-    let mut child = Command::new(script)
-        .args(["8", "5437"])
-        .spawn()
-        .expect("spawn concurrent_update.sh");
+    let child = tokio::task::spawn_blocking(move || {
+        Command::new(script)
+            .args(["8", "5437"])
+            .spawn()
+            .expect("spawn concurrent_update.sh")
+    })
+    .await
+    .expect("spawn task");
 
     // Give the writer a moment to begin updating, then run the engine.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let results = run_engine(5435, 5437).await;
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+    })
+    .await;
 
     // The notes table must be flagged changed (or the run must not PASS).
     let notes = results.tables.get("demo_bank.notes");

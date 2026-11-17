@@ -552,7 +552,7 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       let hash = 0;
       for (let i = 0; i < json.length; i += 1) {
         hash = (hash << 5) - hash + json.charCodeAt(i);
-        hash |= 0;
+        hash = Math.trunc(hash);
       }
       return { hash: `mock-${Math.abs(hash).toString(16)}`, json };
     },
@@ -596,10 +596,13 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     },
 
     async exportReport(request: ReportRequest): Promise<ReportResult> {
+      // The mock never touches a real path: it reports a placeholder destination
+      // so the "saved to …" message stays meaningful without a temp-path default.
+      const base = request.filePath ?? 'chosen-location';
       if (request.format === 'pdf') {
-        return { ok: true, filePath: `${request.filePath}/report.pdf` };
+        return { ok: true, filePath: `${base}/report.pdf` };
       }
-      return { ok: true, filePath: `${request.filePath}/report.xlsx` };
+      return { ok: true, filePath: `${base}/report.xlsx` };
     },
 
     async getVersion(): Promise<string> {

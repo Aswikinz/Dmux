@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { useState } from 'react';
 import type { ReactElement } from 'react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createMockEngine } from '../api/mockEngine';
 import { ThemeProvider } from '../design/theme';
 import type { Engine } from '../api/engine';
@@ -257,6 +257,7 @@ describe('MapScreen', () => {
 
   it('saves the mapping', async () => {
     const engine = createMockEngine();
+    const saveMapping = vi.spyOn(engine, 'saveMapping');
     const inventory = await engine.compareStructure(defaultOldProfile(), defaultNewProfile());
     const initial = await engine.buildMapping(inventory);
     function SaveHarness() {
@@ -275,7 +276,12 @@ describe('MapScreen', () => {
     wrap(<SaveHarness />);
     const save = await screen.findByRole('button', { name: 'Save mapping' });
     fireEvent.click(save);
-    await screen.findByRole('button', { name: 'Save mapping' });
+    // Saving flips the label briefly, then the button returns once the save
+    // promise resolves — and the engine actually received the built mapping.
+    expect(await screen.findByRole('button', { name: 'Save mapping' })).toBeDefined();
+    expect(saveMapping).toHaveBeenCalledTimes(1);
+    expect(saveMapping.mock.calls[0][0]).toEqual(initial);
+    saveMapping.mockRestore();
   });
 });
 
@@ -415,12 +421,13 @@ describe('RunScreen', () => {
     wrap(<RunHarness engine={engine} />);
     const pause = await screen.findByRole('button', { name: 'Pause' });
     fireEvent.click(pause);
-    await screen.findAllByText('Paused');
+    expect(await screen.findAllByText('Paused')).toBeTruthy();
     const resume = screen.getByRole('button', { name: 'Resume' });
     fireEvent.click(resume);
-    await screen.findAllByText('Running');
+    expect(await screen.findAllByText('Running')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-    await screen.findAllByText('Cancelled');
+    expect(await screen.findAllByText('Cancelled')).toBeTruthy();
+    expect(state.overallState).toBe('cancelled');
   });
 
   it('shows an error when the run fails to start', async () => {

@@ -1,9 +1,10 @@
 //! Managed Tauri state shared by every command.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::CommandError;
+use crate::run_manager::RunManager;
 use crate::secrets::{Keychain, PasswordStore};
 use crate::store::Store;
 
@@ -13,6 +14,10 @@ pub struct AppState {
     pub keychain: Mutex<Box<dyn PasswordStore>>,
     /// The SQLite profile store, opened at startup.
     pub store: Mutex<Store>,
+    /// The registry of in-progress runs (the data half).
+    pub runs: Arc<RunManager>,
+    /// The app data directory (home of the profile and resume stores).
+    pub data_dir: PathBuf,
 }
 
 impl AppState {
@@ -36,6 +41,8 @@ impl AppState {
         Ok(Self {
             keychain: Mutex::new(keychain),
             store: Mutex::new(store),
+            runs: Arc::new(RunManager::default()),
+            data_dir,
         })
     }
 
@@ -62,4 +69,53 @@ pub fn app_data_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
     app.path()
         .app_data_dir()
         .expect("the OS must provide an app data dir")
+}
+
+/// The resume-store directory for the data half: `<app data>/resume/`.
+pub fn resume_dir(state: &AppState) -> PathBuf {
+    state.data_dir.join("resume")
+}
+
+/// The resume store of one run: its own SQLite file, `<app data>/resume/<run
+/// id>.sqlite`, created by the engine.  Never a shared file: two runs (even of
+/// the same definition) can never write into or resume from each other's
+/// store.  `run_id` is an app-generated id (`run-<hex>-<hex>-<hex>`); anything
+/// else is refused so it can never name a path outside the directory.
+pub fn resume_store_path(state: &AppState, run_id: &str) -> Result<PathBuf, CommandError> {
+    let safe = !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !safe {
+        return Err(CommandError::internal("invalid run id for a resume store"));
+    }
+    let dir = resume_dir(state);
+    std::fs::create_dir_all(&dir).map_err(|e| CommandError::Store {
+        message: format!("cannot create the resume-store directory: {e}"),
+    })?;
+    Ok(dir.join(format!("{run_id}.sqlite")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_run_has_its_own_resume_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        let a = resume_store_path(&state, "run-1-2-3").unwrap();
+        let b = resume_store_path(&state, "run-4-5-6").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent().unwrap(), dir.path().join("resume"));
+        assert!(a.parent().unwrap().is_dir());
+        assert!(!a.ends_with("resume.db"));
+        for bad in ["", "../x", "a/b", "run.db"] {
+            assert!(resume_store_path(&state, bad).is_err(), "{bad}");
+        }
+    }
 }
