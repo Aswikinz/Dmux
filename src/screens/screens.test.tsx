@@ -136,6 +136,40 @@ describe('ConnectScreen', () => {
     expect(next.disabled).toBe(false);
   });
 
+  it('shows the in-memory password notice when there is no keychain, and only then', async () => {
+    const base = createMockEngine();
+    const engine: Engine = {
+      ...base,
+      testConnection: async (profile, password) => {
+        const r = await base.testConnection(profile, password);
+        return r.info
+          ? { ...r, info: { ...r.info, sessionPassword: profile.id === defaultOldProfile().id } }
+          : r;
+      },
+    };
+    wrap(
+      <ConnectScreen
+        engine={engine}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    const testButtons = screen.getAllByRole('button', { name: 'Test connection' });
+    fireEvent.click(testButtons[0]);
+    expect(
+      await screen.findByText(
+        'No system keychain: Dmux will keep this password in memory until you close the app.',
+      ),
+    ).toBeDefined();
+    fireEvent.click(testButtons[1]);
+    await waitFor(() => expect(screen.getAllByText('Server version:').length).toBe(2));
+    // The new side has a keychain: one notice only.
+    expect(screen.getAllByTestId('session-password-notice').length).toBe(1);
+  });
+
   it('refuses a superuser until the user types a reason, then records it', async () => {
     const engine = createMockEngine();
     const setOverride = vi.spyOn(engine, 'setSuperuserOverride');
@@ -976,5 +1010,55 @@ describe('ReportScreen', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
     expect(await screen.findByText('Export failed')).toBeDefined();
+    expect(screen.getByText('disk full')).toBeDefined();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('shows the exact saved path and asks for this run', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/home/u/dmux-run-pass.pdf' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
+    expect(
+      await screen.findByText('PDF report saved to /home/u/dmux-run-pass.pdf'),
+    ).toBeDefined();
+    expect(exportReport).toHaveBeenCalledWith({
+      runId: 'run-pass',
+      format: 'pdf',
+      includeKeys: false,
+    });
+  });
+
+  it('says cancelled, not saved or failed, when the dialog is dismissed', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      exportReport: async () => ({ ok: false, cancelled: true }),
+    };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    expect(await screen.findByText('Excel export cancelled. Nothing was saved.')).toBeDefined();
+    expect(screen.queryByText('Export failed')).toBeNull();
+    expect(screen.queryByText(/report saved/)).toBeNull();
+  });
+
+  it('sends the key choice only when the user ticks it', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.xlsx' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await screen.findByText(/report saved/);
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
+    await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(2));
+    expect(exportReport.mock.calls.map((c) => (c as unknown[])[0])).toEqual([
+      { runId: 'run-pass', format: 'excel', includeKeys: false },
+      { runId: 'run-pass', format: 'excel', includeKeys: true },
+    ]);
   });
 });

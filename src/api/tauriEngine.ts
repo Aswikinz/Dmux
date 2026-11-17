@@ -4,8 +4,8 @@
  * Structure half (Connect / Compare structure / Map) calls the backend commands
  * and maps their serde (snake_case) JSON onto the frontend contract.  The data
  * half (checks / run / results) also calls the backend; each method maps the
- * engine's serde output strictly.  Report export is still a typed `EngineError`
- * (NOT_AVAILABLE) until T024.  A false PASS is the worst bug this project can
+ * engine's serde output strictly.  Report export asks the backend to render
+ * its own copy of the run's results behind a native save dialog.  A false PASS is the worst bug this project can
  * have, so nothing here ever invents one.
  *
  * Every mapping is strict: an unknown status or verdict is treated as a
@@ -27,6 +27,7 @@ import type {
   MappingMatch,
   IgnoreItem,
   MatchConfidence,
+  ReportRequest,
   ReportResult,
   Results,
   RunDefinition,
@@ -69,12 +70,6 @@ export class RunFailedError extends Error {
   }
 }
 
-const NOT_AVAILABLE_MESSAGE =
-  'Running checks and exporting reports is not available in this version of Dmux yet.';
-
-function notAvailable(): Promise<never> {
-  return Promise.reject(new EngineError('NOT_AVAILABLE', NOT_AVAILABLE_MESSAGE));
-}
 
 // ---------------------------------------------------------------------------
 // Engine-native (snake_case) shapes, matching the Rust commands' serde output.
@@ -101,6 +96,8 @@ interface RawServerInfo {
   md5_available: boolean;
   sql_ascii: boolean;
   tls: RawTlsState;
+  /** The password is kept in memory for this session (no keychain). */
+  session_password?: boolean;
 }
 
 /** Engine `schema_diff::DiffStatus`. */
@@ -214,6 +211,9 @@ interface BackendProfile {
 }
 
 /** Shape `save_profile` returns: the stored profile plus an optional warning. */
+/** Shape `export_report` returns (`commands::report::ExportReportResult`). */
+type RawExportReport = { status: 'saved'; path: string } | { status: 'cancelled' };
+
 interface RawSaveProfileResult {
   profile: BackendProfile;
   warning: string | null;
@@ -601,6 +601,7 @@ function toServerInfo(raw: RawServerInfo): ServerInfo {
     poolerSuspected: raw.pooler_suspected,
     md5Available: raw.md5_available,
     tls: toTlsState(raw.tls),
+    sessionPassword: raw.session_password === true,
   };
 }
 
@@ -1008,10 +1009,24 @@ export function createTauriEngine(): Engine {
       return translateResults(raw);
     },
 
-    exportReport(): Promise<ReportResult> {
-      // Report export lands with T024; until then it is a typed NOT_AVAILABLE,
-      // never a fabricated report or verdict.
-      return notAvailable();
+    async exportReport(request: ReportRequest): Promise<ReportResult> {
+      // The backend renders from its own copy of the run's results and opens
+      // the native save dialog itself: no results and no path cross the IPC.
+      try {
+        const raw = await invoke<RawExportReport>('export_report', {
+          input: {
+            run_id: request.runId,
+            format: request.format,
+            include_keys: request.includeKeys,
+          },
+        });
+        if (raw.status === 'cancelled') {
+          return { ok: false, cancelled: true };
+        }
+        return { ok: true, filePath: raw.path };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
     },
     async getVersion(): Promise<string> {
       return invoke<string>('get_version');

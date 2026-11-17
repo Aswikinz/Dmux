@@ -11,6 +11,10 @@ import type { Engine } from '../api/engine';
 import type { ConnectionProfile, EncryptionMode, ServerInfo } from '../api/contract';
 import { CheckCircle, Database, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
 
+/** Shown when the backend keeps the password for this session only (no keychain). */
+export const SESSION_PASSWORD_NOTICE =
+  'No system keychain: Dmux will keep this password in memory until you close the app.';
+
 interface ConnectScreenProps {
   engine: Engine;
   oldProfile: ConnectionProfile;
@@ -246,6 +250,11 @@ function ServerInfoCard({ info }: { info: ServerInfo }) {
         </div>
       )}
       {info.warning && <p className="text-amber-800 dark:text-amber-200">{info.warning}</p>}
+      {info.sessionPassword && (
+        <p className="text-slate-700 dark:text-slate-300" data-testid="session-password-notice">
+          {SESSION_PASSWORD_NOTICE}
+        </p>
+      )}
     </div>
   );
 }

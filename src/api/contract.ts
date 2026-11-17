@@ -44,6 +44,9 @@ export interface ServerInfo {
   tls: TlsState;
   /** Free-form warning text for the user, e.g. superuser refusal. */
   warning?: string;
+  /** True when the machine has no system keychain and Dmux keeps this
+   *  password in memory until the app closes.  The UI never holds it. */
+  sessionPassword?: boolean;
 }
 
 export interface ConnectionTestResult {
@@ -247,18 +250,20 @@ export interface Results {
 export type ReportFormat = 'pdf' | 'excel';
 
 export interface ReportRequest {
+  /** The finished run to report on.  The backend renders from its own copy of
+   *  that run's results; the UI never sends results or a destination path. */
+  runId: string;
   format: ReportFormat;
   /** Include row keys in the exported report (off by default). */
   includeKeys: boolean;
-  /** Destination chosen by the user (Tauri dialog, T024/T040). Optional until
-   *  the picker exists: no temp-path default is used, and the engine is free to
-   *  choose a safe, user-triggered location. */
-  filePath?: string;
 }
 
 export interface ReportResult {
   ok: boolean;
+  /** Where the report was saved (chosen in the native save dialog). */
   filePath?: string;
+  /** The user dismissed the save dialog; nothing was written. */
+  cancelled?: boolean;
   error?: string;
 }
 
