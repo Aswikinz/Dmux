@@ -54,6 +54,10 @@ impl Store {
                  tls_fingerprint   TEXT,
                  plaintext_reason  TEXT,
                  ca_file           TEXT
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key    TEXT PRIMARY KEY,
+                 value  TEXT NOT NULL
              );",
         )?;
         // Migration: a profiles table created before `ca_file` existed lacks the
@@ -141,6 +145,38 @@ impl Store {
     }
 
     /// Delete a profile.  Returns whether one was removed.
+    /// One app setting (a plain text value), if set.  Settings never hold a
+    /// password or a connection detail.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, CommandError> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Set (or, with `None`, clear) one app setting.
+    pub fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), CommandError> {
+        match value {
+            Some(v) => {
+                self.conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, v],
+                )?;
+            }
+            None => {
+                self.conn
+                    .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: &str) -> Result<bool, CommandError> {
         let n = self
             .conn
@@ -299,6 +335,48 @@ mod tests {
         assert!(
             !present,
             "the profile store must never contain a password in its bytes"
+        );
+    }
+
+    #[test]
+    fn settings_round_trip_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        assert_eq!(store.get_setting("hooks_enabled").unwrap(), None);
+        store.set_setting("hooks_enabled", Some("true")).unwrap();
+        store.set_setting("hooks_enabled", Some("false")).unwrap();
+        assert_eq!(
+            store.get_setting("hooks_enabled").unwrap().as_deref(),
+            Some("false")
+        );
+        store.set_setting("hooks_enabled", None).unwrap();
+        assert_eq!(store.get_setting("hooks_enabled").unwrap(), None);
+    }
+
+    #[test]
+    fn an_older_store_without_settings_still_opens_and_keeps_its_profiles() {
+        // A store written before the settings table (and before ca_file) existed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE profiles (
+                     id TEXT PRIMARY KEY, label TEXT NOT NULL, host TEXT NOT NULL,
+                     port INTEGER NOT NULL, database TEXT NOT NULL, user TEXT NOT NULL,
+                     encryption TEXT NOT NULL, tls_fingerprint TEXT, plaintext_reason TEXT
+                 );
+                 INSERT INTO profiles VALUES ('old','Old','h',5432,'d','u','verify',NULL,NULL);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get("old").unwrap().unwrap().host, "h");
+        assert_eq!(store.get_setting("hooks_folder").unwrap(), None);
+        store.set_setting("hooks_folder", Some("/x")).unwrap();
+        assert_eq!(
+            store.get_setting("hooks_folder").unwrap().as_deref(),
+            Some("/x")
         );
     }
 }

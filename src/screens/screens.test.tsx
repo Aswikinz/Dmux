@@ -691,6 +691,7 @@ describe('RunScreen', () => {
     };
     let state: RunProgress = { ...runningProgress };
     const engine: Engine = {
+      ...createMockEngine(),
       setSuperuserOverride: () => {},
       testConnection: async () => ({ ok: true }),
       saveProfile: async (profile) => ({ profile }),

@@ -34,6 +34,7 @@ use dmux_engine::run::{RunConfig, RunControl, RunError};
 use tauri::async_runtime::JoinHandle;
 
 use crate::error::{from_run_error, CommandError};
+use crate::hooks::{HookPlan, HookRun};
 
 /// The lifecycle state the UI reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,10 @@ pub struct RunHandle {
     resuming: bool,
     /// Set only by `finish` while `Running`: the engine's results or its error.
     outcome: Option<Result<RunResults, CommandError>>,
+    /// Custom checks captured when the run started (`None`: they are off).
+    hook_plan: Option<HookPlan>,
+    /// The custom checks' outcome for the current attempt.
+    hook_run: Option<HookRun>,
 }
 
 impl RunHandle {
@@ -91,6 +96,8 @@ impl RunHandle {
             task: None,
             resuming: false,
             outcome: None,
+            hook_plan: None,
+            hook_run: None,
         }
     }
 }
@@ -163,6 +170,8 @@ impl RunManager {
 
     fn next_attempt(h: &mut RunHandle) -> DriveTicket {
         h.generation += 1;
+        // A new attempt starts without the previous attempt's custom checks.
+        h.hook_run = None;
         h.control = Arc::new(RunControl::new());
         let mut config = h.config.clone();
         config.control = Some(Arc::clone(&h.control));
@@ -317,6 +326,49 @@ impl RunManager {
             }),
             _ => Err(CommandError::ResultsNotAvailable {
                 message: "the run has not finished; results are not available yet".to_string(),
+            }),
+        }
+    }
+
+    /// Remember the custom checks this run must run when it finishes.
+    pub fn set_hook_plan(&self, id: &str, plan: Option<HookPlan>) {
+        if let Some(h) = self.lock().get_mut(id) {
+            h.hook_plan = plan;
+        }
+    }
+
+    /// The custom checks to run for the run's current attempt.
+    pub fn hook_plan(&self, id: &str) -> Option<HookPlan> {
+        self.lock().get(id).and_then(|h| h.hook_plan.clone())
+    }
+
+    /// Record the custom checks' outcome.  Applied only for the current
+    /// attempt while the run is still `Running`, like [`RunManager::finish`].
+    pub fn set_hook_run(&self, id: &str, generation: u64, run: HookRun) {
+        let mut runs = self.lock();
+        if let Some(h) = runs.get_mut(id) {
+            if h.generation == generation && h.phase == RunPhase::Running {
+                h.hook_run = Some(run);
+            }
+        }
+    }
+
+    /// The custom checks' outcome for a finished run: `Ok(None)` when custom
+    /// checks were off for it.  A run that should have custom checks but has
+    /// none recorded is refused, never shown as clean.
+    pub fn hook_run(&self, id: &str) -> Result<Option<HookRun>, CommandError> {
+        let runs = self.lock();
+        let Some(h) = runs.get(id) else {
+            return Err(CommandError::RunNotFound {
+                run_id: id.to_string(),
+            });
+        };
+        match (&h.hook_plan, &h.hook_run) {
+            (None, _) => Ok(None),
+            (Some(_), Some(run)) => Ok(Some(run.clone())),
+            (Some(_), None) => Err(CommandError::ResultsNotAvailable {
+                message: "the custom checks have not finished; results are not available yet"
+                    .to_string(),
             }),
         }
     }

@@ -22,6 +22,8 @@ pub struct AppState {
     pub runs: Arc<RunManager>,
     /// The app data directory (home of the profile and resume stores).
     pub data_dir: PathBuf,
+    /// A Python shipped next to the app (its `python/` resource folder), if any.
+    pub bundled_python: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             store: Mutex::new(store),
             runs: Arc::new(RunManager::default()),
             data_dir,
+            bundled_python: Mutex::new(None),
         })
     }
 
@@ -69,6 +72,21 @@ impl AppState {
 
     /// Drop every session password (called when the app exits).  A poisoned
     /// lock is recovered so the secrets are still zeroed.
+    /// The bundled interpreter, if the app ships one.
+    pub fn bundled_python(&self) -> Option<PathBuf> {
+        self.bundled_python
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_bundled_python(&self, path: Option<PathBuf>) {
+        *self
+            .bundled_python
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+    }
+
     pub fn clear_session_passwords(&self) {
         match self.session_passwords.lock() {
             Ok(mut g) => g.clear(),

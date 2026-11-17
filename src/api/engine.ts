@@ -1,4 +1,6 @@
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   CheckPlan,
   ConnectionProfile,
   ConnectionTestResult,
@@ -82,6 +84,24 @@ export interface Engine {
 
   /** Export a report to the chosen path. */
   exportReport(request: ReportRequest): Promise<ReportResult>;
+
+  /** The app settings (custom checks, scripts folder, Python, time limit). */
+  getSettings(): Promise<AppSettings>;
+
+  /** Change custom checks on/off or the time limit.  Never takes a path. */
+  updateSettings(update: AppSettingsUpdate): Promise<AppSettings>;
+
+  /** Open the native folder dialog (from the backend) to choose the scripts
+   *  folder.  A dismissed dialog changes nothing. */
+  chooseHooksFolder(): Promise<AppSettings>;
+
+  clearHooksFolder(): Promise<AppSettings>;
+
+  /** Open the native file dialog (from the backend) to choose the Python. */
+  choosePython(): Promise<AppSettings>;
+
+  /** Back to the bundled or automatically found Python. */
+  clearPython(): Promise<AppSettings>;
 
   /** Get the engine version string for the run log. */
   getVersion(): Promise<string>;

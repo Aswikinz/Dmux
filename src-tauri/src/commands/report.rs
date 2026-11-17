@@ -75,10 +75,16 @@ pub(crate) fn verified_layout(
     state: &AppState,
 ) -> Result<(Layout, String), CommandError> {
     let results = state.runs.results(run_id)?;
-    let verification =
-        dmux_report::verify::verify_results(&results).map_err(|e| CommandError::Report {
-            message: format!("the run's results cannot be reported: {e}"),
-        })?;
+    // When custom checks ran, render from their envelope (the results plus the
+    // findings and the script hashes), verified like `dmux report` verifies a
+    // file written by `dmux run --hooks`.
+    let verified = match state.runs.hook_run(run_id)? {
+        Some(hooks) => dmux_report::verify::verify_value(&hooks.envelope),
+        None => dmux_report::verify::verify_results(&results),
+    };
+    let verification = verified.map_err(|e| CommandError::Report {
+        message: format!("the run's results cannot be reported: {e}"),
+    })?;
     let layout = dmux_report::build_layout(&verification, &ReportOptions { include_keys });
     Ok((layout, verification.sha256))
 }
@@ -296,6 +302,100 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{format:?}");
         }
+    }
+
+    /// A run whose custom checks (a failing finding) were recorded, as the
+    /// drive task does it: plan, then outcome for the current attempt, then
+    /// finish.
+    fn finished_with_hooks(state: &AppState, results: RunResults) -> String {
+        use crate::hooks::{run_custom_checks, HookPlan};
+        use dmux_hooks::{Finding, HookResult, Severity};
+        let id = RunManager::fresh_id();
+        state.runs.insert(&id, RunHandle::new(config(), None));
+        state.runs.set_hook_plan(
+            &id,
+            Some(HookPlan {
+                folder: None,
+                interpreter: None,
+                timeout: std::time::Duration::from_secs(1),
+            }),
+        );
+        let ticket = state.runs.begin_first(&id).expect("ticket");
+        // Build the envelope from a known finding (no Python needed here).
+        let mut run = run_custom_checks(state.runs.hook_plan(&id).as_ref().unwrap(), &results);
+        let hook = HookResult {
+            script_hash: "f".repeat(64),
+            findings: vec![Finding {
+                id: "balance-sum".into(),
+                severity: Severity::Fail,
+                table: Some("demo_bank.accounts".into()),
+                message: "totals differ by 12".into(),
+            }],
+            warnings: vec![],
+        };
+        let mut folded = results.clone();
+        folded.verdict = Verdict::Fail;
+        folded.results_sha256 = dmux_engine::results::sha256_of(&folded);
+        let envelope = dmux_hooks::build_envelope(
+            &serde_json::to_value(&folded).unwrap(),
+            &[("balance.py".to_string(), &hook)],
+        );
+        let v = dmux_report::verify::verify_value(&envelope).unwrap();
+        run.results = v.results;
+        run.evidence = v.hooks.unwrap();
+        run.envelope = envelope;
+        state.runs.set_hook_run(&id, ticket.generation, run);
+        state.runs.finish(&id, ticket.generation, Ok(results));
+        id
+    }
+
+    #[test]
+    fn the_report_includes_the_custom_check_evidence_and_never_shows_pass() {
+        let s = state();
+        let id = finished_with_hooks(&s, results(Verdict::Pass));
+        let (layout, digest) = verified_layout(&id, false, &s).expect("layout");
+        assert_eq!(layout.verdict_word, "FAIL");
+        assert_eq!(layout.custom_checks.len(), 1);
+        assert_eq!(layout.custom_checks[0].id, "balance-sum");
+        assert_eq!(layout.hook_scripts.len(), 1);
+        assert_eq!(layout.hook_scripts[0].sha256, "f".repeat(64));
+        // The digest on the report is the envelope's, covering the evidence.
+        let env = s.runs.hook_run(&id).unwrap().unwrap().envelope;
+        assert_eq!(digest, env["envelope_sha256"].as_str().unwrap());
+        // And it renders to a file.
+        let path = tmp("hooks.pdf");
+        render_report(&id, ReportFormat::Pdf, false, &s, &path).expect("render");
+        assert!(path.metadata().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn a_run_without_custom_checks_reports_as_before() {
+        let s = state();
+        let id = finished(&s, Ok(results(Verdict::Pass)));
+        let (layout, _) = verified_layout(&id, false, &s).unwrap();
+        assert!(layout.custom_checks.is_empty());
+        assert_eq!(layout.verdict_word, "PASS");
+    }
+
+    #[test]
+    fn a_run_that_should_have_custom_checks_but_has_none_is_not_reported() {
+        let s = state();
+        let id = RunManager::fresh_id();
+        s.runs.insert(&id, RunHandle::new(config(), None));
+        s.runs.set_hook_plan(
+            &id,
+            Some(crate::hooks::HookPlan {
+                folder: None,
+                interpreter: None,
+                timeout: std::time::Duration::from_secs(1),
+            }),
+        );
+        let t = s.runs.begin_first(&id).unwrap();
+        s.runs.finish(&id, t.generation, Ok(results(Verdict::Pass)));
+        assert!(matches!(
+            verified_layout(&id, false, &s),
+            Err(CommandError::ResultsNotAvailable { .. })
+        ));
     }
 
     #[test]

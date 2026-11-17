@@ -3,6 +3,8 @@
 
 mod commands;
 mod error;
+mod hooks;
+mod prefs;
 mod run_manager;
 mod secrets;
 mod state;
@@ -48,10 +50,23 @@ fn main() {
             commands::data::cancel_run,
             commands::data::get_results,
             commands::report::export_report,
+            commands::settings::get_settings,
+            commands::settings::update_settings,
+            commands::settings::choose_hooks_folder,
+            commands::settings::clear_hooks_folder,
+            commands::settings::choose_python,
+            commands::settings::clear_python,
         ])
         .setup(|app| {
             let data_dir = state::app_data_dir(app.handle());
             let app_state = state::AppState::new(data_dir)?;
+            // A Python shipped with the app (the Windows build), if present.
+            app_state.set_bundled_python(
+                app.path()
+                    .resource_dir()
+                    .ok()
+                    .and_then(|dir| hooks::bundled_interpreter(&dir)),
+            );
             app.manage(app_state);
             Ok(())
         })

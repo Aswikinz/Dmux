@@ -1230,6 +1230,7 @@ name = "dmux-app"
 version = "1.0.0"
 dependencies = [
  "dmux-engine",
+ "dmux-hooks",
  "dmux-report",
  "hex",
  "keyring",

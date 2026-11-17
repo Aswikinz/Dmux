@@ -15,6 +15,8 @@ interface StepSidebarProps {
   current: Step;
   completed: Set<Step>;
   onSelect: (step: Step) => void;
+  /** True while another screen (Settings) is showing: no step is current. */
+  suspended?: boolean;
 }
 
 const allSteps: Step[] = [
@@ -28,13 +30,13 @@ const allSteps: Step[] = [
 ];
 
 /** The step list, styled like a macOS source list. */
-export function StepSidebar({ steps, current, completed, onSelect }: StepSidebarProps) {
+export function StepSidebar({ steps, current, completed, onSelect, suspended }: StepSidebarProps) {
   return (
     <nav aria-label="Progress">
       <ol className="space-y-0.5">
         {steps.map(({ id, label }) => {
           const index = allSteps.indexOf(id);
-          const isCurrent = id === current;
+          const isCurrent = id === current && !suspended;
           const isDone = completed.has(id);
           return (
             <li key={id}>
