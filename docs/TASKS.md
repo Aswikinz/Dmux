@@ -57,6 +57,7 @@ Status: todo, doing, review, done, blocked.
 | T031 | `demo_bank` large size (1M accounts, 20M transactions) as database demo_bank_large + full-size option; estimate-accuracy harness hook for nightly. | nina (deepseek-v4.1-flash) | done | T016 |
 | T032 | Private generator (private/ only, never Git): build the full private schema (all parsed tables, a few rows each) from the private dictionary file as database private_bank on the mocks, type-mapped per PLAN 8.1. | nina (deepseek-v4.1-flash) | done | T015 |
 | T033 | Docs part 1 (no T022 dependency): "How Dmux decides" (plain-language method, md5 threat model, NeedsReview, stop rule, what PASS does not prove), DBA setup guide (dmux_reader login, read-only, freeze window, replica advice), user-guide skeleton for the 7 screens. | ella (deepseek-v4.1-flash) | done | |
+| T034 | v0.1.0 release: version bump, pre-release flag for v0.*; published https://github.com/Aswikinz/Dmux/releases/tag/v0.1.0 (12 assets). | kenji | done | T020 |
 
 ## Phase 1: foundation
 
