@@ -97,7 +97,21 @@ jobs:
       - name: Bundle Linux installers (deb, rpm, AppImage)
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: pnpm tauri build --bundles deb,rpm,appimage
+        # linuxdeploy is downloaded from GitHub at bundle time and has flaked
+        # once with an http 504. Retry up to 3 times with backoff: this is a
+        # network retry, not a loosened gate — the build must still succeed.
+        run: |
+          set -euo pipefail
+          attempt=0
+          until pnpm tauri build --bundles deb,rpm,appimage; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::pnpm tauri build failed $attempt times (linuxdeploy download flake)"
+              exit 1
+            fi
+            echo "::warning::pnpm tauri build attempt $attempt failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
 
       # Static CLI for jump servers (PLAN.md section 9). dmux-cli is a
       # zero-dependency std crate, so rustup's self-contained musl target

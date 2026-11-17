@@ -1,0 +1,213 @@
+name: Nightly
+
+# Cross-version identity, harness exit-semantics regression, a small perf run,
+# and live-DB unit tests on the extreme versions. Each step runs one script and
+# reads its OWN exit code directly — no pipe or `|| true` swallows a failure.
+on:
+  schedule:
+    - cron: '0 3 * * *' # daily 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-version:
+    name: prove (${{ matrix.old }} -> ${{ matrix.new }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        old: ['9.4', '9.6']
+        new: ['12', '15', '17', '18']
+    services:
+      # Old side: LATIN1 / C locale, the deliberate encoding+sort difference.
+      old:
+        image: postgres:${{ matrix.old }}
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+          POSTGRES_INITDB_ARGS: '--encoding=LATIN1 --locale=C'
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      new:
+        image: postgres:${{ matrix.new }}
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # psql 14 (apt on ubuntu-22.04) speaks protocol v3.0, so it connects to
+      # every Postgres from 7.4 up — including 9.4. No PGDG repo needed.
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Wait for Postgres service containers
+        run: |
+          for port in 5433 5434; do
+            for _ in $(seq 1 30); do
+              pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank && break
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
+          done
+
+      - name: prove.sh (cross-version identity, own exit code)
+        run: bash testdata/phase0/prove.sh 5433 5434
+
+  harness-regression:
+    name: exit_test + perf (9.6 -> 17)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    services:
+      old:
+        image: postgres:9.6
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+          POSTGRES_INITDB_ARGS: '--encoding=LATIN1 --locale=C'
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      new:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Wait for Postgres service containers
+        run: |
+          for port in 5433 5434; do
+            for _ in $(seq 1 30); do
+              pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank && break
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
+          done
+
+      # T011 regression: a sabotaged prove.sh copy must exit non-zero. Its own
+      # exit code gates this step.
+      - name: exit_test.sh (exit-semantics regression, own exit code)
+        run: bash testdata/phase0/exit_test.sh 5433 5434
+
+      # Small perf run: 100k and 200k rows (the full 1M/20M set is for a release
+      # gate, not a nightly). Own exit code gates this step.
+      - name: perf.sh (100000 / 200000 rows, own exit code)
+        env:
+          PERF_SIZES: '100000 200000'
+        run: bash testdata/phase0/perf.sh 5433 5434
+
+  live-db-tests:
+    name: cargo test live DBs (9.4 -> 18)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      old:
+        image: postgres:9.4
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+          POSTGRES_INITDB_ARGS: '--encoding=LATIN1 --locale=C'
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      new:
+        image: postgres:18
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DMUX_TEST_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/bank
+      DMUX_TEST_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/bank
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The workspace includes the Tauri app, so even unit tests need WebKitGTK.
+      - name: Install Tauri 2 Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev postgresql-client
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        id: rust
+        with:
+          toolchain: 1.100.0
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/release/bundle
+          key: cargo-nightly-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-nightly-${{ runner.os }}-${{ steps.rust.outputs.cachekey }}-
+
+      - name: Wait for Postgres service containers
+        run: |
+          for port in 5433 5434; do
+            for _ in $(seq 1 30); do
+              pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank && break
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
+          done
+
+      # The comparison core's live-DB tests connect to DMUX_TEST_OLD_URL/NEW_URL
+      # and cross-check the extreme versions (9.4 vs 18).
+      - name: cargo test --workspace (live DBs, own exit code)
+        run: cargo test --workspace

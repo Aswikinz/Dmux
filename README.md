@@ -5,6 +5,7 @@
 # Dmux
 
 [![CI](https://github.com/Aswikinz/Dmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Aswikinz/Dmux/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Aswikinz/Dmux/actions/workflows/codeql.yml/badge.svg)](https://github.com/Aswikinz/Dmux/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Aswikinz/Dmux/branch/main/graph/badge.svg)](https://codecov.io/gh/Aswikinz/Dmux)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Aswikinz_Dmux&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Aswikinz_Dmux)
 
