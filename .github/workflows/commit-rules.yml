@@ -2,6 +2,7 @@ name: Commit rules
 
 on:
   pull_request:
+  push:
 
 permissions:
   contents: read
@@ -13,12 +14,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # the PR range needs full history
+          fetch-depth: 0 # the PR/push range needs full history
 
-      - name: No co-author lines in the PR range
+      # Runs on both PRs and pushes. On a push the range is
+      # github.event.before..github.sha; when `before` is all zeros (a first
+      # push of a new branch/tag) there is no `before` ancestor, so the commits
+      # reachable from HEAD but not on main are checked. The identity check
+      # skips merge commits inside check-commits.sh.
+      - name: No co-author lines, owner identity on every non-merge commit
         env:
+          EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
-        run: bash scripts/check-commits.sh "origin/$BASE_REF..HEAD"
+          BEFORE: ${{ github.event.before }}
+          OWNER_EMAIL: devgru-azki@pm.me
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/$BASE_REF..HEAD"
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="origin/main..HEAD"
+          else
+            RANGE="$BEFORE..$GITHUB_SHA"
+          fi
+          bash scripts/check-commits.sh "$RANGE"
 
       # Decision 11: patterns live only in the secret, never in public code.
       # The script fails closed when the secret is missing.

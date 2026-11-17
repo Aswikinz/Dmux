@@ -1,0 +1,72 @@
+# Dmux dependency policy (cargo-deny).
+#
+# The license allow-list below is built from the ACTUAL dependency tree
+# (`cargo deny list`), not guessed. It is permissive-only: OSI-approved
+# permissive licences plus MPL-2.0 (weak, file-level copyleft) and the Unicode
+# data licence. No wildcards. A licence not listed in `allow` is denied by
+# default, so a new dependency with an unapproved licence is surfaced loudly at
+# review time.
+#
+# One deliberate, scoped exception: r-efi (UEFI bindings, a build-only transitive
+# dependency of the Windows resource-embedding toolchain, LGPL-2.1-or-later).
+# It is not linked into a shipped Dmux binary; it is allowed for that crate only,
+# not globally. Flagged for review: if a shipped component ever gains a strong
+# copyleft dependency, that is a licensing decision for Maya, not a CI tweak.
+#
+# Run locally with:  cargo deny check licenses advisories bans sources
+
+[advisories]
+# A vulnerability in any dependency, or a yanked version, fails the build.
+# unsound/unmaintained also fail (not just warn): this matches `cargo audit
+# --deny warnings` and is why cargo-deny's advisory check replaces cargo-audit
+# here (same RustSec database, plus licenses/bans/sources — no duplication).
+yanked = "deny"
+unsound = "all"
+unmaintained = "all"
+ignore = [
+    # RUSTSEC-2024-0370 is "unmaintained", NOT a vulnerability: proc-macro-error
+    # is a transitive proc-macro helper (via darling/derive_more/ref-cast in the
+    # Tauri tree) with no known flaw and no successor. Removing it needs upstream
+    # changes outside this repo. Real vulnerabilities still fail the build.
+    { id = "RUSTSEC-2024-0370", reason = "unmaintained transitive proc-macro helper, no known vulnerability, no successor" },
+    # RUSTSEC-2024-0429 is "unsound", NOT an exploitable vulnerability: a soundness
+    # gap in glib::VariantStrIter's Iterator impls (gtk-rs). glib here is transitive
+    # via webkit2gtk/gtk (the Tauri Linux stack); the fix is glib >= 0.20, gated by
+    # the GTK-rs/Tauri release train, not by this repo. Flagged for a dependency bump.
+    { id = "RUSTSEC-2024-0429", reason = "transitive gtk-rs unsoundness, fix gated by upstream Tauri/gtk-rs, not exercised by Dmux" },
+]
+
+[bans]
+# Duplicate versions are common in a deep Tauri tree; warn, do not fail.
+multiple-versions = "warn"
+# No wildcard version requirements are allowed anywhere.
+wildcards = "deny"
+
+[sources]
+# Everything must come from the crates.io registry. No git or unknown sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+
+[licenses]
+# Any licence not listed in `allow` is denied (cargo-deny >= 0.20 removed the
+# old `default`/`unlicensed`/`copyleft` keys; deny-not-allowed is the default).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Scoped exception: r-efi is LGPL-2.1-or-later (see the header note above).
+[[licenses.exceptions]]
+name = "r-efi"
+version = "*"
+allow = ["LGPL-2.1-or-later"]

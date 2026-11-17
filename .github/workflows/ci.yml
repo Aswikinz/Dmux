@@ -14,7 +14,52 @@ jobs:
   checks:
     name: Checks (Ubuntu 22.04)
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # Raised from 30m: the job now builds demo_bank, runs live-DB engine tests
+    # (cargo test + llvm-cov against service containers), and the dependency and
+    # secret gates below — on top of the full Tauri workspace build.
+    timeout-minutes: 45
+    # The comparison core's live DB tests (T019) connect to a real old/new
+    # Postgres pair. Service containers stand in for the throwaway Podman mocks
+    # (testdata/compose.yml): old = 9.6 LATIN1/C, new = 17 UTF-8. Credentials
+    # are the public mock password (these containers are ephemeral and read
+    # from, never loaded with real data). Images pinned by tag; digest pinning
+    # is a Phase 1 follow-up (carry-forward from the T008 gate).
+    services:
+      old:
+        image: postgres:9.6
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+          POSTGRES_INITDB_ARGS: '--encoding=LATIN1 --locale=C'
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      new:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dmux_dev
+          POSTGRES_PASSWORD: dmux_dev_only
+          POSTGRES_DB: bank
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U dmux_dev -d bank"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DMUX_TEST_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/bank
+      DMUX_TEST_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/bank
+      # The demo_bank fixture (built below) for engine integration tests that run
+      # against real tables rather than the empty `bank` database. T021 must
+      # merge after T015/T016, which add testdata/demo_bank/ to main.
+      DMUX_TEST_DEMO_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/demo_bank
+      DMUX_TEST_DEMO_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/demo_bank
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,7 +76,7 @@ jobs:
         id: rust
         with:
           toolchain: 1.100.0 # also pinned in rust-toolchain.toml
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview # llvm-tools: cargo-llvm-cov
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -52,8 +97,47 @@ jobs:
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # demo_bank fixture: the engine's integration tests (T019 core cross-check)
+      # run against real tables, not the empty `bank` database. psql 14 from the
+      # runner's apt repo is protocol-v3.0 compatible with both 9.6 and 17, and
+      # pg_dump/pg_restore 14 handle the 9.6 -> 17 copy (build.sh uses -Fc dump).
+      - name: Install PostgreSQL client (psql, pg_dump, pg_restore)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      # GHA starts service containers alongside the job and does not reliably
+      # block on the health check (actions/runner#496), so wait here explicitly
+      # before anything connects. The health --retries 20 above bound startup.
+      - name: Wait for Postgres service containers
+        run: |
+          for port in 5433 5434; do
+            for _ in $(seq 1 30); do
+              pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank && break
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
+          done
+
+      # Build the demo_bank fixture (default --plant: the answer-key build).
+      # Unconditional: testdata/demo_bank/build.sh is on main (T015/T016).
+      - name: Build demo_bank fixture (old -> new)
+        run: bash testdata/demo_bank/build.sh 5433 5434
+
       - name: Rust tests
         run: cargo test --workspace
+
+      # Coverage tooling, pinned like every other action. cargo-llvm-cov needs
+      # the llvm-tools-preview component added to the toolchain above.
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # No --fail-under threshold yet: this is the Phase 0 skeleton. PLAN.md
+      # section 9's gates (85% overall, 95% for the comparison core) arrive
+      # with the real engine code and are added then, not loosened now.
+      - name: Rust coverage (LCOV)
+        run: cargo llvm-cov --workspace --lcov --output-path rust-lcov.info
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         # reads packageManager: pnpm@12.21.0 from package.json
@@ -72,11 +156,46 @@ jobs:
       - name: Typecheck the e2e suite
         run: pnpm exec tsc --noEmit -p e2e/tsconfig.json
 
-      - name: Frontend unit tests
-        run: pnpm test
+      - name: Frontend unit tests (with coverage)
+        # --coverage writes coverage/lcov.info (v8 provider, vite.config.ts).
+        # No thresholds yet: PLAN.md section 9's 80% frontend gate arrives
+        # with real UI code.
+        run: pnpm test --coverage
 
       - name: Frontend build
         run: pnpm build
+
+      # Fail-closed on purpose: a silent coverage-upload failure would let
+      # the badge and the Codecov/SonarCloud dashboards drift from reality,
+      # and coverage is a merge gate once the engine code lands (PLAN.md
+      # section 9). Better a red CI than a green lie.
+      - name: Upload Rust coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: rust-lcov.info
+          disable_search: true
+          flags: rust
+          fail_ci_if_error: true
+
+      - name: Upload frontend coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/lcov.info
+          disable_search: true
+          flags: frontend
+          fail_ci_if_error: true
+
+      # The SonarCloud job below runs separately and needs these files.
+      - name: Upload coverage reports (for SonarCloud)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-reports
+          path: |
+            rust-lcov.info
+            coverage/lcov.info
+          if-no-files-found: error
 
       - name: Phase 0 guard battery (no database, 51 cases)
         run: bash testdata/phase0/guard_test.sh
@@ -89,11 +208,26 @@ jobs:
       - name: Final newlines (the T011 lesson)
         run: bash scripts/check-eof.sh
 
-      - name: Commit rules (PR range)
-        if: github.event_name == 'pull_request'
+      # Commit rules run on both PRs and pushes. On a push the range is
+      # github.event.before..github.sha; when `before` is all zeros (a first
+      # push of a new branch/tag) there is no `before` ancestor, so the commits
+      # reachable from HEAD but not on main are checked. The identity check
+      # (OWNER_EMAIL) skips merge commits inside check-commits.sh itself.
+      - name: Commit rules (PR or push range)
         env:
+          EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
-        run: bash scripts/check-commits.sh "origin/$BASE_REF..HEAD"
+          BEFORE: ${{ github.event.before }}
+          OWNER_EMAIL: devgru-azki@pm.me
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/$BASE_REF..HEAD"
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="origin/main..HEAD"
+          else
+            RANGE="$BEFORE..$GITHUB_SHA"
+          fi
+          bash scripts/check-commits.sh "$RANGE"
 
       - name: Protected files (answer key vs product code)
         if: github.event_name == 'pull_request'
@@ -107,6 +241,35 @@ jobs:
         env:
           DMUX_PRIVATE_PATTERNS: ${{ secrets.PRIVATE_NAME_PATTERNS }}
         run: bash scripts/check-public-clean.sh
+
+      # Dependency gates (PLAN.md section 9). cargo-deny covers licences, bans,
+      # sources AND advisories (same RustSec database as cargo-audit), so
+      # cargo-audit is deliberately not run again — no duplication.
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo-deny (licences, advisories, bans, sources)
+        run: cargo deny check licenses advisories bans sources --hide-inclusion-graph
+
+      # pnpm audit on production dependencies only, failing on high/critical.
+      # pnpm is already on PATH from pnpm/action-setup above.
+      - name: pnpm audit (production, high severity)
+        run: pnpm audit --prod --audit-level high
+
+      # Secret scan. The pinned binary + SHA-256 (not gitleaks-action, which
+      # needs a GITLEAKS_LICENSE for some accounts). Full history is present
+      # because checkout uses fetch-depth: 0.
+      - name: Secret scan (Gitleaks, pinned + checksum-verified)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          curl -fL --proto '=https' --tlsv1.2 "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks detect --no-banner --redact --exit-code 1 --source .
 
   build-linux:
     name: Build + smoke (Ubuntu 22.04)
@@ -151,7 +314,7 @@ jobs:
         run: pnpm build
 
       - name: Build the workspace (includes the Tauri app)
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Cache tauri-driver
         id: cache-tauri-driver
@@ -176,7 +339,21 @@ jobs:
           # lack. Extract-and-run avoids it; the bundler also passes
           # --appimage-extract-and-run to linuxdeploy itself (tauri#14241).
           APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: pnpm tauri build --bundles deb,rpm,appimage
+        # linuxdeploy is downloaded from GitHub at bundle time and has flaked
+        # once with an http 504. Retry up to 3 times with backoff: this is a
+        # network retry, not a loosened gate — the build must still succeed.
+        run: |
+          set -euo pipefail
+          attempt=0
+          until pnpm tauri build --bundles deb,rpm,appimage; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::pnpm tauri build failed $attempt times (linuxdeploy download flake)"
+              exit 1
+            fi
+            echo "::warning::pnpm tauri build attempt $attempt failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
 
       - name: Upload Linux installers
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -238,7 +415,7 @@ jobs:
         run: pnpm build
 
       - name: Build the workspace (includes the Tauri app)
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Cache tauri-driver
         id: cache-tauri-driver
@@ -319,3 +496,78 @@ jobs:
           winget install gerardog.gsudo --version 2.6.1 --accept-source-agreements --accept-package-agreements
           icacls "$env:GITHUB_WORKSPACE" /grant "Everyone:(OI)(CI)F"
           sudo --integrity Medium pnpm test:e2e
+
+  # SonarCloud scan (project Aswikinz_Dmux, organization "aswikinz" — verified
+  # via https://sonarcloud.io/api/organizations/search?organizations=aswikinz).
+  # A dedicated job, after checks: the scanner needs the coverage reports but
+  # not the build toolchains, and keeping it out of checks keeps the gate job
+  # fast. Both jobs run on ubuntu-22.04 with the same workspace path, so the
+  # absolute SF: paths in rust-lcov.info resolve against this checkout too.
+  #
+  # Coverage properties (SonarCloud docs, "Rust" and "JavaScript/TypeScript
+  # test coverage"): Rust LCOV goes through sonar.rust.lcov.reportPaths, JS/TS
+  # LCOV through sonar.javascript.lcov.reportPaths (the old
+  # sonar.typescript.lcov.reportPaths is deprecated). The generic
+  # sonar.coverageReportPaths is only for Sonar's generic coverage format.
+  # NOTE: coverage import requires CI-based analysis — automatic analysis must
+  # be OFF in the project's Administration > Analysis Method (Maya confirms).
+  #
+  # Scope (SonarCloud "new analysis scope UX", setting-analysis-scope docs):
+  # sonar.sources / sonar.tests / sonar.test.inclusions have no effect there —
+  # the whole project is analysed by default — so they are omitted. Scope is
+  # narrowed only via exclusions: sonar.exclusions (generated/build/lock files,
+  # the huge RESULTS.md, icons), sonar.coverage.exclusions (test code), and
+  # sonar.cpd.exclusions (testdata, which is deliberately repetitive fixtures).
+  #
+  # T030: **/*.sql is added to sonar.exclusions because Sonar has no PostgreSQL
+  # analyzer — it applies ORACLE PL/SQL rules to our Postgres test fixtures
+  # (57 false-positive BUGs). Engine SQL lives in Rust string literals and is
+  # still analysed. The workflows' public throwaway mock password (dmux_dev_only)
+  # is a real false-positive for secrets:S6698 — these service containers are
+  # ephemeral and read-only, never loaded with real data (AGENTS.md) — so it is
+  # suppressed by the multicriteria block below, scoped to .github/workflows/**.
+  sonar:
+    name: SonarCloud scan
+    needs: checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # SCM blame and new-code detection need full history
+
+      - name: Download coverage reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-reports
+
+      # Fail closed: without the token the scan cannot run, and a skipped
+      # scan would silently stop reporting issues. Maya confirms the secret
+      # exists before this merges (owner is adding SONAR_TOKEN).
+      - name: Require SONAR_TOKEN
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::SONAR_TOKEN secret is missing. Add it in the repo settings (SonarCloud project Aswikinz_Dmux, organization aswikinz) before merging."
+            exit 1
+          fi
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >-
+            -Dsonar.projectKey=Aswikinz_Dmux
+            -Dsonar.organization=aswikinz
+            -Dsonar.exclusions=**/target/**,**/node_modules/**,**/dist/**,**/gen/**,testdata/phase0/RESULTS.md,**/coverage/**,src-tauri/icons/**,**/*.lock,**/*.sql
+            -Dsonar.coverage.exclusions=**/*.test.ts,**/*.test.tsx,e2e/**,**/db_tests.rs
+            -Dsonar.cpd.exclusions=testdata/**
+            -Dsonar.issue.ignore.multicriteria=e1
+            -Dsonar.issue.ignore.multicriteria.e1.ruleKey=secrets:S6698
+            -Dsonar.issue.ignore.multicriteria.e1.resourceKey=.github/workflows/**
+            -Dsonar.rust.lcov.reportPaths=rust-lcov.info
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.sourceEncoding=UTF-8

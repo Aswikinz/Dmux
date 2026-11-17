@@ -8,12 +8,12 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 ID="${1:-}"; valid_id "$ID"; shift
-[ $# -gt 0 ] || die "usage: scripts/in-wt.sh <task ID> <command> [args...]"
-DIR="$(wt_dir "$ID")"; [ -d "$DIR" ] || die "no working copy for $ID (scripts/wt-new.sh creates one)"
+[[ $# -gt 0 ]] || die "usage: scripts/in-wt.sh <task ID> <command> [args...]"
+DIR="$(wt_dir "$ID")"; [[ -d "$DIR" ]] || die "no working copy for $ID (scripts/wt-new.sh creates one)"
 
 case "$1" in
   cargo|rustfmt|pnpm|npx|node|python3|uv|podman|psql|pg_dump|pg_restore|pg_isready|actionlint|gitleaks|shellcheck|ls|cat|bash)
-    if [ "$1" = bash ]; then
+    if [[ "$1" = bash ]]; then
       case "${2:-}" in testdata/*.sh|scripts/check-*.sh) ;;
         *) die "bash may only run scripts under testdata/ or scripts/check-*.sh" ;; esac
     fi ;;

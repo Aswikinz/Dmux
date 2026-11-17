@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Dmux pre-push guard (decision 11): refuse to push when any tracked file
+# name or content matches the private-name patterns — in the current tree AND
+# in every commit being pushed (a merge can carry an old tainted commit back).
+# Patterns come from the local Git config only (dmux.privateNamePattern).
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+RAW="$(git config dmux.privateNamePattern || true)"
+if [[ -z "$RAW" ]]; then
+  echo "push refused: git config dmux.privateNamePattern is not set (decision 11)" >&2
+  exit 1
+fi
+ALT="$(printf '%s' "$RAW" | tr ',' '|')"
+if ! (cd "$ROOT" && DMUX_PRIVATE_PATTERNS="$RAW" bash scripts/check-public-clean.sh >/dev/null); then
+  echo "push refused: a tracked file matches a private-name pattern; run scripts/check-public-clean.sh" >&2
+  exit 1
+fi
+ZERO="0000000000000000000000000000000000000000"
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ "$local_sha" == "$ZERO" ]] && continue
+  if [[ "$remote_sha" == "$ZERO" ]]; then
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    if git grep -q -I -i -E -e "$ALT" "$c" -- 2>/dev/null; then
+      echo "push refused: commit $(git log -1 --format=%h "$c") contains a private-name pattern" >&2
+      exit 1
+    fi
+    if git log -1 --format=%B "$c" | grep -q -i -E -e "$ALT"; then
+      echo "push refused: commit message of $(git log -1 --format=%h "$c") contains a private-name pattern" >&2
+      exit 1
+    fi
+  done < <(git rev-list "$range")
+done

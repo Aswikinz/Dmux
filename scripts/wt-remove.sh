@@ -7,7 +7,7 @@ set -euo pipefail
 
 ID="${1:-}"; valid_id "$ID"
 ROOT="$(main_root)"; DIR="$(wt_dir "$ID")"
-[ -d "$DIR" ] || die "no working copy for $ID"
+[[ -d "$DIR" ]] || die "no working copy for $ID"
 BRANCH="$(wt_branch "$ID")"
 git -C "$ROOT" worktree remove --force "$DIR"
 git -C "$ROOT" branch -q -D "$BRANCH"
