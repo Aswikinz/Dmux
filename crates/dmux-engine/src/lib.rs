@@ -4,6 +4,7 @@
 //! Phase 0 skeleton. The comparison core (`core/`: normalise, fingerprint,
 //! compare, drilldown) arrives in later phases; this crate deliberately
 //! contains no database code yet.
+pub mod db;
 
 /// The engine version, taken from the crate manifest at compile time.
 pub fn version() -> &'static str {
