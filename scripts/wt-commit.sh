@@ -7,8 +7,8 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 ID="${1:-}"; MSG="${2:-}"
-valid_id "$ID"; [ -n "$MSG" ] || die "give a commit message as the second argument"
-DIR="$(wt_dir "$ID")"; [ -d "$DIR" ] || die "no working copy for $ID"
+valid_id "$ID"; [[ -n "$MSG" ]] || die "give a commit message as the second argument"
+DIR="$(wt_dir "$ID")"; [[ -d "$DIR" ]] || die "no working copy for $ID"
 
 clean_git -C "$DIR" add -A
 if clean_git -C "$DIR" diff --cached --quiet; then

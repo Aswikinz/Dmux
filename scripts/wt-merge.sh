@@ -7,19 +7,19 @@ set -euo pipefail
 
 ID="${1:-}"; valid_id "$ID"
 ROOT="$(main_root)"; DIR="$(wt_dir "$ID")"
-[ -d "$DIR" ] || die "no working copy for $ID"
+[[ -d "$DIR" ]] || die "no working copy for $ID"
 BRANCH="$(wt_branch "$ID")"
 
-[ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" = main ] || die "the main checkout must be on branch 'main'"
-[ -z "$(git -C "$DIR" status --porcelain)" ] || die ".worktrees/$ID has uncommitted work: run scripts/wt-commit.sh $ID \"message\" first"
+[[ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" = main ]] || die "the main checkout must be on branch 'main'"
+[[ -z "$(git -C "$DIR" status --porcelain)" ]] || die ".worktrees/$ID has uncommitted work: run scripts/wt-commit.sh $ID \"message\" first"
 
 # The task board and decisions log are edited in the main checkout. Commit them
 # first so the merge starts from a clean main.
 "$(dirname "$0")/board-commit.sh" "before merging $ID" >/dev/null
-[ -z "$(git -C "$ROOT" status --porcelain)" ] || die "the main checkout has uncommitted changes other than the task board:
+[[ -z "$(git -C "$ROOT" status --porcelain)" ]] || die "the main checkout has uncommitted changes other than the task board:
 $(git -C "$ROOT" status --short)"
 
-if [ "$(git -C "$ROOT" rev-list --count "main..$BRANCH")" -eq 0 ]; then
+if [[ "$(git -C "$ROOT" rev-list --count "main..$BRANCH")" -eq 0 ]]; then
   die "$BRANCH has no commits to merge"
 fi
 

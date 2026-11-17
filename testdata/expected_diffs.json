@@ -1,0 +1,355 @@
+{
+  "version": 1,
+  "dataset": "demo_bank-small",
+  "must_report": [
+    {
+      "id": "m01",
+      "plan_ref": "8.2 row 1",
+      "object": "demo_bank.transactions",
+      "kind": "missing_rows",
+      "level": "counts",
+      "expected": {
+        "old_count": 20000,
+        "new_count": 19988,
+        "missing_count": 12,
+        "missing_keys": [137, 1902, 2988, 4221, 5450, 6777, 8012, 9334, 10601, 12345, 15118, 19888]
+      }
+    },
+    {
+      "id": "m02",
+      "plan_ref": "8.2 row 2",
+      "object": "demo_bank.audit_log",
+      "kind": "extra_rows",
+      "level": "counts",
+      "expected": {
+        "old_count": 10495,
+        "new_count": 10498,
+        "extra_count": 3,
+        "no_key": true,
+        "extra_rows": [
+          {
+            "event_at": "2024-01-01 01:00:00+00",
+            "actor": "teller2",
+            "action": "UPDATE",
+            "object_name": "accounts",
+            "detail": "detail 1"
+          },
+          {
+            "event_at": "2024-01-01 02:00:00+00",
+            "actor": "supervisor",
+            "action": "DELETE",
+            "object_name": "accounts",
+            "detail": "detail 2"
+          },
+          {
+            "event_at": "2024-01-01 03:00:00+00",
+            "actor": "batch",
+            "action": "LOGIN",
+            "object_name": "accounts",
+            "detail": "detail 3"
+          }
+        ]
+      }
+    },
+    {
+      "id": "m03",
+      "plan_ref": "8.2 row 3",
+      "object": "demo_bank.accounts.balance",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "column": "balance",
+        "key": {"account_id": 4999},
+        "old": "2085.9914",
+        "new": "2086.0014",
+        "difference": "0.0100",
+        "control_total": {
+          "column": "accounts.balance",
+          "old": "23004404.1414",
+          "new": "23004404.1514",
+          "difference": "0.0100"
+        }
+      }
+    },
+    {
+      "id": "m04",
+      "plan_ref": "8.2 row 4",
+      "object": "demo_bank.transactions.narration",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "column": "narration",
+        "key": {"transaction_id": 19997},
+        "old": "Payment 19997",
+        "new": "Paxment 19997",
+        "note": "small size stands in for the 20-million-row table; one character differs"
+      }
+    },
+    {
+      "id": "m05",
+      "plan_ref": "8.2 row 5",
+      "object": "demo_bank.transactions.narration",
+      "kind": "null_vs_empty",
+      "level": "full_values",
+      "expected": {
+        "column": "narration",
+        "key": {"transaction_id": 7},
+        "old": "",
+        "new": null,
+        "plain_words": "an empty text became NULL"
+      }
+    },
+    {
+      "id": "m06",
+      "plan_ref": "8.2 row 6",
+      "object": "demo_bank.transactions.value_timestamp",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "column": "value_timestamp",
+        "key": {"transaction_id": 20000},
+        "old": "2024-04-07 05:20:00",
+        "new": "2024-04-07 00:00:00"
+      }
+    },
+    {
+      "id": "m07",
+      "plan_ref": "8.2 row 7",
+      "object": "demo_bank.user_roles.granted_by",
+      "kind": "schema_missing",
+      "level": "structure",
+      "expected": {
+        "column": "granted_by",
+        "old": "present",
+        "old_type": "character varying(40)",
+        "new": "absent"
+      }
+    },
+    {
+      "id": "m08",
+      "plan_ref": "8.2 row 7",
+      "object": "demo_bank.loans.settlement_ref",
+      "kind": "schema_added",
+      "level": "structure",
+      "expected": {
+        "column": "settlement_ref",
+        "old": "absent",
+        "new": "present",
+        "new_type": "character varying(24)"
+      }
+    },
+    {
+      "id": "m09",
+      "plan_ref": "8.2 row 8",
+      "object": "demo_bank.limits",
+      "kind": "rename_suggested",
+      "level": "structure",
+      "expected": {
+        "old_name": "limits",
+        "new_name": "product_limits",
+        "rows": 120,
+        "suggested_match": "product_limits"
+      }
+    },
+    {
+      "id": "m10",
+      "plan_ref": "8.2 row 8",
+      "object": "demo_bank.fees.fee_name",
+      "kind": "rename_suggested",
+      "level": "structure",
+      "expected": {
+        "table": "fees",
+        "old_name": "fee_name",
+        "new_name": "fee_label",
+        "rows": 25,
+        "suggested_match": "fee_label"
+      }
+    },
+    {
+      "id": "m11",
+      "plan_ref": "8.2 row 9",
+      "object": "demo_bank.branches.city",
+      "kind": "schema_changed",
+      "level": "structure",
+      "expected": {
+        "column": "city",
+        "old_type": "character varying(60)",
+        "new_type": "character varying(120)",
+        "verdict": "amber",
+        "note": "same amber class as the plan's varchar(50) to varchar(100); values unchanged"
+      }
+    },
+    {
+      "id": "m12",
+      "plan_ref": "8.2 row 10",
+      "object": "demo_bank.seq_gl_entry",
+      "kind": "sequence_behind",
+      "level": "structure",
+      "expected": {
+        "sequence": "seq_gl_entry",
+        "old_last_value": 8000,
+        "new_last_value": 7975,
+        "old_next_value": 8001,
+        "new_next_value": 7976
+      }
+    },
+    {
+      "id": "m13",
+      "plan_ref": "8.2 row 11",
+      "object": "demo_bank.transactions",
+      "kind": "index_missing",
+      "level": "structure",
+      "expected": {
+        "index": "ix_transactions_posted",
+        "present_old": true,
+        "present_new": false
+      }
+    },
+    {
+      "id": "m14",
+      "plan_ref": "8.2 row 11",
+      "object": "demo_bank.transactions",
+      "kind": "constraint_not_validated",
+      "level": "structure",
+      "expected": {
+        "constraint": "ck_transactions_fee",
+        "constraint_type": "c",
+        "definition": "CHECK (fee_amount >= 0)",
+        "old_validated": true,
+        "new_validated": false
+      }
+    },
+    {
+      "id": "m15",
+      "plan_ref": "8.2 row 12",
+      "object": "demo_bank",
+      "kind": "large_object_missing",
+      "level": "structure",
+      "expected": {
+        "large_object_oid": 7654321,
+        "old_count": 1,
+        "new_count": 0,
+        "dangling_reference": "demo_bank.customer_documents.document_id=1"
+      }
+    }
+  ],
+  "must_stay_quiet": [
+    {
+      "id": "q01",
+      "plan_ref": "8.2 quiet row 1",
+      "object": "demo_bank.branches.branch_name",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "verdict": "PASS",
+        "reason": "LATIN1 vs UTF-8 storage of the same characters",
+        "old_encoding": "LATIN1",
+        "new_encoding": "UTF8",
+        "sample_key": {"branch_id": 5},
+        "sample_value": "Branch 5 ést",
+        "utf8_hex": "4272616e6368203520c3a97374"
+      }
+    },
+    {
+      "id": "q02",
+      "plan_ref": "8.2 quiet row 2",
+      "object": "demo_bank.branches.branch_name",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "verdict": "PASS",
+        "reason": "the servers sort text differently; order never matters",
+        "old_collate": "C",
+        "new_collate": "en_US.utf8",
+        "probe": ["z", "é"],
+        "old_order": ["z", "é"],
+        "new_order": ["é", "z"]
+      }
+    },
+    {
+      "id": "q03",
+      "plan_ref": "8.2 quiet row 3",
+      "object": "demo_bank.products.nominal_rate",
+      "kind": "changed_values",
+      "level": "full_values",
+      "expected": {
+        "verdict": "PASS",
+        "reason": "floats are hashed from their bytes, not their printed text",
+        "key": {"product_id": 1},
+        "old_default_extra_float_digits": 0,
+        "new_default_extra_float_digits": 1,
+        "canonical_extra_float_digits": 0,
+        "canonical_value": "0.0158",
+        "old_high_precision": "0.015799999",
+        "new_high_precision": "0.0158"
+      }
+    },
+    {
+      "id": "q04",
+      "plan_ref": "8.2 quiet row 4",
+      "object": "demo_bank.balances_daily",
+      "kind": "schema_changed",
+      "level": "structure",
+      "expected": {
+        "verdict": "PASS",
+        "reason": "one table converted to a partitioned table; must be shown as one table",
+        "old_relkind": "r",
+        "new_relkind": "p",
+        "new_partitions": ["balances_daily_p1", "balances_daily_p2", "balances_daily_p3"],
+        "rows": 15000,
+        "shown_as": "one table"
+      }
+    },
+    {
+      "id": "q05",
+      "plan_ref": "8.2 quiet row 5",
+      "object": "demo_bank.holidays",
+      "kind": "schema_changed",
+      "level": "structure",
+      "expected": {
+        "verdict": "PASS",
+        "reason": "columns in a different order; attnum order is not data",
+        "old_column_order": ["holiday_date", "country_code", "holiday_name", "is_half_day"],
+        "new_column_order": ["holiday_date", "country_code", "is_half_day", "holiday_name"],
+        "rows": 100
+      }
+    },
+    {
+      "id": "q06",
+      "plan_ref": "8.2 quiet row 6",
+      "object": "demo_bank.kyc_checks.result",
+      "kind": "schema_changed",
+      "level": "structure",
+      "expected": {
+        "verdict": "PASS",
+        "type_change": "amber",
+        "reason": "char(1) moved to varchar(1); a one-character char is not padded, so values match",
+        "column": "result",
+        "old_type": "character(1)",
+        "new_type": "character varying(1)",
+        "rows": 2500
+      }
+    }
+  ],
+  "runtime": [
+    {
+      "id": "r01",
+      "plan_ref": "8.2 row 13",
+      "object": "demo_bank.notes.note_text",
+      "kind": "changed_during_check",
+      "level": "full_values",
+      "expected": {
+        "verdict": "changed_during_check",
+        "never": "PASS",
+        "reason": "a row updated while the check runs must end as changed during check, never PASS",
+        "table": "demo_bank.notes",
+        "row": {"note_id": 1500},
+        "helper": "testdata/demo_bank/concurrent_update.sh",
+        "how": "testdata/demo_bank/concurrent_update.sh 60",
+        "start": "just after the engine has read the first table's counts",
+        "duration_seconds": 60,
+        "expected_report": "changed during check (amber), never PASS"
+      }
+    }
+  ]
+}
