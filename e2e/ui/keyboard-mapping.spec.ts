@@ -1,11 +1,13 @@
 import { test, expect } from '@playwright/test';
+import { fillProfiles } from './helpers';
 
 test('maps the needs-attention queue using only the keyboard', async ({ page }) => {
   await page.goto('/');
 
   // Point the old database at 'diff' so the mock returns a differing inventory,
-  // which produces a non-empty needs-attention queue.
-  await page.getByTestId('Old database-database').fill('diff');
+  // which produces a non-empty needs-attention queue.  The form no longer
+  // pre-fills values, so fill both sides explicitly.
+  await fillProfiles(page, { oldDatabase: 'diff' });
 
   const testButtons = page.getByRole('button', { name: 'Test connection' });
   await testButtons.nth(0).click();

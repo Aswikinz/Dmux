@@ -9,6 +9,7 @@ unavoidable, it is explained in one line.
 | [How Dmux decides](../how-dmux-decides.md) | Bank staff and auditors who read and sign the report | What a fingerprint is, why row order does not matter, what each verdict means, what a PASS does not prove, and the md5 limit. |
 | [Dmux for the database administrator](dba-setup.md) | The DBA on the old and new servers | The read-only login, why a superuser is refused, certificate trust, poolers, freeze window or replica advice, load, and how to watch or cancel a run. |
 | [Dmux user guide](user-guide.md) | The person running the comparison | Installing Dmux, then the seven screens step by step: Connect, Compare structure, Map, Choose checks, Run, Results, Report. |
+| [Verifying a Dmux download](verify-download.md) | Anyone who downloaded Dmux | How to check that an installer or CLI download really came from this project, using the checksums, the signature and the build provenance. |
 
 Related material, kept where the work happened:
 

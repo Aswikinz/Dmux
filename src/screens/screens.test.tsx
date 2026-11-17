@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
@@ -173,6 +173,109 @@ describe('ConnectScreen', () => {
     expect(input.value).toBe('');
     fireEvent.change(input, { target: { value: '/tmp/bank-ca.pem' } });
     expect(input.value).toBe('/tmp/bank-ca.pem');
+  });
+
+  it('starts with empty profiles (no pre-filled host, database or user)', () => {
+    expect(defaultOldProfile()).toMatchObject({
+      host: '',
+      database: '',
+      user: '',
+      port: 5432,
+    });
+    expect(defaultNewProfile()).toMatchObject({
+      host: '',
+      database: '',
+      user: '',
+      port: 5432,
+    });
+  });
+
+  it('shows a password input on each side', () => {
+    wrap(
+      <ConnectScreen
+        engine={createMockEngine()}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+    const oldPassword = screen.getByTestId('Old database-password') as HTMLInputElement;
+    const newPassword = screen.getByTestId('New database-password') as HTMLInputElement;
+    expect(oldPassword.type).toBe('password');
+    expect(newPassword.type).toBe('password');
+  });
+
+  it('sends the typed password to saveProfile exactly once and clears it', async () => {
+    const engine = createMockEngine();
+    const saveProfile = vi.spyOn(engine, 'saveProfile');
+    wrap(
+      <ConnectScreen
+        engine={engine}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+
+    const password = screen.getByTestId('Old database-password') as HTMLInputElement;
+    fireEvent.change(password, { target: { value: 'hunter2' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);
+
+    await waitFor(() => expect(saveProfile).toHaveBeenCalledTimes(1));
+    expect(saveProfile.mock.calls[0][1]).toBe('hunter2');
+    await waitFor(() => expect(password.value).toBe(''));
+    saveProfile.mockRestore();
+  });
+
+  it('clears the password after a failed save', async () => {
+    const engine = createMockEngine();
+    const saveProfile = vi.fn().mockRejectedValue(new Error('boom'));
+    wrap(
+      <ConnectScreen
+        engine={{ ...engine, saveProfile }}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+
+    const password = screen.getByTestId('Old database-password') as HTMLInputElement;
+    fireEvent.change(password, { target: { value: 'hunter2' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);
+
+    expect(await screen.findByText('boom')).toBeDefined();
+    await waitFor(() => expect(password.value).toBe(''));
+  });
+
+  it('never renders the password text after save, even on failure', async () => {
+    const engine = createMockEngine();
+    const saveProfile = vi.fn().mockRejectedValue(new Error('boom'));
+    wrap(
+      <ConnectScreen
+        engine={{ ...engine, saveProfile }}
+        oldProfile={defaultOldProfile()}
+        newProfile={defaultNewProfile()}
+        onChangeOld={() => {}}
+        onChangeNew={() => {}}
+        onNext={() => {}}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId('Old database-password'), {
+      target: { value: 'hunter2' },
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);
+
+    expect(await screen.findByText('boom')).toBeDefined();
+    // The password never appears in any rendered text or error message.
+    expect(screen.queryByText('hunter2')).toBeNull();
+    expect(screen.queryByText(/hunter2/)).toBeNull();
   });
 });
 
@@ -415,6 +518,8 @@ describe('RunScreen', () => {
     let state: RunProgress = { ...runningProgress };
     const engine: Engine = {
       testConnection: async () => ({ ok: true }),
+      saveProfile: async (profile) => ({ profile }),
+      profileHasPassword: async () => false,
       compareStructure: async () => ({ schemas: [], oldEncoding: 'UTF8', newEncoding: 'UTF8', oldCollation: 'C', newCollation: 'C' }),
       buildMapping: async () => ({ rules: [], matches: [], needsAttention: [], ignored: [] }),
       saveMapping: async () => ({ hash: 'h', json: '{}' }),

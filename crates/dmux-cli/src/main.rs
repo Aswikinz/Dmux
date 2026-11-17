@@ -18,11 +18,24 @@ use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{capture, compare_files, run, Input, RunConfig};
 use dmux_engine::schema_diff::{compare_inventories, DiffStatus};
 use dmux_hooks::{Finding, HookSpec, Severity};
+use dmux_report::verify::verify_results_file;
 
 /// PLAN.md 4.8 exit codes.
 const EXIT_PASS: u8 = 0;
 const EXIT_FAIL: u8 = 1;
 const EXIT_WARN: u8 = 2;
+
+/// Upper bound on an inventory JSON file `dmux diff` will read (audit L2).
+const MAX_INVENTORY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The honest hook warning (decision 23: hooks are not sandboxed in v1.0).
+const HOOK_WARNING: &str =
+    "warning: a check runs with your full permissions; only run scripts you trust";
+
+/// Print the one-time hook warning to stderr (plain text, once per invocation).
+fn warn_about_hooks() {
+    eprintln!("{HOOK_WARNING}");
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dmux")]
@@ -46,6 +59,8 @@ enum Command {
     Compare(CompareArgs),
     /// Run a saved verification definition (TOML or JSON).
     Run(RunArgs),
+    /// Render the PDF summary, Excel detail and run log from a results file.
+    Report(ReportArgs),
     /// Run Python hooks over a results JSON file and print their findings.
     Hook(HookArgs),
 }
@@ -71,21 +86,51 @@ struct ConnArgs {
     allow_superuser: bool,
 }
 
+/// A connection-configuration error that carries **no secret-derived data**: each
+/// variant names only a field or an error kind, and [`ConfigError::message`]
+/// renders a fixed string.  A caller that prints the message can therefore never
+/// leak a password or any other user-supplied value (CodeQL rust/cleartext-logging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigError {
+    /// `--password-env <VAR>` names an environment variable that is not set.
+    PasswordEnvUnset,
+    /// `--tls disable` without a `--reason`.
+    TlsDisableNeedsReason,
+    /// `--tls disable` with an empty `--reason`.
+    TlsReasonEmpty,
+    /// `--tls fingerprint:<hex>` with an empty hex value.
+    TlsFingerprintEmpty,
+    /// An unrecognised `--tls` value.
+    TlsUnknown,
+    /// `--allow-superuser` without a non-empty `--reason`.
+    SuperuserNeedsReason,
+}
+
+impl ConfigError {
+    fn message(self) -> &'static str {
+        match self {
+            ConfigError::PasswordEnvUnset => "password environment variable is not set",
+            ConfigError::TlsDisableNeedsReason => "--reason <text> is required for --tls disable",
+            ConfigError::TlsReasonEmpty => "--reason <text> may not be empty",
+            ConfigError::TlsFingerprintEmpty => "--tls fingerprint:<hex> is missing the hex value",
+            ConfigError::TlsUnknown => {
+                "unknown --tls value (expected verify, fingerprint:<hex>, or disable)"
+            }
+            ConfigError::SuperuserNeedsReason => "--allow-superuser requires --reason <text>",
+        }
+    }
+}
+
 impl ConnArgs {
-    fn profile(&self) -> Result<ConnProfile, String> {
+    fn profile(&self) -> Result<ConnProfile, ConfigError> {
         let tls_mode = parse_tls_mode(&self.tls, &self.reason)?;
         let password = match self.password_env.as_deref().map(std::env::var) {
             Some(Ok(p)) => p,
-            Some(Err(_)) => {
-                return Err(format!(
-                    "password environment variable {} is not set",
-                    self.password_env.as_deref().unwrap_or_default()
-                ))
-            }
+            Some(Err(_)) => return Err(ConfigError::PasswordEnvUnset),
             None => String::new(),
         };
         if self.allow_superuser && !allow_superuser_requires_reason(&self.reason) {
-            return Err("--allow-superuser requires --reason <text>".to_string());
+            return Err(ConfigError::SuperuserNeedsReason);
         }
         Ok(ConnProfile::new(
             self.host.clone(),
@@ -185,29 +230,49 @@ struct HookArgs {
     python: Option<PathBuf>,
 }
 
-/// Parse the `--tls` mode string into a [`TlsMode`].
-fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, String> {
+/// Report arguments: render artefacts from a results file (PLAN.md 4.7).
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// The results JSON file written by `compare` / `run` (SHA-256 verified).
+    #[arg(long, value_name = "FILE")]
+    results: PathBuf,
+    /// Write the PDF summary to this path.
+    #[arg(long, value_name = "FILE")]
+    pdf: Option<PathBuf>,
+    /// Write the Excel detail workbook to this path.
+    #[arg(long, value_name = "FILE")]
+    xlsx: Option<PathBuf>,
+    /// Write the run log to this path (`.json` for JSON, text otherwise).
+    #[arg(long, value_name = "FILE")]
+    log: Option<PathBuf>,
+    /// Include key / covered-column names in the detail (default: off).
+    #[arg(long)]
+    include_keys: bool,
+}
+
+/// Parse the `--tls` mode string into a [`TlsMode`].  Errors are a
+/// [`ConfigError`] kind — never the raw value — so a caller never logs a
+/// user-controlled string.
+fn parse_tls_mode(tls: &str, reason: &Option<String>) -> Result<TlsMode, ConfigError> {
     match tls {
         "verify" => Ok(TlsMode::VerifyFull),
         "disable" => {
             let reason = reason
                 .as_deref()
-                .ok_or("--reason <text> is required for --tls disable")?;
+                .ok_or(ConfigError::TlsDisableNeedsReason)?;
             if reason.trim().is_empty() {
-                return Err("--reason <text> may not be empty".to_string());
+                return Err(ConfigError::TlsReasonEmpty);
             }
             Ok(TlsMode::Disable(reason.to_string()))
         }
         _ => {
             if let Some(hex) = tls.strip_prefix("fingerprint:") {
                 if hex.is_empty() {
-                    return Err("--tls fingerprint:<hex> is missing the hex value".to_string());
+                    return Err(ConfigError::TlsFingerprintEmpty);
                 }
                 Ok(TlsMode::TrustFingerprint(hex.to_string()))
             } else {
-                Err(format!(
-                    "unknown --tls value: {tls} (expected verify, fingerprint:<hex>, or disable)"
-                ))
+                Err(ConfigError::TlsUnknown)
             }
         }
     }
@@ -236,6 +301,7 @@ async fn main() -> ExitCode {
         Command::Capture(args) => run_capture(args).await,
         Command::Compare(args) => run_compare(args).await,
         Command::Run(args) => run_run(args).await,
+        Command::Report(args) => run_report(args),
         Command::Hook(args) => run_hook(args).await,
     }
 }
@@ -244,7 +310,7 @@ async fn run_probe(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -292,7 +358,7 @@ async fn run_inventory(args: ConnArgs) -> ExitCode {
     let profile = match args.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -333,10 +399,8 @@ async fn run_inventory(args: ConnArgs) -> ExitCode {
 
 fn run_diff(args: DiffArgs) -> ExitCode {
     let result = (|| -> Result<DiffStatus, String> {
-        let old_text = fs::read_to_string(&args.old).map_err(|e| e.to_string())?;
-        let new_text = fs::read_to_string(&args.new).map_err(|e| e.to_string())?;
-        let old = serde_json::from_str(&old_text).map_err(|e| e.to_string())?;
-        let new = serde_json::from_str(&new_text).map_err(|e| e.to_string())?;
+        let old = read_inventory_json(&args.old)?;
+        let new = read_inventory_json(&args.new)?;
         let diff = compare_inventories(&old, &new);
         let json = serde_json::to_string_pretty(&diff).map_err(|e| e.to_string())?;
         println!("{json}");
@@ -354,11 +418,29 @@ fn run_diff(args: DiffArgs) -> ExitCode {
     }
 }
 
+/// Read one inventory JSON file, refusing anything at or over the size limit
+/// before it is parsed (audit L2: unbounded input can exhaust memory).
+fn read_inventory_json(
+    path: &std::path::Path,
+) -> Result<dmux_engine::inventory::DatabaseInventory, String> {
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_INVENTORY_BYTES {
+        return Err(format!(
+            "inventory file {} is {} bytes, over the {}-byte limit",
+            path.display(),
+            meta.len(),
+            MAX_INVENTORY_BYTES
+        ));
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
 async fn run_capture(args: CaptureArgs) -> ExitCode {
     let profile = match args.conn.profile() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("configuration error: {e}");
+            eprintln!("configuration error: {}", e.message());
             return ExitCode::from(EXIT_FAIL);
         }
     };
@@ -371,7 +453,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     };
     let mapping = match args.mapping.as_ref() {
         Some(path) => {
-            let bytes = match fs::read(path) {
+            let bytes = match tokio::fs::read(path).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("dmux capture failed: {e}");
@@ -406,7 +488,7 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
         }
     };
 
-    if let Err(e) = write_fingerprint_file(&args.out, &file) {
+    if let Err(e) = write_fingerprint_file(&args.out, &file).await {
         eprintln!("dmux capture failed: {e}");
         return ExitCode::from(EXIT_FAIL);
     }
@@ -418,9 +500,23 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     ExitCode::from(EXIT_PASS)
 }
 
-fn write_fingerprint_file(path: &std::path::Path, file: &FingerprintFile) -> Result<(), String> {
+/// Write a fingerprint file without blocking the async runtime (Sonar S7493),
+/// created with mode 0600 on Unix (audit L3).
+async fn write_fingerprint_file(
+    path: &std::path::Path,
+    file: &FingerprintFile,
+) -> Result<(), String> {
     let bytes = file.clone().to_json().map_err(|e| e.to_string())?;
-    fs::write(path, bytes).map_err(|e| e.to_string())
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).await.map_err(|e| e.to_string())?;
+    tokio::io::AsyncWriteExt::write_all(&mut f, &bytes)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn run_compare(args: CompareArgs) -> ExitCode {
@@ -451,11 +547,80 @@ async fn run_compare(args: CompareArgs) -> ExitCode {
     ExitCode::from(outcome.exit_code)
 }
 
+/// Render the report artefacts from a results file, verifying its SHA-256 first
+/// (refuse tampered input — PLAN.md 2.4).
+fn run_report(args: ReportArgs) -> ExitCode {
+    // Verify the results file before rendering anything (refuse tampered input).
+    let verification = match verify_results_file(&args.results) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
+
+    let options = dmux_report::ReportOptions {
+        include_keys: args.include_keys,
+    };
+    let layout = dmux_report::build_layout(&verification, &options);
+    let sha256 = verification.sha256;
+
+    if let Some(pdf) = args.pdf.as_deref() {
+        if let Err(e) = dmux_report::pdf::write_summary_layout(&layout, &sha256, pdf) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(xlsx) = args.xlsx.as_deref() {
+        if let Err(e) = dmux_report::xlsx::write_detail_layout(&layout, &sha256, xlsx) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+    if let Some(log) = args.log.as_deref() {
+        if let Err(e) = dmux_report::log::write_run_log(
+            &verification.results,
+            verification.hooks.as_ref(),
+            &options,
+            log,
+        ) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+
+    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() {
+        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx and/or --log)");
+        return ExitCode::from(EXIT_FAIL);
+    }
+
+    ExitCode::from(EXIT_PASS)
+}
+
+/// Write bytes to a file, creating it with mode 0600 on Unix so results,
+/// fingerprints and other CLI output never become world-readable (audit L3).
+/// Preserves `fs::write`'s create/truncate overwrite behaviour.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(contents)
+        })
+        .map_err(|e| e.to_string())
+}
+
 fn emit_results(path: Option<&std::path::Path>, results: &dmux_engine::results::RunResults) {
     let json = serde_json::to_string_pretty(results).unwrap_or_else(|_| "{}".to_string());
     match path {
         Some(p) => {
-            if let Err(e) = fs::write(p, &json) {
+            if let Err(e) = write_private_file(p, json.as_bytes()) {
                 eprintln!("dmux: failed to write results: {e}");
             }
         }
@@ -467,7 +632,7 @@ fn emit_json_value(path: Option<&std::path::Path>, value: &serde_json::Value) {
     let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
     match path {
         Some(p) => {
-            if let Err(e) = fs::write(p, &json) {
+            if let Err(e) = write_private_file(p, json.as_bytes()) {
                 eprintln!("dmux: failed to write results: {e}");
             }
         }
@@ -478,6 +643,7 @@ fn emit_json_value(path: Option<&std::path::Path>, value: &serde_json::Value) {
 /// Run the `dmux hook` command: read a results file (or stdin), run the given
 /// hook script(s), and print their findings as JSON marked `custom_checks`.
 async fn run_hook(args: HookArgs) -> ExitCode {
+    warn_about_hooks();
     let results_value = match read_results_json(&args.results) {
         Ok(v) => v,
         Err(e) => {
@@ -541,6 +707,10 @@ fn discover_hook_specs(
     interpreter: Option<&std::path::Path>,
 ) -> Result<Vec<HookSpec>, String> {
     let files: Vec<PathBuf> = if path.is_dir() {
+        // A world-writable or foreign-owned hooks directory lets someone swap
+        // the scripts Dmux discovers; refuse it up front (decision 23). The
+        // individual script files are re-checked in `run_hook`.
+        dmux_hooks::check_hook_path_permissions(path).map_err(|e| e.to_string())?;
         let mut entries: Vec<PathBuf> = fs::read_dir(path)
             .map_err(|e| format!("cannot read hooks dir {}: {e}", path.display()))?
             .filter_map(|e| e.ok())
@@ -686,6 +856,7 @@ async fn run_run(args: RunArgs) -> ExitCode {
 
     // Hooks are opt-in and off by default (PLAN 4.9).
     if let Some(dir) = args.hooks.as_deref() {
+        warn_about_hooks();
         let mut specs = match discover_hook_specs(dir, args.hook_timeout, args.python.as_deref()) {
             Ok(s) => s,
             Err(e) => {
@@ -856,11 +1027,28 @@ struct ConnDef {
     port: u16,
     db: String,
     user: String,
-    password: Option<String>,
     password_env: Option<String>,
     #[serde(default = "default_tls")]
     tls: String,
     reason: Option<String>,
+    /// A plaintext `password` is not allowed (decision 23 / PLAN 6.5).  This
+    /// field exists only to turn its presence into a clear error; it is never
+    /// read.  `deny_unknown_fields` would otherwise report a generic "unknown
+    /// field" that does not tell the user what to do instead.
+    #[serde(rename = "password", deserialize_with = "reject_password", default)]
+    _password: Option<serde::de::IgnoredAny>,
+}
+
+/// Reject a plaintext `password` in a run definition with a clear message
+/// (audit M7): passwords belong in `password_env` or the OS keychain, never in
+/// a definition file that gets copied around jump servers.
+fn reject_password<'de, D>(_de: D) -> Result<Option<serde::de::IgnoredAny>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "run definition files may not contain a password; use password_env",
+    ))
 }
 
 fn default_tls() -> String {
@@ -876,12 +1064,11 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     };
 
     let conn_def_to_profile = |c: &ConnDef| -> Result<ConnProfile, String> {
-        let tls_mode = parse_tls_mode(&c.tls, &c.reason)?;
-        let password = match (&c.password, &c.password_env) {
-            (Some(p), _) => p.clone(),
-            (None, Some(var)) => std::env::var(var)
-                .map_err(|_| format!("password environment variable {var} is not set"))?,
-            (None, None) => String::new(),
+        let tls_mode = parse_tls_mode(&c.tls, &c.reason).map_err(|e| e.message().to_string())?;
+        let password = match &c.password_env {
+            Some(var) => std::env::var(var)
+                .map_err(|_| "password environment variable is not set".to_string())?,
+            None => String::new(),
         };
         Ok(ConnProfile::new(
             c.host.clone(),
@@ -977,8 +1164,9 @@ fn minimal_run_results(verdict: Verdict) -> RunResults {
 mod tests {
     use super::{
         allow_superuser_requires_reason, apply_hook_verdict, hook_causes_non_pass, hook_exit_code,
-        load_definition, minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs,
-        Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        load_definition, minimal_run_results, parse_level, parse_tls_mode, read_inventory_json,
+        write_private_file, Cli, Command, ConfigError, ConnArgs, DiffArgs, Severity, EXIT_FAIL,
+        EXIT_PASS, EXIT_WARN, MAX_INVENTORY_BYTES,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
@@ -1036,6 +1224,21 @@ mod tests {
             Command::Compare(_)
         ));
         assert!(matches!(parse(&["run", "def.toml"]), Command::Run(_)));
+        assert!(matches!(
+            parse(&[
+                "report",
+                "--results",
+                "r.json",
+                "--pdf",
+                "out.pdf",
+                "--xlsx",
+                "out.xlsx",
+                "--log",
+                "out.txt",
+                "--include-keys"
+            ]),
+            Command::Report(_)
+        ));
     }
 
     #[test]
@@ -1062,6 +1265,37 @@ mod tests {
         assert!(!allow_superuser_requires_reason(&None));
         assert!(!allow_superuser_requires_reason(&Some("  ".into())));
         assert!(allow_superuser_requires_reason(&Some("lab".into())));
+    }
+
+    #[test]
+    fn config_error_never_leaks_a_password_or_user_value() {
+        // A live password lives in the environment while an unrelated config
+        // error is triggered.  The rendered message must be a fixed ConfigError
+        // string — never the password sentinel and never the user-supplied tls
+        // value (CodeQL rust/cleartext-logging).
+        const SENTINEL: &str = "SENTINEL-PASSWORD-982134";
+        std::env::set_var("DMUX_TEST_SENTINEL_PW", SENTINEL);
+        let args = ConnArgs {
+            host: "h".into(),
+            port: 5433,
+            db: "d".into(),
+            user: "u".into(),
+            password_env: Some("DMUX_TEST_SENTINEL_PW".into()),
+            tls: "SENTINEL-TLS-VALUE".into(),
+            reason: None,
+            allow_superuser: false,
+        };
+        let err = args.profile().unwrap_err();
+        assert_eq!(err, ConfigError::TlsUnknown);
+        let message = err.message();
+        assert!(
+            !message.contains(SENTINEL),
+            "password leaked into the error message: {message}"
+        );
+        assert!(
+            !message.contains("SENTINEL-TLS-VALUE"),
+            "user value leaked into the error message: {message}"
+        );
     }
 
     #[test]
@@ -1407,5 +1641,69 @@ new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", 
         let c = definition("settle-5s", &format!("stats_settle_ms = 5000\n{CONNS}")).unwrap();
         assert_eq!(c.stats_settle, std::time::Duration::from_secs(5));
         assert!(definition("settle-low", &format!("stats_settle_ms = 500\n{CONNS}")).is_err());
+    }
+
+    #[test]
+    fn definition_rejects_plaintext_password_with_a_clear_error() {
+        // Build the password at runtime: CodeQL rust/hard-coded-cryptographic-value
+        // flags a literal secret, and the value is irrelevant to the rejection.
+        let password = format!("not-a-secret-{:x}", std::process::id());
+        let body = format!(
+            r#"old = {{ host = "127.0.0.1", port = 5433, db = "d", user = "u", password = "{password}", tls = "disable", reason = "lab" }}
+new = {{ host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", reason = "lab" }}
+"#
+        );
+        let err = definition("pw", &body).unwrap_err();
+        assert!(
+            err.contains("may not contain a password"),
+            "expected a clear password rejection, got: {err}"
+        );
+        assert!(
+            err.contains("password_env"),
+            "the error should point at password_env, got: {err}"
+        );
+    }
+
+    #[test]
+    fn diff_refuses_an_inventory_over_the_size_limit() {
+        let dir = std::env::temp_dir().join(format!("dmux-diff-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.json");
+        // A sparse file: the logical length exceeds the limit without writing
+        // 64 MiB of real data.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_INVENTORY_BYTES + 1).unwrap();
+        drop(f);
+
+        let err = read_inventory_json(&path).unwrap_err();
+        assert!(
+            err.contains("over the") && err.contains("limit"),
+            "expected an over-limit error, got: {err}"
+        );
+
+        // A small file passes the size gate and fails on parsing instead, which
+        // proves the refusal above was the size check, not a parse error.
+        let small = dir.join("small.json");
+        std::fs::write(&small, "not json").unwrap();
+        let small_err = read_inventory_json(&small).unwrap_err();
+        assert!(
+            !small_err.contains("over the"),
+            "small file should not trigger the size limit: {small_err}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_files_are_created_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dmux-cli-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("results.json");
+        write_private_file(&path, b"{}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "results file must be 0600, got {mode:o}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

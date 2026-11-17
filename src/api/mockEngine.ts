@@ -15,6 +15,7 @@ import type {
   Results,
   RunDefinition,
   RunProgress,
+  SaveProfileResult,
   ServerInfo,
   TableCheck,
   TableProgress,
@@ -494,9 +495,17 @@ export interface MockEngineOptions {
  */
 export function createMockEngine(options: MockEngineOptions = {}): Engine {
   let currentRunId = 0;
+  // A mock keychain: the mock never touches a real OS keychain, but it models
+  // the backend's "password lives in the keychain, not in the profile" shape so
+  // `saveProfile` / `profileHasPassword` behave like the real engine.
+  const savedPasswords = new Map<string, string>();
 
   return {
-    async testConnection(profile: ConnectionProfile): Promise<ConnectionTestResult> {
+    async testConnection(
+      profile: ConnectionProfile,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the mock ignores the one-time password
+      _password?: string,
+    ): Promise<ConnectionTestResult> {
       if (profile.host === 'error') {
         return { ok: false, error: 'Could not reach the database server.' };
       }
@@ -541,6 +550,21 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
         };
       }
       return { ok: true, info: makeServerInfo() };
+    },
+
+    async saveProfile(
+      profile: ConnectionProfile,
+      password?: string,
+    ): Promise<SaveProfileResult> {
+      if (password) {
+        savedPasswords.set(profile.id, password);
+      }
+      // The mock always has a working keychain, so there is no warning.
+      return { profile };
+    },
+
+    async profileHasPassword(id: string): Promise<boolean> {
+      return savedPasswords.has(id);
     },
 
     async compareStructure(

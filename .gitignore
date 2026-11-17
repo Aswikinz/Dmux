@@ -32,3 +32,6 @@ playwright-report/
 # Local noise
 *.log
 .DS_Store
+
+# Local-only security audit handover (owner decision 22): never tracked
+SECURITY-AUDIT.md

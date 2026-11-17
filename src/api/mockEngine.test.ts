@@ -58,6 +58,19 @@ describe('mockEngine', () => {
     expect(res.info?.tls).toEqual({ state: 'encrypted', verified: true });
   });
 
+  it('saveProfile stores the password in its (mock) keychain and profileHasPassword reports it', async () => {
+    const engine = createMockEngine();
+    await engine.saveProfile(profile(), 'hunter2');
+    expect(await engine.profileHasPassword(defaultOldProfile().id)).toBe(true);
+    expect(await engine.profileHasPassword(defaultNewProfile().id)).toBe(false);
+  });
+
+  it('saveProfile without a password does not store one', async () => {
+    const engine = createMockEngine();
+    await engine.saveProfile(profile());
+    expect(await engine.profileHasPassword(defaultOldProfile().id)).toBe(false);
+  });
+
   it('returns the base inventory by default', async () => {
     const inv = await mockEngine.compareStructure(defaultOldProfile(), defaultNewProfile());
     expect(inv.schemas[0].name).toBe('demo_bank');
