@@ -1023,6 +1023,17 @@ describe('ReportScreen', () => {
     warnings: [],
   };
 
+  it('uses the same coverage line as the Results screen', () => {
+    wrap(
+      <ReportScreen engine={createMockEngine()} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    expect(
+      screen.getByText(
+        '12 of 40 tables fully checked, 10 counts only, 15 structure only, 3 ignored',
+      ),
+    ).toBeDefined();
+  });
+
   it('exports a PDF and shows the saved path', async () => {
     const engine = createMockEngine();
     wrap(

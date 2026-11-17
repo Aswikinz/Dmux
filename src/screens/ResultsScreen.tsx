@@ -19,7 +19,7 @@ interface ResultsScreenProps {
   onBack: () => void;
 }
 
-function coverageLabel(coverage: Results['coverage']): string {
+export function coverageLabel(coverage: Results['coverage']): string {
   return `${coverage.fullValuesTables} of ${coverage.totalTables} tables fully checked, ${coverage.countsTables} counts only, ${coverage.structureTables} structure only, ${coverage.ignoredTables} ignored`;
 }
 

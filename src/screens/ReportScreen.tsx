@@ -6,6 +6,7 @@ import { Switch } from '../components/Switch';
 import { ErrorCard } from '../design/ErrorCard';
 import { StatusBadge } from '../design/StatusBadge';
 import { qualifiedVerdictLabel } from '../components/VerdictBanner';
+import { coverageLabel } from './ResultsScreen';
 import { FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
 import type { ReportFormat, Results } from '../api/contract';
@@ -59,8 +60,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
             className="text-base"
           />
           <p className="text-sm text-slate-700 dark:text-slate-300">
-            {results.coverage.fullValuesTables} of {results.coverage.totalTables} tables fully checked,{' '}
-            {results.coverage.countsTables} counts only, {results.coverage.ignoredTables} ignored.
+            {coverageLabel(results.coverage)}
           </p>
         </div>
         {results.ignored.length > 0 && (
