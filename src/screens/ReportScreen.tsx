@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { Switch } from '../components/Switch';
 import { ErrorCard } from '../design/ErrorCard';
 import { StatusBadge } from '../design/StatusBadge';
+import { qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
 import type { ReportFormat, Results } from '../api/contract';
@@ -48,10 +50,14 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Report</h2>
+      <ScreenHeader title="Report" subtitle="Save this check as a PDF summary to sign, or as an Excel workbook with the detail." />
       <Panel>
         <div className="flex flex-wrap items-center gap-4">
-          <StatusBadge status={results.verdict} className="text-base" />
+          <StatusBadge
+            status={results.verdict}
+            label={qualifiedVerdictLabel(results)}
+            className="text-base"
+          />
           <p className="text-sm text-slate-700 dark:text-slate-300">
             {results.coverage.fullValuesTables} of {results.coverage.totalTables} tables fully checked,{' '}
             {results.coverage.countsTables} counts only, {results.coverage.ignoredTables} ignored.
@@ -59,12 +65,12 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
         </div>
         {results.ignored.length > 0 && (
           <div className="mt-4">
-            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Ignored</h3>
+            <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Ignored</h3>
             <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
               {results.ignored.map((item) => (
                 <li key={item.id}>
                   <span className="font-medium">{item.name}</span>
-                  <span className="ml-2 text-slate-500">— {item.reason}</span>
+                  <span className="ml-2 text-slate-500 dark:text-slate-400">— {item.reason}</span>
                 </li>
               ))}
             </ul>
@@ -107,7 +113,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
           </ErrorCard>
         )}
       </Panel>
-      <div className="flex justify-between">
+      <div className="flex items-center justify-between">
         <Button onClick={onBack} variant="secondary">
           Back
         </Button>

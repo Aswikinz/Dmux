@@ -35,6 +35,7 @@ import type {
   SaveProfileResult,
   SchemaDiffNode,
   ServerInfo,
+  SuperuserOverride,
   TableCheck,
   TableProgress,
   TableResult,
@@ -455,7 +456,6 @@ function isAutoApproved(status: string): boolean {
 /** Project the engine `Mapping` + attention queue onto the contract `Mapping`. */
 function translateMapping(
   build: RawMappingBuild,
-  inventory: Inventory,
 ): Mapping {
   const matches: MappingMatch[] = [];
   const needsAttention: MappingMatch[] = [];
@@ -523,18 +523,9 @@ function translateMapping(
     (rule) => `${rule.kind}: ${rule.pattern} -> ${rule.target}`,
   );
 
-  // Surface the encoding/collation differences as review items, matching the
-  // mock's behaviour so the Map screen always surfaces them.
-  if (inventory.oldEncoding !== inventory.newEncoding) {
-    needsAttention.push({
-      id: 'encoding',
-      oldName: `encoding ${inventory.oldEncoding}`,
-      newName: `encoding ${inventory.newEncoding}`,
-      confidence: 'fuzzy',
-      approved: false,
-    });
-  }
-
+  // An encoding difference is not a mapping decision: Dmux converts every
+  // value to UTF-8 before comparing.  It is shown as information on Compare
+  // structure, never as a blocking "needs attention" item.
   return { rules, matches, needsAttention, ignored };
 }
 
@@ -846,8 +837,18 @@ export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
   let lastNewProfile: ConnectionProfile | null = null;
   let lastRawMapping: RawMapping | null = null;
+  let superuserOverride: SuperuserOverride | null = null;
+  /** The backend's `SuperuserOverride { allow, reason }`, or null (refuse). */
+  const allowSuperuser = () =>
+    superuserOverride && superuserOverride.reason.trim()
+      ? { allow: true, reason: superuserOverride.reason.trim() }
+      : null;
 
   return {
+    setSuperuserOverride(override: SuperuserOverride | null): void {
+      superuserOverride = override && override.reason.trim() ? { reason: override.reason } : null;
+    },
+
     async testConnection(
       profile: ConnectionProfile,
       password?: string,
@@ -855,6 +856,7 @@ export function createTauriEngine(): Engine {
       try {
         const info = await invoke<RawServerInfo>('probe_connection', {
           input: toConnectInput(profile, password),
+          allowSuperuser: allowSuperuser(),
         });
         const serverInfo = toServerInfo(info);
         if (serverInfo.isSuperuser) {
@@ -863,7 +865,15 @@ export function createTauriEngine(): Engine {
         }
         return { ok: true, info: serverInfo };
       } catch (error) {
-        return { ok: false, error: describeError(error) };
+        const refused =
+          typeof error === 'object' &&
+          error !== null &&
+          (error as { kind?: unknown }).kind === 'superuser_refused';
+        return {
+          ok: false,
+          error: describeError(error),
+          ...(refused ? { superuserRefused: true } : {}),
+        };
       }
     },
 
@@ -894,9 +904,11 @@ export function createTauriEngine(): Engine {
 
       const oldInventory = await invoke<Record<string, unknown>>('run_inventory', {
         input: toConnectInput(oldProfile),
+        allowSuperuser: allowSuperuser(),
       });
       const newInventory = await invoke<Record<string, unknown>>('run_inventory', {
         input: toConnectInput(newProfile),
+        allowSuperuser: allowSuperuser(),
       });
       const diff = await invoke<RawSchemaDiff>('schema_diff', {
         old: oldInventory,
@@ -912,16 +924,18 @@ export function createTauriEngine(): Engine {
       };
     },
 
-    async buildMapping(inventory: Inventory): Promise<Mapping> {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the backend builds the mapping from the live databases
+    async buildMapping(_inventory: Inventory): Promise<Mapping> {
       if (!lastOldProfile || !lastNewProfile) {
         throw new Error('compareStructure must run before buildMapping');
       }
       const build = await invoke<RawMappingBuild>('build_mapping', {
         old: toConnectInput(lastOldProfile),
         new: toConnectInput(lastNewProfile),
+        allowSuperuser: allowSuperuser(),
       });
       lastRawMapping = build.mapping;
-      return translateMapping(build, inventory);
+      return translateMapping(build);
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the projected mapping is rebuilt from the backend `lastRawMapping`
@@ -948,6 +962,7 @@ export function createTauriEngine(): Engine {
         old: toConnectInput(lastOldProfile),
         new: toConnectInput(lastNewProfile),
         mapping: lastRawMapping,
+        allowSuperuser: allowSuperuser(),
       });
       return translateCheckPlan(raw);
     },
@@ -968,6 +983,7 @@ export function createTauriEngine(): Engine {
           levels,
           default_level: 'full_values',
           control_total_columns: controlTotalColumns,
+          allow_superuser: allowSuperuser(),
         },
       });
       return { runId: started.run_id, overallState: 'running', tables: [] };

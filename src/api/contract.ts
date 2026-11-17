@@ -53,6 +53,14 @@ export interface ConnectionTestResult {
   ok: boolean;
   info?: ServerInfo;
   error?: string;
+  /** The login is a superuser and Dmux refused it (no override yet). */
+  superuserRefused?: boolean;
+}
+
+/** A user's explicit, recorded decision to allow a superuser login (PLAN 6.2).
+ *  The reason is sent to the backend and written into the results. */
+export interface SuperuserOverride {
+  reason: string;
 }
 
 /** What `save_profile` returns: the stored profile plus, when the password could

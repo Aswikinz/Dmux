@@ -4,7 +4,7 @@ import { ProgressRow } from './ProgressRow';
 import type { TableProgress } from '../api/contract';
 
 describe('ProgressRow', () => {
-  it('shows the table name, progress and a state word (Done, not Pass)', () => {
+  it('shows the table name, progress and a neutral state word (Scan finished, never PASS)', () => {
     const progress: TableProgress = {
       tableId: 'tbl-000001',
       schemaName: 'demo_bank',
@@ -14,12 +14,13 @@ describe('ProgressRow', () => {
     };
     render(<ProgressRow progress={progress} />);
     expect(screen.getByText('demo_bank.account_master')).toBeDefined();
-    expect(screen.getByText('Done')).toBeDefined();
+    expect(screen.getByText('Scan finished')).toBeDefined();
     // A finished scan is not a verified PASS.
-    expect(screen.queryByText('Pass')).toBeNull();
+    expect(screen.queryByText('PASS')).toBeNull();
+    expect(screen.queryByText('Done')).toBeNull();
   });
 
-  it('a done table never shows a Pass badge, even if it later differs', () => {
+  it('a done table never shows a PASS badge, even if it later differs', () => {
     const progress: TableProgress = {
       tableId: 'tbl-000005',
       schemaName: 'demo_bank',
@@ -28,11 +29,12 @@ describe('ProgressRow', () => {
       progressPercent: 100,
     };
     render(<ProgressRow progress={progress} />);
-    expect(screen.getByText('Done')).toBeDefined();
-    expect(screen.queryByText('Pass')).toBeNull();
+    expect(screen.getByText('Scan finished')).toBeDefined();
+    expect(screen.queryByText('PASS')).toBeNull();
+    expect(screen.queryByText('Done')).toBeNull();
   });
 
-  it('maps a failed scan to Failed, not data Fail', () => {
+  it('maps a failed scan to Scan failed, not the data verdict FAIL', () => {
     const progress: TableProgress = {
       tableId: 'tbl-000002',
       schemaName: 'demo_bank',
@@ -41,8 +43,8 @@ describe('ProgressRow', () => {
       progressPercent: 0,
     };
     render(<ProgressRow progress={progress} />);
-    expect(screen.getByText('Failed')).toBeDefined();
-    expect(screen.queryByText('Fail')).toBeNull();
+    expect(screen.getByText('Scan failed')).toBeDefined();
+    expect(screen.queryByText('FAIL')).toBeNull();
   });
 
   it('maps changed-during-check to its badge', () => {
@@ -54,7 +56,7 @@ describe('ProgressRow', () => {
       progressPercent: 0,
     };
     render(<ProgressRow progress={progress} />);
-    expect(screen.getByText('Changed during check')).toBeDefined();
+    expect(screen.getByText('CHANGED DURING CHECK')).toBeDefined();
   });
 
   it('shows eta while running', () => {
@@ -67,6 +69,6 @@ describe('ProgressRow', () => {
       etaSeconds: 12,
     };
     render(<ProgressRow progress={progress} />);
-    expect(screen.getByText(/12s left/)).toBeDefined();
+    expect(screen.getByText('about 12 seconds left')).toBeDefined();
   });
 });

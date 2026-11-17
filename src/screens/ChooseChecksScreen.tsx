@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Panel } from '../design/Panel';
+import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { Select } from '../design/Select';
 import { DataTable } from '../components/DataTable';
 import { ErrorCard } from '../design/ErrorCard';
+import { Tooltip } from '../design/Tooltip';
+import { formatDurationRange } from '../components/duration';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
 import type { CheckLevel, CheckPlan, Mapping, TableCheck } from '../api/contract';
@@ -18,10 +21,43 @@ interface ChooseChecksScreenProps {
 }
 
 const levelOptions: { value: CheckLevel; label: string }[] = [
-  { value: 'structure', label: 'Structure' },
+  { value: 'structure', label: 'Structure only' },
   { value: 'counts', label: 'Counts and totals' },
   { value: 'full-values', label: 'Full values' },
 ];
+
+/** The presets the user can pick.  Each one really reassigns table levels. */
+export type PresetId = 'suggested' | 'full' | 'counts' | 'structure' | 'custom';
+
+export const PRESETS: { value: PresetId; label: string }[] = [
+  { value: 'suggested', label: 'Suggested levels' },
+  { value: 'full', label: 'Full values for every table' },
+  { value: 'counts', label: 'Counts and totals for every table (then pick tables for full values)' },
+  { value: 'structure', label: 'Structure only for every table' },
+  { value: 'custom', label: 'Custom (your own choices)' },
+];
+
+/** The level a preset gives every table, or the suggested level. */
+export function applyPreset(
+  plan: CheckPlan,
+  preset: PresetId,
+  suggested: Record<string, CheckLevel>,
+): CheckPlan {
+  if (preset === 'custom') return plan;
+  const levelFor = (t: TableCheck): CheckLevel => {
+    switch (preset) {
+      case 'full':
+        return 'full-values';
+      case 'counts':
+        return 'counts';
+      case 'structure':
+        return 'structure';
+      default:
+        return suggested[t.tableId] ?? t.level;
+    }
+  };
+  return { ...plan, tables: plan.tables.map((t) => ({ ...t, level: levelFor(t) })) };
+}
 
 export function ChooseChecksScreen({
   engine,
@@ -33,7 +69,14 @@ export function ChooseChecksScreen({
 }: ChooseChecksScreenProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedPreset, setSelectedPreset] = useState<string>('');
+  const [selectedPreset, setSelectedPreset] = useState<PresetId>('suggested');
+  const [presetNote, setPresetNote] = useState<string | null>(null);
+  // The levels the engine suggested, captured once, so "Suggested levels"
+  // can always restore them.
+  const suggestedRef = useRef<Record<string, CheckLevel> | null>(null);
+  if (plan && !suggestedRef.current) {
+    suggestedRef.current = Object.fromEntries(plan.tables.map((t) => [t.tableId, t.level]));
+  }
 
   useEffect(() => {
     let mounted = true;
@@ -44,7 +87,7 @@ export function ChooseChecksScreen({
         const result = await engine.buildCheckPlan(mapping);
         if (mounted) {
           onPlanChange(result);
-          setSelectedPreset(result.presets[0] ?? '');
+          setSelectedPreset('suggested');
         }
       } catch (e) {
         if (mounted) {
@@ -64,8 +107,26 @@ export function ChooseChecksScreen({
     };
   }, [engine, mapping, plan, onPlanChange]);
 
+  const choosePreset = (preset: PresetId) => {
+    setSelectedPreset(preset);
+    if (!plan || preset === 'custom') {
+      setPresetNote(null);
+      return;
+    }
+    const next = applyPreset(plan, preset, suggestedRef.current ?? {});
+    onPlanChange(next);
+    const label = PRESETS.find((p) => p.value === preset)?.label ?? preset;
+    setPresetNote(
+      preset === 'counts'
+        ? `Applied "${label}": ${next.tables.length} tables set to Counts and totals. Now set Full values on the tables you want checked in full.`
+        : `Applied "${label}" to ${next.tables.length} tables.`,
+    );
+  };
+
   const updateLevel = (tableId: string, level: CheckLevel) => {
     if (!plan) return;
+    setSelectedPreset('custom');
+    setPresetNote(null);
     onPlanChange({
       ...plan,
       tables: plan.tables.map((t) => (t.tableId === tableId ? { ...t, level } : t)),
@@ -82,6 +143,7 @@ export function ChooseChecksScreen({
         cell: ({ row }) => (
           <Select
             options={levelOptions}
+            aria-label={`Check level for ${row.original.schemaName}.${row.original.tableName}`}
             value={row.original.level}
             onChange={(e) => updateLevel(row.original.tableId, e.target.value as CheckLevel)}
             className="w-48"
@@ -89,7 +151,14 @@ export function ChooseChecksScreen({
         ),
       }),
       col.accessor('controlTotalColumns', {
-        header: 'Control totals',
+        header: () => (
+          <Tooltip
+            label="Control totals"
+            explanation="Number columns, such as amounts and balances, that Dmux adds up on both sides. The sums must match, so you know the money adds up the same."
+          >
+            Control totals
+          </Tooltip>
+        ),
         cell: ({ getValue }) => (getValue() as string[] | undefined)?.join(', ') ?? '—',
       }),
     ] as ColumnDef<TableCheck>[];
@@ -105,7 +174,7 @@ export function ChooseChecksScreen({
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Choose checks</h2>
+      <ScreenHeader title="Choose checks" subtitle="Pick how thoroughly each table is checked. A full-values check compares every value." />
       {loading && (
         <Panel>
           <div className="py-8 text-center text-slate-600 dark:text-slate-300">Building check plan…</div>
@@ -118,16 +187,26 @@ export function ChooseChecksScreen({
             <div className="flex flex-wrap items-end gap-4">
               <Select
                 label="Preset"
-                options={plan.presets.map((p) => ({ value: p, label: p }))}
+                options={PRESETS}
                 value={selectedPreset}
-                onChange={(e) => setSelectedPreset(e.target.value)}
-                className="w-72"
+                onChange={(e) => choosePreset(e.target.value as PresetId)}
+                className="w-96"
+                data-testid="preset-select"
               />
               <div className="rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
-                <span className="font-medium">Estimate:</span>{' '}
-                {plan.estimateSecondsMin}s – {plan.estimateSecondsMax}s
+                <span className="font-medium">Estimated time:</span>{' '}
+                {formatDurationRange(plan.estimateSecondsMin, plan.estimateSecondsMax)}
+                <span className="block text-xs text-slate-500 dark:text-slate-400">
+                  Corrected as each table finishes. A table that fails takes a second pass to list
+                  its differences.
+                </span>
               </div>
             </div>
+            {presetNote && (
+              <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
+                {presetNote}
+              </p>
+            )}
             {totals && (
               <div className="flex gap-4 text-sm text-slate-600 dark:text-slate-300">
                 <span><strong>{totals.full}</strong> full values</span>
@@ -141,7 +220,7 @@ export function ChooseChecksScreen({
               filterPlaceholder="Filter by schema or table name"
             />
           </Panel>
-          <div className="flex justify-between">
+          <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">
               Back
             </Button>

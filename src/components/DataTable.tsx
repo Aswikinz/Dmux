@@ -79,25 +79,26 @@ export function DataTable<T extends object>({
           onChange={(e) => setFilter(e.target.value)}
           placeholder={filterPlaceholder}
           aria-label={filterPlaceholder}
-          className="w-full rounded-lg border border-slate-300 py-2 pl-9 pr-3 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+          className="h-9 w-full rounded-[10px] border border-black/[0.1] bg-black/[0.03] pl-9 pr-3 text-sm transition-[border-color,box-shadow,background-color] duration-150 placeholder:text-slate-400 focus:border-accent-500 focus:bg-white focus:outline-none focus:ring-4 focus:ring-accent-500/20 dark:border-white/10 dark:bg-white/[0.06] dark:text-slate-100"
         />
       </div>
       <div
         ref={parentRef}
-        className="overflow-auto rounded-lg border border-slate-200 dark:border-slate-700"
+        className="overflow-auto rounded-xl border border-black/[0.06] dark:border-white/[0.08]"
         style={{ maxHeight: '60vh' }}
         tabIndex={0}
         role="region"
         aria-label="Table results"
       >
         <table className="w-full border-collapse text-sm">
-          <thead className="sticky top-0 z-10 bg-slate-50 dark:bg-slate-800">
+          <thead className="sticky top-0 z-10 bg-[#fafafc]/95 backdrop-blur dark:bg-[#2a2a2d]/95">
             {table.getHeaderGroups().map((headerGroup) => (
-              <tr key={headerGroup.id}>
+              <tr key={headerGroup.id} className="flex">
                 {headerGroup.headers.map((header) => (
                   <th
                     key={header.id}
-                    className="border-b border-slate-200 px-3 py-2 text-left font-medium text-slate-700 dark:border-slate-700 dark:text-slate-300"
+                    style={{ flexBasis: header.column.getSize() }}
+                    className="flex-1 border-b border-black/[0.06] px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.05em] text-ink-secondary dark:border-white/[0.08] dark:text-slate-400"
                   >
                     {header.isPlaceholder
                       ? null
@@ -129,12 +130,12 @@ export function DataTable<T extends object>({
                           width: '100%',
                           transform: `translateY(${virtualRow.start}px)`,
                         }}
-                        className="flex"
+                        className="flex transition-colors hover:bg-accent-50/50 dark:hover:bg-white/[0.03]"
                       >
                         {row.getVisibleCells().map((cell) => (
                           <div
                             key={cell.id}
-                            className="flex-1 border-b border-slate-100 px-3 py-2 dark:border-slate-800"
+                            className="flex flex-1 items-center border-b border-black/[0.04] px-3 py-2 dark:border-white/[0.05]"
                             style={{ flexBasis: cell.column.getSize() }}
                           >
                             {flexRender(cell.column.columnDef.cell, cell.getContext())}
