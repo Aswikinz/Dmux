@@ -26,14 +26,13 @@ const encryptionOptions: { value: EncryptionMode; label: string }[] = [
 ];
 
 function emptyProfile(side: 'old' | 'new'): ConnectionProfile {
-  const base = side === 'old' ? '5433' : '5434';
   return {
     id: `${side}-profile`,
     label: `${side === 'old' ? 'Old' : 'New'} database`,
-    host: '127.0.0.1',
-    port: Number(base),
-    database: 'demo_bank',
-    user: 'dmux_dev',
+    host: '',
+    port: 5432,
+    database: '',
+    user: '',
     encryption: 'verify',
   };
 }
@@ -45,10 +44,14 @@ function ProfileEditor({
   title,
   profile,
   onChange,
+  password,
+  onPasswordChange,
 }: {
   title: string;
   profile: ConnectionProfile;
   onChange: (p: ConnectionProfile) => void;
+  password: string;
+  onPasswordChange: (value: string) => void;
 }) {
   return (
     <div className="space-y-3">
@@ -87,6 +90,14 @@ function ProfileEditor({
         value={profile.user}
         onChange={(e) => onChange({ ...profile, user: e.target.value })}
         data-testid={`${title}-user`}
+      />
+      <Input
+        label="Password (stored in your system keychain)"
+        type="password"
+        autoComplete="new-password"
+        value={password}
+        onChange={(e) => onPasswordChange(e.target.value)}
+        data-testid={`${title}-password`}
       />
       <Select
         label="Encryption"
@@ -210,22 +221,81 @@ export function ConnectScreen({
   const [newResult, setNewResult] = useState<Awaited<ReturnType<Engine['testConnection']>> | null>(
     null,
   );
-  const [loading, setLoading] = useState<'old' | 'new' | null>(null);
+  const [testing, setTesting] = useState<'old' | 'new' | null>(null);
+  const [saving, setSaving] = useState<'old' | 'new' | null>(null);
+
+  // The typed password lives only in this component's local state, is sent once
+  // to the backend on Save/Test, and is cleared as soon as the call returns —
+  // never lifted into app state, never persisted, never logged (PLAN 6.5).
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [oldPasswordSaved, setOldPasswordSaved] = useState(false);
+  const [newPasswordSaved, setNewPasswordSaved] = useState(false);
+  const [oldSaveWarning, setOldSaveWarning] = useState<string | null>(null);
+  const [newSaveWarning, setNewSaveWarning] = useState<string | null>(null);
+  const [oldSaveError, setOldSaveError] = useState<string | null>(null);
+  const [newSaveError, setNewSaveError] = useState<string | null>(null);
 
   const bothOk = oldResult?.ok && newResult?.ok;
 
+  function describeThrown(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  async function saveOld() {
+    setSaving('old');
+    setOldSaveError(null);
+    setOldSaveWarning(null);
+    try {
+      const result = await engine.saveProfile(oldProfile, oldPassword || undefined);
+      setOldSaveWarning(result.warning ?? null);
+      setOldPasswordSaved(await engine.profileHasPassword(oldProfile.id));
+      onChangeOld(result.profile);
+    } catch (error) {
+      setOldSaveError(describeThrown(error));
+    } finally {
+      setOldPassword('');
+      setSaving(null);
+    }
+  }
+
+  async function saveNew() {
+    setSaving('new');
+    setNewSaveError(null);
+    setNewSaveWarning(null);
+    try {
+      const result = await engine.saveProfile(newProfile, newPassword || undefined);
+      setNewSaveWarning(result.warning ?? null);
+      setNewPasswordSaved(await engine.profileHasPassword(newProfile.id));
+      onChangeNew(result.profile);
+    } catch (error) {
+      setNewSaveError(describeThrown(error));
+    } finally {
+      setNewPassword('');
+      setSaving(null);
+    }
+  }
+
   async function testOld() {
-    setLoading('old');
-    const result = await engine.testConnection(oldProfile);
-    setOldResult(result);
-    setLoading(null);
+    setTesting('old');
+    try {
+      const result = await engine.testConnection(oldProfile, oldPassword || undefined);
+      setOldResult(result);
+    } finally {
+      setOldPassword('');
+      setTesting(null);
+    }
   }
 
   async function testNew() {
-    setLoading('new');
-    const result = await engine.testConnection(newProfile);
-    setNewResult(result);
-    setLoading(null);
+    setTesting('new');
+    try {
+      const result = await engine.testConnection(newProfile, newPassword || undefined);
+      setNewResult(result);
+    } finally {
+      setNewPassword('');
+      setTesting(null);
+    }
   }
 
   return (
@@ -233,16 +303,45 @@ export function ConnectScreen({
       <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">Connect</h2>
       <div className="grid gap-6 lg:grid-cols-2">
         <Panel>
-          <ProfileEditor title="Old database" profile={oldProfile} onChange={onChangeOld} />
-          <div className="mt-4">
-            <Button
-              onClick={testOld}
-              disabled={loading === 'old'}
-              variant="secondary"
-              className="w-full"
-            >
-              {loading === 'old' ? 'Testing…' : 'Test connection'}
-            </Button>
+          <ProfileEditor
+            title="Old database"
+            profile={oldProfile}
+            onChange={onChangeOld}
+            password={oldPassword}
+            onPasswordChange={setOldPassword}
+          />
+          <div className="mt-4 space-y-3">
+            <div className="flex gap-2">
+              <Button
+                onClick={saveOld}
+                disabled={saving === 'old' || testing === 'old'}
+                variant="secondary"
+                className="flex-1"
+              >
+                {saving === 'old' ? 'Saving…' : 'Save'}
+              </Button>
+              <Button
+                onClick={testOld}
+                disabled={saving === 'old' || testing === 'old'}
+                variant="secondary"
+                className="flex-1"
+              >
+                {testing === 'old' ? 'Testing…' : 'Test connection'}
+              </Button>
+            </div>
+            {oldPasswordSaved && (
+              <p className="text-sm text-emerald-700 dark:text-emerald-300">
+                Password saved in keychain
+              </p>
+            )}
+            {oldSaveWarning && (
+              <p className="text-sm text-amber-700 dark:text-amber-300">{oldSaveWarning}</p>
+            )}
+            {oldSaveError && (
+              <ErrorCard title="Could not save profile" className="mt-3">
+                {oldSaveError}
+              </ErrorCard>
+            )}
             {oldResult && !oldResult.ok && (
               <ErrorCard title="Connection failed" className="mt-3">
                 {oldResult.error}
@@ -252,16 +351,45 @@ export function ConnectScreen({
           </div>
         </Panel>
         <Panel>
-          <ProfileEditor title="New database" profile={newProfile} onChange={onChangeNew} />
-          <div className="mt-4">
-            <Button
-              onClick={testNew}
-              disabled={loading === 'new'}
-              variant="secondary"
-              className="w-full"
-            >
-              {loading === 'new' ? 'Testing…' : 'Test connection'}
-            </Button>
+          <ProfileEditor
+            title="New database"
+            profile={newProfile}
+            onChange={onChangeNew}
+            password={newPassword}
+            onPasswordChange={setNewPassword}
+          />
+          <div className="mt-4 space-y-3">
+            <div className="flex gap-2">
+              <Button
+                onClick={saveNew}
+                disabled={saving === 'new' || testing === 'new'}
+                variant="secondary"
+                className="flex-1"
+              >
+                {saving === 'new' ? 'Saving…' : 'Save'}
+              </Button>
+              <Button
+                onClick={testNew}
+                disabled={saving === 'new' || testing === 'new'}
+                variant="secondary"
+                className="flex-1"
+              >
+                {testing === 'new' ? 'Testing…' : 'Test connection'}
+              </Button>
+            </div>
+            {newPasswordSaved && (
+              <p className="text-sm text-emerald-700 dark:text-emerald-300">
+                Password saved in keychain
+              </p>
+            )}
+            {newSaveWarning && (
+              <p className="text-sm text-amber-700 dark:text-amber-300">{newSaveWarning}</p>
+            )}
+            {newSaveError && (
+              <ErrorCard title="Could not save profile" className="mt-3">
+                {newSaveError}
+              </ErrorCard>
+            )}
             {newResult && !newResult.ok && (
               <ErrorCard title="Connection failed" className="mt-3">
                 {newResult.error}

@@ -16,8 +16,29 @@ function cta(page: Page, name: string) {
   return page.getByRole('main').getByRole('button', { name, exact: true });
 }
 
+/**
+ * Fill the two connection profiles explicitly.  The Connect form no longer
+ * pre-fills mock values (empty defaults), so tests that drive the real form
+ * must supply them.  `database` defaults to 'demo_bank' (the mock's base
+ * inventory) but may be overridden to 'diff' etc.
+ */
+export async function fillProfiles(
+  page: Page,
+  overrides: { oldDatabase?: string; newDatabase?: string } = {},
+): Promise<void> {
+  const fill = async (side: 'Old database' | 'New database', database: string) => {
+    await page.getByTestId(`${side}-host`).fill('127.0.0.1');
+    await page.getByTestId(`${side}-port`).fill(side === 'Old database' ? '5433' : '5434');
+    await page.getByTestId(`${side}-database`).fill(database);
+    await page.getByTestId(`${side}-user`).fill('dmux_dev');
+  };
+  await fill('Old database', overrides.oldDatabase ?? 'demo_bank');
+  await fill('New database', overrides.newDatabase ?? 'demo_bank');
+}
+
 /** Connect both databases on the Connect screen and move to the next step. */
 export async function connect(page: Page): Promise<void> {
+  await fillProfiles(page);
   const testButtons = page.getByRole('button', { name: 'Test connection' });
   await testButtons.nth(0).click();
   await expect(page.getByText('Server version:').first()).toBeVisible();

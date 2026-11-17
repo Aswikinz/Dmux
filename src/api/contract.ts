@@ -50,6 +50,16 @@ export interface ConnectionTestResult {
   error?: string;
 }
 
+/** What `save_profile` returns: the stored profile plus, when the password could
+ *  not be written to (or had to be removed from) the keychain, a plain-language
+ *  warning.  The profile never carries a password value. */
+export interface SaveProfileResult {
+  profile: ConnectionProfile;
+  /** Present when the password could not be stored, or when it was removed
+   *  because the connection details changed without a new password. */
+  warning?: string;
+}
+
 export type DiffKind = 'missing' | 'added' | 'changed';
 
 export interface SchemaDiffNode {
