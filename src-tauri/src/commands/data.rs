@@ -209,6 +209,11 @@ pub struct ResultsDto {
     pub table_results: Vec<TableResultDto>,
     /// Whether any column option was applied (H2): drives "PASS (with options)".
     pub options_applied: bool,
+    /// Whether the results file recorded options (schema >= 3); when false the
+    /// UI says "options not recorded", never a bare PASS.
+    pub options_recorded: bool,
+    /// Run-level warnings (can-write, superuser, row-level security, ...).
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +838,8 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
         failures,
         table_results,
         options_applied: results.options_applied,
+        options_recorded: dmux_engine::results::options_recorded(results),
+        warnings: results.warnings.clone(),
     }
 }
 

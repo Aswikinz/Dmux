@@ -520,6 +520,8 @@ describe('RunScreen', () => {
         failures: [],
         tableResults: [],
         optionsApplied: false,
+        optionsRecorded: true,
+        warnings: [],
       }),
       exportReport: async () => ({ ok: true, filePath: '/tmp/r.pdf' }),
       getVersion: async () => 'mock',
@@ -699,12 +701,58 @@ describe('ResultsScreen', () => {
           },
         ],
         optionsApplied: true,
+        optionsRecorded: true,
+        warnings: [],
       }),
     };
     wrap(<ResultsHarness engine={engine} runId="run-pass-options" />);
     expect(await screen.findByText('PASS (with options)')).toBeDefined();
     expect(screen.getByText('Options applied')).toBeDefined();
     expect(screen.getAllByText(/round to 2 decimals/).length).toBeGreaterThan(0);
+  });
+
+  it('shows "options not recorded" for an older results file (never a bare PASS)', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      getResults: async () => ({
+        runId: 'run-pass-old',
+        verdict: 'PASS',
+        coverage: { totalTables: 1, fullValuesTables: 1, countsTables: 0, structureTables: 0, ignoredTables: 0 },
+        ignored: [],
+        failures: [],
+        tableResults: [],
+        optionsApplied: false,
+        optionsRecorded: false,
+        warnings: [],
+      }),
+    };
+    wrap(<ResultsHarness engine={engine} runId="run-pass-old" />);
+    expect(
+      await screen.findByText('PASS (options not recorded — older results file)'),
+    ).toBeDefined();
+    expect(screen.getByText('options not recorded (older results file)')).toBeDefined();
+    // The verdict badge must be the single qualified label, never a bare "Pass".
+    expect(screen.queryByText('Pass')).toBeNull();
+  });
+
+  it('lists run warnings (can-write / superuser / row-level security)', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      getResults: async () => ({
+        runId: 'run-warn',
+        verdict: 'PASS',
+        coverage: { totalTables: 21, fullValuesTables: 2, countsTables: 1, structureTables: 0, ignoredTables: 0 },
+        ignored: [],
+        failures: [],
+        tableResults: [],
+        optionsApplied: false,
+        optionsRecorded: true,
+        warnings: ['the old database login can write; the login should be read-only'],
+      }),
+    };
+    wrap(<ResultsHarness engine={engine} runId="run-warn" />);
+    expect(await screen.findByText('Warnings')).toBeDefined();
+    expect(screen.getByText(/the old database login can write/)).toBeDefined();
   });
 });
 
@@ -721,6 +769,8 @@ describe('ReportScreen', () => {
     failures: [],
     tableResults: [],
     optionsApplied: false,
+    optionsRecorded: true,
+    warnings: [],
   };
 
   it('exports a PDF and shows the saved path', async () => {

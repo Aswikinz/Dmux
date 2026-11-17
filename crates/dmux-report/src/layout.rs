@@ -71,17 +71,29 @@ pub fn verdict_word(v: Verdict) -> &'static str {
     }
 }
 
-/// The displayed overall verdict word, with the "(with options)" qualifier when
-/// the run is PASS and at least one column option was applied (decision 23).
-pub fn verdict_display(word: &str, options_applied: bool) -> String {
-    if word == "PASS" && options_applied {
+/// The displayed overall verdict word.  A PASS is never bare when the results
+/// file could not vouch for options (decision 23): "(with options)" when at
+/// least one column option was applied, and "(options not recorded — older
+/// results file)" when the results schema predates option recording.
+pub fn verdict_display(word: &str, options_applied: bool, options_recorded: bool) -> String {
+    if word != "PASS" {
+        return word.to_string();
+    }
+    if !options_recorded {
+        return "PASS (options not recorded — older results file)".to_string();
+    }
+    if options_applied {
         "PASS (with options)".to_string()
     } else {
-        word.to_string()
+        "PASS".to_string()
     }
 }
 
-/// Plain-language connection-safety lines for one side (audit M5).  An empty
+/// The "Options applied" body when options were never recorded: every report
+/// format and the log show this rather than assume none were applied.
+pub const OPTIONS_NOT_RECORDED: &str = "options not recorded (older results file)";
+
+/// Plain-language connection-safety lines for one side (audit M5, H1).  An empty
 /// `tls` means the side was not a live connection (a saved fingerprint file).
 fn connection_lines(side: &str, c: &ConnectionInfo) -> Vec<String> {
     if c.tls.is_empty() {
@@ -112,7 +124,18 @@ fn connection_lines(side: &str, c: &ConnectionInfo) -> Vec<String> {
         lines.push(format!("{side}: superuser login (override reason: {why})"));
     }
     if c.can_write {
-        lines.push(format!("{side}: the login can write to at least one table"));
+        let reasons = if c.can_write_reasons.is_empty() {
+            "at least one table".to_string()
+        } else {
+            c.can_write_reasons.join("; ")
+        };
+        lines.push(format!("{side}: the login can write ({reasons})"));
+    }
+    if !c.rls_tables.is_empty() && !c.rolbypassrls {
+        lines.push(format!(
+            "{side}: {} tables use row-level security; Dmux refused to read them filtered",
+            c.rls_tables.len()
+        ));
     }
     if c.pooler_suspected {
         lines.push(format!("{side}: a connection pooler is suspected"));
@@ -282,6 +305,10 @@ pub struct Layout {
     pub structure_findings: Vec<StructureFindingLine>,
     pub suggestions: Vec<SuggestionLine>,
     pub definition_hash: String,
+    /// Whether the results file recorded per-column options (results schema
+    /// version >= 3).  When false, the reader says "options not recorded",
+    /// never a bare PASS or "no options".
+    pub options_recorded: bool,
     /// Whether any column option was applied (H2): page 1 says
     /// "PASS (with options)" when the overall verdict is PASS.
     pub options_applied: bool,
@@ -446,6 +473,7 @@ pub fn build(
         hook_warnings: hooks
             .map(|h| h.warnings.iter().map(|w| sanitize(w)).collect())
             .unwrap_or_default(),
+        options_recorded: dmux_engine::results::options_recorded(results),
         options_applied: results.options_applied,
         options_applied_lines: option_lines(results),
         capture_sha256_old: results.capture_sha256_old.as_deref().map(sanitize),
@@ -861,8 +889,13 @@ mod tests {
         };
         let layout = build(&r, None, &ReportOptions::default());
         assert!(layout.options_applied);
+        assert!(layout.options_recorded);
         assert_eq!(
-            verdict_display(&layout.verdict_word, layout.options_applied),
+            verdict_display(
+                &layout.verdict_word,
+                layout.options_applied,
+                layout.options_recorded
+            ),
             "PASS (with options)"
         );
         assert_eq!(
@@ -884,5 +917,54 @@ mod tests {
             .unwrap()
             .column_notes;
         assert_eq!(notes, &vec!["balance: round to 2 decimals".to_string()]);
+    }
+
+    #[test]
+    fn an_old_results_file_never_shows_a_bare_pass() {
+        // A v2 results file never recorded options, so a PASS must be qualified
+        // and the options line must say "not recorded", never "none" or a bare
+        // PASS (H2 / decision 23 / fix round).
+        let mut r = fixture(Verdict::Pass);
+        r.results_version = 2;
+        r.options_applied = false;
+        let layout = build(&r, None, &ReportOptions::default());
+        assert!(!layout.options_recorded);
+        assert_eq!(
+            verdict_display(
+                &layout.verdict_word,
+                layout.options_applied,
+                layout.options_recorded
+            ),
+            "PASS (options not recorded — older results file)"
+        );
+        assert!(layout.options_applied_lines.is_empty());
+    }
+
+    #[test]
+    fn rls_and_can_write_reasons_reach_the_connection_lines() {
+        use dmux_engine::results::Connections;
+        let mut r = fixture(Verdict::Fail);
+        r.connections = Connections {
+            old: ConnectionInfo {
+                tls: "verified".into(),
+                can_write: true,
+                can_write_reasons: vec!["has INSERT on at least one table".into()],
+                rolbypassrls: false,
+                rls_tables: vec!["s.accounts".into(), "s.audit_log".into()],
+                server_version: "17.0".into(),
+                server_encoding: "UTF8".into(),
+                ..ConnectionInfo::default()
+            },
+            new: ConnectionInfo::default(),
+        };
+        let layout = build(&r, None, &ReportOptions::default());
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("has INSERT on at least one table")));
+        assert!(layout
+            .connections
+            .iter()
+            .any(|l| l.contains("2 tables use row-level security")));
     }
 }

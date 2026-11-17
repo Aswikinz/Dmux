@@ -396,16 +396,19 @@ pub(crate) fn connection_info(
             None
         },
         can_write: info.can_write,
-        can_write_reasons: Vec::new(),
+        can_write_reasons: info.can_write_reasons.clone(),
         pooler_suspected: info.pooler_suspected,
         md5_available: info.md5_available,
         server_version: info.version_string.clone(),
         server_encoding: info.encoding.clone(),
+        rolbypassrls: info.rolbypassrls,
+        rls_tables: info.rls_tables.clone(),
     }
 }
 
 /// Record the plain-language run warnings the connection-safety decisions
-/// imply (audit M5): a login that can write, and a superuser login.
+/// imply (audit M5, H1): a login that can write, a superuser login, and
+/// row-level security that Dmux refuses to read filtered.
 pub(crate) fn connection_warnings(
     results: &mut RunResults,
     old: &ConnectionInfo,
@@ -413,8 +416,13 @@ pub(crate) fn connection_warnings(
 ) {
     for (side, info) in [("old", old), ("new", new)] {
         if info.can_write {
+            let reasons = if info.can_write_reasons.is_empty() {
+                "it can write".to_string()
+            } else {
+                info.can_write_reasons.join("; ")
+            };
             let w = format!(
-                "the {side} database login can write (INSERT/UPDATE/DELETE on at least one table); the login should be read-only"
+                "the {side} database login can write ({reasons}); the login should be read-only"
             );
             if !results.warnings.contains(&w) {
                 results.warnings.push(w);
@@ -426,6 +434,15 @@ pub(crate) fn connection_warnings(
                 .as_deref()
                 .unwrap_or("no reason recorded");
             let w = format!("the {side} database login is a superuser (override: {why})");
+            if !results.warnings.contains(&w) {
+                results.warnings.push(w);
+            }
+        }
+        if !info.rls_tables.is_empty() && !info.rolbypassrls {
+            let w = format!(
+                "the {side} database: {} tables use row-level security; Dmux refused to read them filtered",
+                info.rls_tables.len()
+            );
             if !results.warnings.contains(&w) {
                 results.warnings.push(w);
             }
@@ -1696,8 +1713,8 @@ mod tests {
             md5_available: false,
             sql_ascii: false,
             rolbypassrls: false,
-            rls_tables: Vec::new(),
-            can_write_reasons: Vec::new(),
+            rls_tables: vec!["s.accounts".into()],
+            can_write_reasons: vec!["has INSERT on at least one table".into()],
         };
         let c = connection_info(&profile, &info, Some("migration needs it"));
         assert_eq!(c.tls, "plaintext");
@@ -1705,6 +1722,12 @@ mod tests {
         assert!(c.superuser);
         assert_eq!(c.superuser_reason.as_deref(), Some("migration needs it"));
         assert!(c.can_write);
+        assert_eq!(
+            c.can_write_reasons,
+            vec!["has INSERT on at least one table".to_string()]
+        );
+        assert!(!c.rolbypassrls);
+        assert_eq!(c.rls_tables, vec!["s.accounts".to_string()]);
         assert!(c.pooler_suspected);
         assert!(!c.md5_available);
         assert_eq!(c.server_version, "17.0");
@@ -1713,8 +1736,16 @@ mod tests {
         let mut r = RunResults::default();
         connection_warnings(&mut r, &c, &ConnectionInfo::default());
         assert!(r.warnings.iter().any(|w| w.contains("can write")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("has INSERT on at least one table")));
         assert!(r.warnings.iter().any(|w| w.contains("superuser")));
         assert!(r.warnings.iter().any(|w| w.contains("migration needs it")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("tables use row-level security")));
     }
 
     fn stopped_config() -> (RunConfig, std::sync::Arc<RunControl>) {

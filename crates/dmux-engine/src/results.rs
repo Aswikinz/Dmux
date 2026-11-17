@@ -122,14 +122,21 @@ pub struct ConnectionInfo {
     #[serde(default)]
     pub superuser_reason: Option<String>,
     pub can_write: bool,
-    /// How the probe saw write access.  The probe currently reports only the
-    /// boolean; this list is reserved for the finer reasons it will expose.
+    /// Fixed, plain-language reasons the login can write (no object names, no
+    /// row data).  Empty when the login is read-only in every way checked.
     #[serde(default)]
     pub can_write_reasons: Vec<String>,
     pub pooler_suspected: bool,
     pub md5_available: bool,
     pub server_version: String,
     pub server_encoding: String,
+    /// Whether the login has `BYPASSRLS` (PostgreSQL 9.5+; `false` on 9.4).
+    #[serde(default)]
+    pub rolbypassrls: bool,
+    /// `schema.table` of every relation with row-level security enabled
+    /// (PostgreSQL 9.5+; empty on 9.4).
+    #[serde(default)]
+    pub rls_tables: Vec<String>,
 }
 
 /// The connection-safety record for both sides (audit M5).
@@ -360,6 +367,19 @@ impl Default for RunResults {
 
 /// Results schema version this module writes.
 pub const RESULTS_VERSION: u32 = 3;
+
+/// The results schema version at which per-column option notes (and the
+/// `options_applied` flag) were first recorded.  A file with an older
+/// `results_version` never recorded options, so a reader must say
+/// "options not recorded" rather than assume none were applied (a bare PASS).
+pub const OPTIONS_RECORDED_VERSION: u32 = 3;
+
+/// Whether a results file recorded per-column options (H2 / decision 23).
+/// Files with `results_version < OPTIONS_RECORDED_VERSION` carry no option
+/// notes, so their options are unknown, never "none".
+pub fn options_recorded(results: &RunResults) -> bool {
+    results.results_version >= OPTIONS_RECORDED_VERSION
+}
 
 /// The precedence order for combining verdicts: a run is PASS only when every
 /// contributing verdict is PASS.  Any non-PASS verdict pulls the run down;

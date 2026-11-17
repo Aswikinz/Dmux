@@ -324,6 +324,8 @@ interface RawResults {
   failures: RawFailureCard[];
   table_results: RawTableResult[];
   options_applied: boolean;
+  options_recorded: boolean;
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +815,10 @@ function translateResults(raw: RawResults): Results {
     failures,
     tableResults,
     optionsApplied: raw.options_applied ?? false,
+    // A v2 file never recorded options: default to false so the UI says
+    // "options not recorded" rather than assume none (never a bare PASS).
+    optionsRecorded: raw.options_recorded ?? false,
+    warnings: raw.warnings ?? [],
   };
 }
 

@@ -227,6 +227,11 @@ export interface Results {
   tableResults: TableResult[];
   /** Whether any column option was applied: shows "PASS (with options)". */
   optionsApplied: boolean;
+  /** Whether the results file recorded per-column options (schema >= 3).  When
+   *  false the UI shows "options not recorded", never a bare PASS. */
+  optionsRecorded: boolean;
+  /** Run-level warnings (can-write, superuser, row-level security, ...). */
+  warnings: string[];
 }
 
 export type ReportFormat = 'pdf' | 'excel';

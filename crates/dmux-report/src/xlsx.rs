@@ -144,7 +144,11 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
         let pairs: Vec<(String, String)> = vec![
             (
                 "Verdict".into(),
-                layout::verdict_display(&layout.verdict_word, layout.options_applied),
+                layout::verdict_display(
+                    &layout.verdict_word,
+                    layout.options_applied,
+                    layout.options_recorded,
+                ),
             ),
             ("Coverage".into(), layout.coverage_line.clone()),
             ("Fully checked".into(), layout.fully_checked.to_string()),
@@ -177,7 +181,11 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
             summary.write_string(row, 1, new)?;
             row += 1;
         }
-        if layout.options_applied {
+        if !layout.options_recorded {
+            summary.write_string(row, 0, "Options applied")?;
+            summary.write_string(row, 1, layout::OPTIONS_NOT_RECORDED)?;
+            row += 1;
+        } else if layout.options_applied {
             summary.write_string(row, 0, "Options applied")?;
             summary.write_string(row, 1, "yes")?;
             row += 1;
@@ -562,6 +570,7 @@ mod tests {
             structure_findings: vec![],
             suggestions: vec![],
             definition_hash: String::new(),
+            options_recorded: true,
             options_applied: false,
             options_applied_lines: vec![],
             capture_sha256_old: None,

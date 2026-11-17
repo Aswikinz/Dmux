@@ -453,6 +453,8 @@ const makeResults = (fixture: string): Results => {
     failures,
     tableResults,
     optionsApplied: false,
+    optionsRecorded: true,
+    warnings: [],
   };
 };
 

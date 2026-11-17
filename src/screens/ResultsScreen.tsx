@@ -43,6 +43,16 @@ function IgnoredList({ ignored }: { ignored: IgnoreItem[] }) {
 
 /** Every ticked option is listed, in table.column: option form (H2 / decision 23). */
 function OptionsAppliedList({ results }: { results: Results }) {
+  if (!results.optionsRecorded) {
+    return (
+      <div className="mt-3">
+        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Options applied</h3>
+        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+          options not recorded (older results file)
+        </p>
+      </div>
+    );
+  }
   const lines: string[] = results.tableResults.flatMap((t) =>
     (t.columnNotes ?? [])
       .filter((n) => n.kind === 'option')
@@ -61,6 +71,38 @@ function OptionsAppliedList({ results }: { results: Results }) {
       </ul>
     </div>
   );
+}
+
+/** Run-level warnings (can-write, superuser, row-level security, ...). */
+function WarningsList({ warnings }: { warnings: string[] }) {
+  if (warnings.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-3">
+      <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Warnings</h3>
+      <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
+        {warnings.map((warning) => (
+          <li key={warning}>{warning}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The single, consistent verdict label: a PASS is never bare when the file
+ *  cannot vouch for options (H2 / decision 23). */
+function verdictLabel(results: Results): string | undefined {
+  if (results.verdict !== 'PASS') {
+    return undefined;
+  }
+  if (!results.optionsRecorded) {
+    return 'PASS (options not recorded — older results file)';
+  }
+  if (results.optionsApplied) {
+    return 'PASS (with options)';
+  }
+  return undefined;
 }
 
 /**
@@ -200,16 +242,16 @@ export function ResultsScreen({
       {error && <ErrorCard title="Could not load results">{error}</ErrorCard>}
       <Panel>
         <div className="flex flex-wrap items-center gap-4">
-          <StatusBadge status={results.verdict} className="text-base" />
-          {results.verdict === 'PASS' && results.optionsApplied && (
-            <span className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-              PASS (with options)
-            </span>
-          )}
+          <StatusBadge
+            status={results.verdict}
+            label={verdictLabel(results)}
+            className="text-base"
+          />
           <p className="text-sm text-slate-700 dark:text-slate-300">{coverageLabel(results.coverage)}</p>
         </div>
         <IgnoredList ignored={results.ignored} />
         <OptionsAppliedList results={results} />
+        <WarningsList warnings={results.warnings} />
         <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">
           A PASS means every in-scope table passed at its chosen level, nothing was skipped without a
           recorded reason, and no table changed during the check.

@@ -266,12 +266,16 @@ fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
     runs.push(Run::Bold(layout::verdict_display(
         &layout.verdict_word,
         layout.options_applied,
+        layout.options_recorded,
     )));
 
     runs.push(Run::Heading("Coverage".to_string()));
     runs.push(Run::Body(layout.coverage_line.clone()));
 
-    if !layout.options_applied_lines.is_empty() {
+    if !layout.options_recorded {
+        runs.push(Run::Heading("Options applied".to_string()));
+        runs.push(Run::Body(layout::OPTIONS_NOT_RECORDED.to_string()));
+    } else if !layout.options_applied_lines.is_empty() {
         runs.push(Run::Heading("Options applied".to_string()));
         for line in &layout.options_applied_lines {
             runs.push(Run::Body(line.clone()));
