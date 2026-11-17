@@ -55,20 +55,40 @@ impl Estimate {
     }
 }
 
-/// Size on disk of one table (indexes + TOAST included), 9.4-safe.
+/// Size on disk of one table (indexes + TOAST included), 9.4-safe.  The table
+/// is found by exact schema and table name (bound parameters), never by
+/// parsing a `schema.table` string, so an upper-case or dotted name can never
+/// resolve to a different table.  `None` when there is no such table.
 pub async fn table_size_bytes(
     txn: &Transaction<'_>,
     schema: &str,
     table: &str,
-) -> Result<i64, EstimateError> {
-    let regclass = format!("{schema}.{table}");
+) -> Result<Option<i64>, EstimateError> {
     let row = txn
-        .query_one(
-            "SELECT pg_catalog.pg_total_relation_size($1::pg_catalog.text::pg_catalog.regclass)",
-            &[&regclass],
+        .query_opt(
+            "SELECT pg_catalog.pg_total_relation_size(c.oid) FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&schema, &table],
         )
         .await?;
-    Ok(row.try_get(0)?)
+    Ok(match row {
+        Some(r) => Some(r.try_get(0)?),
+        None => None,
+    })
+}
+
+/// An estimate from a point value in seconds: half the point to twice the
+/// point.  The upper bound covers the second pass a failing table costs for
+/// its drill-down (PLAN.md 4.5).
+pub fn estimate_from_seconds(seconds: f64) -> Estimate {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Estimate::zero();
+    }
+    Estimate::new(
+        (seconds * 0.5).floor() as u64,
+        (seconds * 2.0).ceil() as u64,
+    )
 }
 
 /// Time one row-identity scan of a sample of rows, without the fingerprint's
@@ -143,5 +163,12 @@ mod tests {
     #[test]
     fn high_is_at_least_low() {
         assert_eq!(Estimate::new(9, 3).high_seconds, 9);
+    }
+
+    #[test]
+    fn seconds_estimate_covers_a_drilldown_pass() {
+        assert_eq!(estimate_from_seconds(10.0), Estimate::new(5, 20));
+        assert_eq!(estimate_from_seconds(0.0), Estimate::zero());
+        assert_eq!(estimate_from_seconds(f64::NAN), Estimate::zero());
     }
 }

@@ -31,7 +31,7 @@ pub enum InventoryError {
 
 /// A complete structural inventory of one database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct DatabaseInventory {
     pub server_version: String,
     pub server_version_num: i32,
@@ -47,7 +47,7 @@ pub struct DatabaseInventory {
 
 /// A schema and the objects it contains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Schema {
     pub name: String,
     pub owner: String,
@@ -61,7 +61,7 @@ pub struct Schema {
 
 /// A table, including columns, constraints, indexes and child partitions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Table {
     pub name: String,
     pub owner: String,
@@ -81,7 +81,7 @@ pub struct Table {
 
 /// A table column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Column {
     pub name: String,
     pub type_name: String,
@@ -92,7 +92,7 @@ pub struct Column {
 
 /// A table constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Constraint {
     pub name: String,
     pub kind: ConstraintKind,
@@ -112,7 +112,7 @@ pub enum ConstraintKind {
 
 /// An index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Index {
     pub name: String,
     pub valid: bool,
@@ -121,7 +121,7 @@ pub struct Index {
 
 /// A sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Sequence {
     pub name: String,
     pub data_type: String,
@@ -141,7 +141,7 @@ pub struct Sequence {
 
 /// A view or materialised view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct View {
     pub name: String,
     pub definition: String,
@@ -149,7 +149,7 @@ pub struct View {
 
 /// A function or procedure, keyed by schema + name + identity arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Function {
     pub name: String,
     pub arguments: String,
@@ -160,7 +160,7 @@ pub struct Function {
 
 /// A trigger, keyed by table + name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Trigger {
     pub name: String,
     pub table_name: String,
@@ -174,7 +174,7 @@ pub struct Trigger {
 
 /// An installed extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Extension {
     pub name: String,
     pub schema: String,

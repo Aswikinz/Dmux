@@ -2,12 +2,11 @@
 //! end as CHANGED_DURING_CHECK, never PASS.
 //!
 //! This uses the `concurrent_update.sh` harness against `demo_bank` on the
-//! 9.4 -> 18 matrix pair (ports 5435/5437) when present, and is gated behind
-//! `DMUX_TEST_RUNTIME=1` (or `CI=true`), so it never disturbs the shared
-//! 5433/5434 readers.  `concurrent_update.sh` WRITES to demo_bank.notes on the
+//! 9.4 -> 18 matrix pair (ports 5435/5437), and is gated behind
+//! `DMUX_TEST_RUNTIME=1` only (not `CI`), so it never disturbs the shared
+//! 5433/5434 readers.  It belongs in the nightly workflow.  `concurrent_update.sh` WRITES to demo_bank.notes on the
 //! new side on purpose; it is harness code guarded to local mocks.
 
-use std::collections::BTreeMap;
 use std::process::Command;
 
 use dmux_engine::db::{ConnProfile, TlsMode};
@@ -39,13 +38,8 @@ async fn run_engine(old_port: u16, new_port: u16) -> RunResults {
         new: Input::Live(profile(new_port)),
         mapping: Mapping::new(),
         default_level: CheckLevel::FullValues,
-        levels: BTreeMap::new(),
-        control_total_columns: Default::default(),
-        old_parallelism: 2,
-        new_parallelism: 4,
         allow_superuser: true,
-        export_keys: false,
-        resume_store: None,
+        ..RunConfig::default()
     };
     run(&config).await.expect("run should succeed").results
 }

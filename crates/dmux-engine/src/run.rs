@@ -1,35 +1,59 @@
 //! The comparison orchestration (PLAN.md 3 and 4.6-4.8): turn live databases or
-//! a saved fingerprint into per-table verdicts, a coverage line and an overall
-//! verdict.
+//! saved fingerprints into per-table verdicts, structure findings, a coverage
+//! line and an overall verdict.
 //!
 //! This module composes the comparison core.  It opens read-only sessions only
-//! through `db::ReadOnlySession` and never passes a table or a run unless the
-//! core said so and the consistency checks (change detection, spot check) agree.
+//! through `db::ReadOnlySession`.  Every path (live, file against live, file
+//! against file) records what it measured as [`verdict::Evidence`] and lets the
+//! shared [`verdict::Builder`] decide, so the rules cannot drift between paths.
+//! A table whose plan or scan fails becomes an explicit TOOL_FAULT result: the
+//! run never aborts on one table and never drops one silently.
+//!
+//! ## Levels
+//!
+//! * Structure — no data scan; the verdict comes from the table's structure
+//!   findings and is reported as "structure only".
+//! * CountsAndTotals — one `count(*)` plus control-total sums per side; no value
+//!   is hashed; reported as "counts only".
+//! * FullValues — the fingerprint, drill-down and independent spot check.
+//!
+//! ## Parallelism
+//!
+//! `old_parallelism` / `new_parallelism` are **maxima** (PLAN.md 4.6).  This
+//! runner scans one table at a time on each side, which never exceeds them; it
+//! does not yet run scans concurrently.  A limit below 1 is rejected.
 
 pub mod capture;
 pub mod compare_files;
+pub mod scan;
+pub mod spot;
+pub mod structure;
+pub mod verdict;
 
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 use thiserror::Error;
 
 use crate::consistency::{
-    read_counters, read_wal_position, sample_keys, spot_check_agrees, ChangeCounters,
-    SPOT_CHECK_ROWS,
+    read_counters, read_replica_state, read_server_epoch, read_wal_position, replica_decision,
+    ChangeCounters, ReplicaDecision, ReplicaState, ServerEpoch,
 };
-use crate::core::compare::{compare, SideOutcome};
+use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerdict};
 use crate::core::drilldown::{classify, fetch_rows};
-use crate::core::fingerprint::{fingerprint, Side, Source, TablePlan};
+use crate::core::fingerprint::{fingerprint, Fingerprint, Side, Source, TablePlan};
+use crate::core::normalise::{plan_column, ColumnOptions};
 use crate::db::{probe_server, ConnProfile, DbError, ReadOnlySession};
+use crate::estimate::{estimate_from_seconds, timed_sample, total_estimate, Estimate};
+use crate::inventory::{ConstraintKind, DatabaseInventory};
 use crate::mapping::Mapping;
-use crate::plan::{
-    build_table_spec, core_table_plan, read_live_table, read_live_table_opt, row_estimate,
-    TableSpec,
-};
+use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecInputs};
 use crate::results::{
-    add_table, apply_coverage, finalise, fresh_run_id, from_core, overall_verdict, CheckLevel,
-    IgnoredItem, RunResults, TableResult, Verdict, RESULTS_VERSION,
+    fresh_run_id, ChangedRowExport, CheckLevel, ControlTotalExport, RunResults, TableDetail,
 };
+use crate::store::{Loaded, RunKey, SideMark, Store, StoredTableResult};
+
+use verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 
 /// An input to a run: a live database or a saved fingerprint file.
 #[derive(Debug, Clone)]
@@ -45,52 +69,61 @@ pub struct RunConfig {
     pub new: Input,
     pub mapping: Mapping,
     pub default_level: CheckLevel,
+    /// Per-table level overrides, by old `schema.table`.
     pub levels: BTreeMap<String, CheckLevel>,
-    /// Control-total column names (applied to every matching column).
+    /// Control-total column names (applied to every table that has them).
     pub control_total_columns: BTreeSet<String>,
-    /// Parallel-scan limits per side (PLAN.md 4.6).
+    /// Per-column options (PLAN.md 3.2), by old `schema.table.column`.
+    pub column_options: BTreeMap<String, ColumnOptions>,
+    /// Maximum concurrent scans on the old side (see the module docs).
     pub old_parallelism: usize,
+    /// Maximum concurrent scans on the new side (see the module docs).
     pub new_parallelism: usize,
     pub allow_superuser: bool,
+    /// Put row keys of differing rows into the results (the user ticked export).
     pub export_keys: bool,
-    /// An optional resume store path: tables already finished there are skipped
-    /// on `--resume`, and each table's result is saved as it completes.
+    /// An optional resume store path (see `crate::store`).
     pub resume_store: Option<std::path::PathBuf>,
+    /// How long to wait before the final change-counter read, so writes made
+    /// during the run have been flushed into the server statistics (see
+    /// `crate::consistency`).  Default 2 s; definition key `stats_settle_ms`.
+    pub stats_settle: std::time::Duration,
 }
+
+/// The default [`RunConfig::stats_settle`].
+pub const DEFAULT_STATS_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Default for RunConfig {
     fn default() -> Self {
+        let local = |port| {
+            ConnProfile::new(
+                "127.0.0.1",
+                port,
+                "bank",
+                "dmux_dev",
+                "",
+                crate::db::TlsMode::Disable("default".to_string()),
+            )
+        };
         Self {
-            old: Input::Live(ConnProfile::new(
-                "127.0.0.1",
-                5433,
-                "bank",
-                "dmux_dev",
-                "",
-                crate::db::TlsMode::Disable("default".to_string()),
-            )),
-            new: Input::Live(ConnProfile::new(
-                "127.0.0.1",
-                5434,
-                "bank",
-                "dmux_dev",
-                "",
-                crate::db::TlsMode::Disable("default".to_string()),
-            )),
+            old: Input::Live(local(5433)),
+            new: Input::Live(local(5434)),
             mapping: Mapping::new(),
             default_level: CheckLevel::FullValues,
             levels: BTreeMap::new(),
             control_total_columns: BTreeSet::new(),
+            column_options: BTreeMap::new(),
             old_parallelism: 2,
             new_parallelism: 4,
             allow_superuser: false,
             export_keys: false,
             resume_store: None,
+            stats_settle: DEFAULT_STATS_SETTLE,
         }
     }
 }
 
-/// Errors from running a comparison.
+/// Errors that stop a whole run (one table's failure never does).
 #[derive(Debug, Error)]
 pub enum RunError {
     #[error("database error: {0}")]
@@ -107,6 +140,8 @@ pub enum RunError {
     Compare(#[from] crate::core::compare::CompareError),
     #[error("resume store error: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("configuration error: {0}")]
+    Config(String),
     #[error("a full run needs both sides live")]
     NeedsLive,
 }
@@ -114,21 +149,8 @@ pub enum RunError {
 impl From<tokio_postgres::Error> for RunError {
     fn from(e: tokio_postgres::Error) -> Self {
         RunError::Db(DbError::Postgres {
-            // `Error::to_string()` for a server error is just "db error"; the
-            // real reason lives in `as_db_error()`.  Keep the public message
-            // free of row values (SQLSTATE + server message only).
-            message: render_pg_error(&e),
+            message: crate::plan::render_pg_error(&e),
         })
-    }
-}
-
-/// Render a tokio-postgres error including the server message and SQLSTATE,
-/// without ever including bound-parameter values (they are not part of it).
-fn render_pg_error(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("{}: {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
     }
 }
 
@@ -158,16 +180,7 @@ pub struct RunOutcome {
 /// Enumerate `(schema, table)` pairs in scope from a live session, partitions
 /// already folded under their parent by the inventory.
 pub async fn list_tables(session: &mut ReadOnlySession) -> Result<Vec<(String, String)>, RunError> {
-    let inventory = session
-        .with_read_only("30s", |txn| {
-            Box::pin(async move {
-                crate::inventory::collect_inventory(txn)
-                    .await
-                    .map_err(RunError::from)
-                    .map_err(run_err)
-            })
-        })
-        .await?;
+    let inventory = inventory(session).await?;
     let mut out = Vec::new();
     for schema in &inventory.schemas {
         for table in &schema.tables {
@@ -178,588 +191,1183 @@ pub async fn list_tables(session: &mut ReadOnlySession) -> Result<Vec<(String, S
     Ok(out)
 }
 
-/// Map an old table name to its new name: explicit `table_mappings` first, then
-/// schema/prefix/suffix rules, then identity.
-fn map_table(mapping: &Mapping, schema: &str, table: &str) -> (String, String) {
-    // Explicit per-table rename in the mapping.
-    if let Some(sm) = mapping.schema_mappings.get(schema) {
-        if let Some(tm) = sm.table_mappings.get(table) {
-            if !tm.target_table.is_empty() {
-                return (sm.target_schema.clone(), tm.target_table.clone());
-            }
-        }
-        if !sm.target_schema.is_empty() && sm.target_schema != schema {
-            return (sm.target_schema.clone(), table.to_string());
-        }
-    }
-    for rule in &mapping.rules {
-        if matches!(rule.kind, crate::mapping::RuleKind::SchemaRename)
-            && rule.pattern.eq_ignore_ascii_case(schema)
-        {
-            return (rule.target.clone(), table.to_string());
+/// Map an old table name to its new `(schema, table)`: the schema through the
+/// schema mapping or a schema-rename rule, the table through an explicit table
+/// mapping or else the first prefix/suffix rule that matches; identity otherwise.
+pub fn map_table(mapping: &Mapping, schema: &str, table: &str) -> (String, String) {
+    let new_schema = structure::map_schema(mapping, schema);
+    if let Some(tm) = mapping
+        .schema_mappings
+        .get(schema)
+        .and_then(|sm| sm.table_mappings.get(table))
+    {
+        if !tm.target_table.is_empty() {
+            return (new_schema, tm.target_table.clone());
         }
     }
     for rule in &mapping.rules {
+        if matches!(rule.kind, crate::mapping::RuleKind::SchemaRename) {
+            continue;
+        }
         if let Some(renamed) = crate::mapping::apply_rule(rule, table) {
-            return (schema.to_string(), renamed);
+            return (new_schema, renamed);
         }
     }
-    (schema.to_string(), table.to_string())
+    (new_schema, table.to_string())
 }
 
-/// Run a full live comparison over both databases.
-pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
-    let (Input::Live(old_profile), Input::Live(new_profile)) = (&config.old, &config.new) else {
-        let result = match &config.old {
-            Input::File(old_file) => match &config.new {
-                Input::File(new_file) => compare_files::compare_two_files(old_file, new_file),
-                Input::Live(new_profile) => {
-                    compare_files::compare_file_to_live(
-                        old_file,
-                        new_profile,
-                        config.allow_superuser,
-                    )
-                    .await
-                }
+/// SHA-256 of what a run is: both inputs (connection identity without the
+/// password, or the fingerprint file's own hash), levels, control totals,
+/// options, the mapping hash and the export choice.  The resume store is keyed
+/// by it.
+pub fn definition_hash(config: &RunConfig) -> String {
+    use sha2::Digest;
+    let input = |i: &Input| match i {
+        Input::Live(p) => serde_json::json!({
+            "host": p.host, "port": p.port, "db": p.dbname, "user": p.user,
+            "tls": match &p.tls_mode {
+                crate::db::TlsMode::VerifyFull => "verify".to_string(),
+                crate::db::TlsMode::TrustFingerprint(f) => format!("fingerprint:{f}"),
+                crate::db::TlsMode::Disable(_) => "disable".to_string(),
             },
-            Input::Live(old_profile) => match &config.new {
-                Input::File(new_file) => {
-                    compare_files::compare_file_to_live(
-                        new_file,
-                        old_profile,
-                        config.allow_superuser,
-                    )
-                    .await
-                }
-                Input::Live(_) => Err(RunError::NeedsLive),
-            },
-        }?;
-        return Ok(result);
+        }),
+        Input::File(f) => serde_json::json!({ "file_sha256": f.sha256 }),
     };
+    let canonical = serde_json::json!({
+        "old": input(&config.old),
+        "new": input(&config.new),
+        "default_level": config.default_level,
+        "levels": config.levels,
+        "control_total_columns": config.control_total_columns,
+        "column_options": config.column_options,
+        "mapping_hash": config.mapping.mapping_hash,
+        "export_keys": config.export_keys,
+    });
+    hex::encode(sha2::Sha256::digest(canonical.to_string().as_bytes()))
+}
 
-    let tool_version = crate::version().to_string();
+fn level_for(config: &RunConfig, path: &str) -> CheckLevel {
+    config
+        .levels
+        .get(path)
+        .copied()
+        .unwrap_or(config.default_level)
+}
+
+/// Run a comparison: live against live, file against live (either side), or
+/// file against file.
+pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
+    if config.old_parallelism == 0 || config.new_parallelism == 0 {
+        return Err(RunError::Config(
+            "the parallel-scan limits must be at least 1".into(),
+        ));
+    }
+    match (&config.old, &config.new) {
+        (Input::Live(o), Input::Live(n)) => run_live(config, o, n).await,
+        (Input::File(o), Input::File(n)) => compare_files::compare_two_files_with(o, n, config),
+        (Input::File(f), Input::Live(p)) => {
+            compare_files::compare_file_to_live(f, Side::Old, p, config).await
+        }
+        (Input::Live(p), Input::File(f)) => {
+            compare_files::compare_file_to_live(f, Side::New, p, config).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small read-only helpers.  Each runs in its own read-only transaction and
+// returns a reason string on failure (never row data).
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn inventory(s: &mut ReadOnlySession) -> Result<DatabaseInventory, RunError> {
+    Ok(s.with_read_only("60s", |txn| {
+        Box::pin(async move {
+            crate::inventory::collect_inventory(txn)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await?)
+}
+
+pub(crate) async fn live_table(
+    s: &mut ReadOnlySession,
+    schema: &str,
+    table: &str,
+) -> Result<Option<crate::plan::LiveTable>, String> {
+    s.with_read_only("30s", |to| {
+        Box::pin(async move {
+            read_live_table_opt(&*to, schema, table)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn counters(
+    s: &mut ReadOnlySession,
+    schema: &str,
+    table: &str,
+) -> Result<ChangeCounters, String> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_counters(&*to, schema, table)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn epoch(s: &mut ReadOnlySession) -> Option<ServerEpoch> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_server_epoch(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .ok()
+}
+
+pub(crate) async fn replica(s: &mut ReadOnlySession, version_num: i32) -> Option<ReplicaState> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_replica_state(&*to, version_num)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .ok()
+}
+
+/// The replica decision for one side, with an unreadable state counted as
+/// moved (fail-closed).
+pub(crate) fn replica_outcome(
+    before: &Option<ReplicaState>,
+    after: &Option<ReplicaState>,
+) -> ReplicaDecision {
+    match (before, after) {
+        (Some(b), Some(a)) => replica_decision(b, a),
+        _ => ReplicaDecision::Moved("the recovery state could not be read"),
+    }
+}
+
+/// Apply a replica decision to a table's evidence: moved replay is a change
+/// during the check, paused replay is recorded.
+pub(crate) fn apply_replica(e: &mut verdict::Evidence, side: &str, d: &ReplicaDecision) {
+    match d {
+        ReplicaDecision::Moved(why) => {
+            e.changed = true;
+            e.notes.push(format!("{side} database: {why}"));
+        }
+        ReplicaDecision::Paused => e.notes.push(format!(
+            "{side} database: replica replay paused during the check"
+        )),
+        ReplicaDecision::Steady | ReplicaDecision::NotReplica => {}
+    }
+}
+
+pub(crate) async fn wal(s: &mut ReadOnlySession, version_num: i32) -> Option<String> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_wal_position(&*to, version_num)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .ok()
+    .and_then(|w| w.lsn)
+}
+
+pub(crate) async fn scan_fingerprint(
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+    mapping_hash: &str,
+) -> Result<Fingerprint, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            fingerprint(&*to, plan, side, src, mapping_hash)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn scan_counts(
+    s: &mut ReadOnlySession,
+    schema: &str,
+    table: &str,
+    controls: &[String],
+) -> Result<(u64, Vec<crate::core::fingerprint::Decimal>), String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            scan::counts_and_totals(&*to, schema, table, controls)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn drill_rows(
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+    buckets: &[u32],
+) -> Result<Vec<crate::core::drilldown::RowRef>, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            fetch_rows(&*to, plan, side, src, buckets)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn drill_values(
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+    hashes: &[String],
+) -> Result<std::collections::HashMap<String, Vec<Option<String>>>, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            scan::values_by_key_hash(&*to, plan, side, src, hashes)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn spot_sample(
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+) -> Result<Vec<spot::SpotRow>, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            spot::sample(&*to, plan, side, src)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn spot_fetch(
+    s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    side: Side,
+    src: &Source,
+    khs: &[String],
+) -> Result<Vec<spot::SpotRow>, String> {
+    s.with_read_only("300s", |to| {
+        Box::pin(async move {
+            spot::fetch(&*to, plan, side, src, khs)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn sample_time(
+    s: &mut ReadOnlySession,
+    schema: &str,
+    table: &str,
+    rows: u64,
+) -> Result<std::time::Duration, String> {
+    s.with_read_only("60s", |to| {
+        Box::pin(async move {
+            timed_sample(&*to, schema, table, rows)
+                .await
+                .map_err(|e| DbError::Postgres {
+                    message: e.to_string(),
+                })
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The live run.
+// ---------------------------------------------------------------------------
+
+/// One old table paired with an existing new table.
+#[derive(Debug, Clone)]
+struct Pair {
+    path: String,
+    old: (String, String),
+    new: (String, String),
+    level: CheckLevel,
+    keyed_hint: bool,
+    old_size: i64,
+    new_size: i64,
+    old_rows: i64,
+    new_rows: i64,
+}
+
+impl Pair {
+    fn new_path(&self) -> String {
+        format!("{}.{}", self.new.0, self.new.1)
+    }
+}
+
+/// Before/after change counters of one table (None: could not be read).
+type CounterPair = Option<(ChangeCounters, ChangeCounters)>;
+
+/// Whether a table's (old, new) counters moved; anything unreadable is moved.
+pub(crate) fn counters_moved(before: &CounterPair, after: Option<&CounterPair>) -> bool {
+    match (before, after) {
+        (Some((bo, bn)), Some(Some((ao, an)))) => bo.moved(ao) || bn.moved(an),
+        _ => true,
+    }
+}
+
+/// Whether the server epoch changed between two reads (an unreadable read
+/// after a readable one counts as changed).
+pub(crate) fn epoch_changed(start: &Option<ServerEpoch>, end: &Option<ServerEpoch>) -> bool {
+    match (start, end) {
+        (Some(a), Some(b)) => a != b,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// Record "replay paused" once per side in the run warnings.
+pub(crate) fn note_paused(results: &mut RunResults, side: &str, d: &ReplicaDecision) {
+    if *d == ReplicaDecision::Paused {
+        let w = format!("{side} database is a replica with replay paused during the check");
+        if !results.warnings.contains(&w) {
+            results.warnings.push(w);
+        }
+    }
+}
+
+async fn snapshot(
+    old_s: &mut ReadOnlySession,
+    new_s: &mut ReadOnlySession,
+    pairs: &[Pair],
+) -> BTreeMap<String, CounterPair> {
+    let mut out = BTreeMap::new();
+    for p in pairs.iter().filter(|p| p.level != CheckLevel::Structure) {
+        let o = counters(old_s, &p.old.0, &p.old.1).await;
+        let n = counters(new_s, &p.new.0, &p.new.1).await;
+        out.insert(p.path.clone(), o.ok().zip(n.ok()));
+    }
+    out
+}
+
+/// Size-on-disk plus a timed LIMIT sample per side (PLAN.md 4.5).
+async fn estimates(
+    old_s: &mut ReadOnlySession,
+    new_s: &mut ReadOnlySession,
+    pairs: &[Pair],
+) -> (Option<Estimate>, BTreeMap<String, Estimate>) {
+    const SAMPLE: u64 = 10_000;
+    let data: Vec<&Pair> = pairs
+        .iter()
+        .filter(|p| p.level != CheckLevel::Structure)
+        .collect();
+    // Bytes per second on one side, timed on its largest data table.
+    async fn rate(
+        s: &mut ReadOnlySession,
+        biggest: Option<(&(String, String), i64, i64)>,
+    ) -> Option<f64> {
+        let ((schema, table), size, rows) = biggest?;
+        if size <= 0 {
+            return None;
+        }
+        let took = sample_time(s, schema, table, SAMPLE).await.ok()?;
+        let share = if rows > 0 {
+            (SAMPLE as f64 / rows as f64).min(1.0)
+        } else {
+            1.0
+        };
+        Some(size as f64 * share / took.as_secs_f64().max(0.001))
+    }
+    let big_old = data
+        .iter()
+        .max_by_key(|p| p.old_size)
+        .map(|p| (&p.old, p.old_size, p.old_rows));
+    let big_new = data
+        .iter()
+        .max_by_key(|p| p.new_size)
+        .map(|p| (&p.new, p.new_size, p.new_rows));
+    let (Some(ro), Some(rn)) = (rate(old_s, big_old).await, rate(new_s, big_new).await) else {
+        return (None, BTreeMap::new());
+    };
+    let mut per = BTreeMap::new();
+    for p in &data {
+        // A keyed full-values table is read twice per side (fingerprint and
+        // spot-check sample); everything else once.
+        let passes = if p.level == CheckLevel::FullValues && p.keyed_hint {
+            2.0
+        } else {
+            1.0
+        };
+        let secs = passes * (p.old_size.max(0) as f64 / ro + p.new_size.max(0) as f64 / rn);
+        per.insert(p.path.clone(), estimate_from_seconds(secs));
+    }
+    let total = total_estimate(&per.values().copied().collect::<Vec<_>>());
+    (Some(total), per)
+}
+
+async fn run_live(
+    config: &RunConfig,
+    old_profile: &ConnProfile,
+    new_profile: &ConnProfile,
+) -> Result<RunOutcome, RunError> {
     let mapping_hash = config.mapping.mapping_hash.clone();
-    // A separate copy for the per-table scan closures (the primary one is moved
-    // into the results payload).
-    let scan_mapping_hash = mapping_hash.clone();
+    let def_hash = definition_hash(config);
 
     let old_info = probe_server(old_profile, config.allow_superuser).await?;
     let new_info = probe_server(new_profile, config.allow_superuser).await?;
+    let mut old_s = ReadOnlySession::open(old_profile, config.allow_superuser).await?;
+    let mut new_s = ReadOnlySession::open(new_profile, config.allow_superuser).await?;
 
-    let mut warnings = Vec::new();
-    if old_info.sql_ascii {
-        warnings
-            .push("old database is SQL_ASCII; never a clean PASS on encoding (P19)".to_string());
-    }
-    if new_info.sql_ascii {
-        warnings
-            .push("new database is SQL_ASCII; never a clean PASS on encoding (P19)".to_string());
-    }
-    let sql_ascii = old_info.sql_ascii || new_info.sql_ascii;
-
-    let mut old_session = ReadOnlySession::open(old_profile, config.allow_superuser).await?;
-    let mut new_session = ReadOnlySession::open(new_profile, config.allow_superuser).await?;
-
-    // Open the resume store, if requested, and load the set of already-finished
-    // tables to skip.
-    let store = match config.resume_store.as_ref() {
-        Some(path) => Some(crate::store::Store::open(path)?),
+    // Resume store: bound to this run's key; the run id survives resumes.
+    let store = match config.resume_store.as_deref() {
+        Some(path) => Some(Store::open(path)?),
         None => None,
     };
-    let skip_tables: BTreeSet<String> = match store.as_ref() {
-        Some(s) => s.finished_tables()?.into_iter().collect(),
-        None => BTreeSet::new(),
-    };
-    let store = std::cell::RefCell::new(store);
-
-    // Record the write-ahead-log position at run start (version-branched).
-    let wal_start = new_session
-        .with_read_only("5s", |to| {
-            let v = new_info.version_num;
-            Box::pin(async move {
-                read_wal_position(&*to, v)
-                    .await
-                    .map_err(RunError::from)
-                    .map_err(run_err)
-            })
-        })
-        .await?;
-
-    let old_tables = list_tables(&mut old_session).await?;
-
-    // Plan every table first (resolves column types from the live catalogue).
-    let mut specs: Vec<TableSpec> = Vec::with_capacity(old_tables.len());
-    let mut missing_tables: Vec<String> = Vec::new();
-    for (schema, table) in &old_tables {
-        let (new_schema, new_name) = map_table(&config.mapping, schema, table);
-        let level = config
-            .levels
-            .get(&format!("{schema}.{table}"))
-            .copied()
-            .unwrap_or(config.default_level);
-
-        let old_live = old_session
-            .with_read_only("5s", |to| {
-                Box::pin(async move {
-                    read_live_table(&*to, schema, table)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
-            })
-            .await?;
-        let (ns_n, nn_n) = (new_schema.clone(), new_name.clone());
-        let new_live = new_session
-            .with_read_only("5s", |to| {
-                Box::pin(async move {
-                    read_live_table_opt(&*to, &ns_n, &nn_n)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
-            })
-            .await?;
-        let Some(new_live) = new_live else {
-            // The mapped new-side table does not exist: a structure difference
-            // (rename/drop), recorded here so the run never aborts and the
-            // table is reported as missing, not PASS.
-            missing_tables.push(format!("{schema}.{table}"));
-            continue;
-        };
-        let estimate = old_session
-            .with_read_only("5s", |to| {
-                Box::pin(async move {
-                    row_estimate(&*to, schema, table)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
-            })
-            .await?;
-
-        specs.push(build_table_spec(
-            &old_live,
-            &new_live,
-            &new_schema,
-            &new_name,
-            level,
-            &config.mapping,
-            &config.control_total_columns,
-            estimate,
-        ));
-    }
-
-    // Build core plans up front so a bad column fails before any scan.
-    let mut plans: Vec<(TablePlan, Source, Source)> = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        let plan = core_table_plan(spec)?;
-        let old_src = Source::Table {
-            schema: spec.old_schema.clone(),
-            name: spec.old_name.clone(),
-        };
-        let new_src = Source::Table {
-            schema: spec.new_schema.clone(),
-            name: spec.new_name.clone(),
-        };
-        plans.push((plan, old_src, new_src));
-    }
-
-    let mut results = RunResults {
-        results_version: RESULTS_VERSION,
-        run_id: fresh_run_id(),
-        tool_version,
-        mapping_hash,
-        verdict: Verdict::Pass,
-        coverage_line: String::new(),
-        fully_checked: 0,
-        counts_only: 0,
-        ignored: 0,
-        tables: BTreeMap::new(),
-        ignored_items: Vec::new(),
-        changed_during_check: Vec::new(),
-        warnings,
-        wal_start_lsn: wal_start.lsn.clone(),
-        wal_end_lsn: None,
-        results_sha256: String::new(),
-    };
-    if let Some(s) = store.borrow().as_ref() {
-        let _ = s.set_meta("run_id", &results.run_id);
-        let _ = s.set_meta("tool_version", &results.tool_version);
-    }
-
-    // Tables whose mapped new-side counterpart does not exist are recorded as
-    // missing (a structure difference), never silently PASSed.
-    for name in &missing_tables {
-        results.tables.insert(
-            name.clone(),
-            TableResult {
-                table: name.clone(),
-                level: config.default_level,
-                verdict: Verdict::Fail,
-                old_rows: None,
-                new_rows: None,
-                columns_covered: None,
-                differing_buckets: None,
-                missing_buckets: None,
-                extra_buckets: None,
-                missing_rows: None,
-                extra_rows: None,
-                changed_rows: None,
-                reasons: vec!["table missing in the new database".to_string()],
+    let run_id = match &store {
+        Some(s) => s.bind(
+            &RunKey {
+                definition_hash: def_hash.clone(),
+                mapping_hash: mapping_hash.clone(),
+                tool_version: crate::version().to_string(),
             },
-        );
-        results.fully_checked += 1;
+            &fresh_run_id(),
+        )?,
+        None => fresh_run_id(),
+    };
+
+    let mut b = Builder::new(run_id, mapping_hash.clone(), def_hash);
+    b.set_sql_ascii(old_info.sql_ascii || new_info.sql_ascii);
+    if old_info.sql_ascii {
+        b.results
+            .warnings
+            .push("old database is SQL_ASCII; never a clean PASS on encoding (P19)".into());
     }
+    if new_info.sql_ascii {
+        b.results
+            .warnings
+            .push("new database is SQL_ASCII; never a clean PASS on encoding (P19)".into());
+    }
+    b.results.wal_start_lsn = wal(&mut new_s, new_info.version_num).await;
+    // What the counters are relative to (see `crate::consistency`).
+    let epoch_old = epoch(&mut old_s).await;
+    let epoch_new = epoch(&mut new_s).await;
 
-    // Change detection (PLAN 3.4): snapshot every table's counters before the
-    // scans, then again after, and flag any table that moved.  This run-level
-    // sweep is robust to a small table scanned in a few milliseconds.
-    let before_old_counters = snapshot_counters(&mut old_session, &specs, Side::Old).await?;
-    let before_new_counters = snapshot_counters(&mut new_session, &specs, Side::New).await?;
+    // Structure: both inventories, compared after the mapping is applied.
+    let old_inv = inventory(&mut old_s).await?;
+    let new_inv = inventory(&mut new_s).await?;
+    let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
 
-    for (i, spec) in specs.iter().enumerate() {
-        let plan = plans[i].0.clone();
-        let old_src = plans[i].1.clone();
-        let new_src = plans[i].2.clone();
-        let table_path = format!("{}.{}", spec.old_schema, spec.old_name);
-
-        // Resume: skip a table already finished in a previous run.
-        if skip_tables.contains(&table_path) {
-            if let Some(prev) = store.borrow().as_ref().and_then(|s| {
-                s.load_tables()
-                    .ok()
-                    .and_then(|v| v.into_iter().find(|t| t.table == table_path))
-            }) {
-                add_table(
-                    &mut results,
-                    TableResult {
-                        table: table_path.clone(),
-                        level: prev.level,
-                        verdict: prev.verdict,
-                        old_rows: prev.old_rows,
-                        new_rows: prev.new_rows,
-                        columns_covered: None,
-                        differing_buckets: None,
-                        missing_buckets: None,
-                        extra_buckets: None,
-                        missing_rows: None,
-                        extra_rows: None,
-                        changed_rows: None,
-                        reasons: prev.reasons.clone(),
-                    },
-                );
+    // Pair every old table with its mapped new table.
+    let table_ignores: BTreeMap<String, String> = config
+        .mapping
+        .ignored
+        .iter()
+        .filter(|i| i.path.matches('.').count() == 1)
+        .map(|i| (i.path.clone(), i.reason.clone()))
+        .collect();
+    let mut new_tables = BTreeMap::new();
+    for s in &new_inv.schemas {
+        for t in &s.tables {
+            new_tables.insert(format!("{}.{}", s.name, t.name), (s.name.clone(), t));
+        }
+    }
+    let mut targets = BTreeSet::new();
+    let mut pairs: Vec<Pair> = Vec::new();
+    for s in &old_inv.schemas {
+        for t in &s.tables {
+            let path = format!("{}.{}", s.name, t.name);
+            let (ns, nt) = map_table(&config.mapping, &s.name, &t.name);
+            let new_path = format!("{ns}.{nt}");
+            targets.insert(new_path.clone());
+            if let Some(reason) = table_ignores.get(&path) {
+                b.ignore_table(&path, reason);
+                continue;
             }
-            continue;
-        }
-
-        // Table-level ignore.
-        if let Some(item) = config
-            .mapping
-            .ignored
-            .iter()
-            .find(|it| it.path == table_path)
-        {
-            results.ignored_items.push(IgnoredItem {
-                path: table_path,
-                reason: item.reason.clone(),
-            });
-            results.ignored += 1;
-            continue;
-        }
-
-        // Record columns with no counterpart as schema notes for the report; they
-        // are structure differences (handled by `dmux diff`), so they do not
-        // change the data verdict by themselves.
-        let mut schema_notes: Vec<String> = Vec::new();
-        for c in &spec.uncovered {
-            schema_notes.push(format!("column has no mapped counterpart: {c}"));
-        }
-
-        // Scan both sides.
-        let old_fp = old_session
-            .with_read_only("300s", |to| {
-                let p = plan.clone();
-                let s = old_src.clone();
-                let mh = scan_mapping_hash.clone();
-                Box::pin(async move {
-                    fingerprint(&*to, &p, Side::Old, &s, &mh)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
-            })
-            .await?;
-        let new_fp = new_session
-            .with_read_only("300s", |to| {
-                let p = plan.clone();
-                let s = new_src.clone();
-                let mh = scan_mapping_hash.clone();
-                Box::pin(async move {
-                    fingerprint(&*to, &p, Side::New, &s, &mh)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
-            })
-            .await?;
-
-        // Change detection is resolved after the loop from the before/after
-        // counter snapshots (below).
-
-        let comparison = compare(SideOutcome::Ok(&old_fp), SideOutcome::Ok(&new_fp))?;
-
-        // Drill down.
-        let (mut missing_rows, mut extra_rows, mut changed_rows) = (None, None, None);
-        // Any schema notes (dropped/added columns) are reported here as
-        // informational; they do not change the data verdict.
-        let mut reasons: Vec<String> = schema_notes;
-        // Translate the core's not-pass reasons into the report.
-        for r in &comparison.reasons {
-            reasons.push(match r {
-                crate::core::compare::NotPassReason::CountsDiffer => {
-                    "row counts differ".to_string()
-                }
-                crate::core::compare::NotPassReason::BucketsDiffer => {
-                    "bucket summaries differ".to_string()
-                }
-                crate::core::compare::NotPassReason::ControlTotalsDiffer => {
-                    "control totals differ".to_string()
-                }
-                crate::core::compare::NotPassReason::NeedsReview => {
-                    "a column was compared by an inexact printed form".to_string()
-                }
-                crate::core::compare::NotPassReason::SideErrored => {
-                    "a side failed to scan".to_string()
-                }
-                crate::core::compare::NotPassReason::Truncated => {
-                    "a side returned a truncated scan".to_string()
-                }
-            });
-        }
-        let mut drill_fault = false;
-        if comparison.verdict != crate::core::compare::Verdict::Pass
-            && comparison.verdict != crate::core::compare::Verdict::Error
-        {
-            let buckets = comparison.drilldown_buckets();
-            let old_refs = old_session
-                .with_read_only("300s", |to| {
-                    let p = plan.clone();
-                    let s = old_src.clone();
-                    let b = buckets.clone();
-                    Box::pin(async move {
-                        fetch_rows(&*to, &p, Side::Old, &s, &b)
-                            .await
-                            .map_err(RunError::from)
-                            .map_err(run_err)
-                    })
-                })
-                .await?;
-            let new_refs = new_session
-                .with_read_only("300s", |to| {
-                    let p = plan.clone();
-                    let s = new_src.clone();
-                    let b = buckets.clone();
-                    Box::pin(async move {
-                        fetch_rows(&*to, &p, Side::New, &s, &b)
-                            .await
-                            .map_err(RunError::from)
-                            .map_err(run_err)
-                    })
-                })
-                .await?;
-            let drill = classify(old_refs, new_refs);
-            missing_rows = Some(drill.missing.len());
-            extra_rows = Some(drill.extra.len());
-            changed_rows = Some(drill.changed.len());
-            if !drill.explains_difference() {
-                reasons
-                    .push("drill-down found no row explaining the differing buckets".to_string());
-                drill_fault = true;
+            let level = level_for(config, &path);
+            match new_tables.get(&new_path) {
+                None => b.record(Evidence::new(&path, level, Outcome::MissingOnNew)),
+                Some((_, new_t)) => pairs.push(Pair {
+                    path,
+                    old: (s.name.clone(), t.name.clone()),
+                    new: (ns, nt),
+                    level,
+                    keyed_hint: t
+                        .constraints
+                        .iter()
+                        .any(|c| c.kind == ConstraintKind::PrimaryKey),
+                    old_size: t.size_bytes,
+                    new_size: new_t.size_bytes,
+                    old_rows: t.n_live_tup,
+                    new_rows: new_t.n_live_tup,
+                }),
             }
         }
-
-        // Independent spot check for keyed tables.
-        let mut spot_fault = false;
-        if spec.is_keyed() {
-            let key_col = spec.columns[spec.key[0]].old_name.clone();
-            let old_keys = old_session
-                .with_read_only("30s", |to| {
-                    let k = key_col.clone();
-                    Box::pin(async move {
-                        sample_keys(&*to, &spec.old_schema, &spec.old_name, &k, SPOT_CHECK_ROWS)
-                            .await
-                            .map_err(RunError::from)
-                            .map_err(run_err)
-                    })
-                })
-                .await?;
-            let new_keys = new_session
-                .with_read_only("30s", |to| {
-                    let k = key_col.clone();
-                    Box::pin(async move {
-                        sample_keys(&*to, &spec.new_schema, &spec.new_name, &k, SPOT_CHECK_ROWS)
-                            .await
-                            .map_err(RunError::from)
-                            .map_err(run_err)
-                    })
-                })
-                .await?;
-            if !spot_check_agrees(&old_keys, &new_keys) {
-                reasons.push("independent spot check disagrees with the fingerprint".to_string());
-                spot_fault = true;
-            }
-        }
-
-        let verdict = if spot_fault || drill_fault {
-            Verdict::ToolFault
+    }
+    for (new_path, _) in new_tables.iter().filter(|(p, _)| !targets.contains(*p)) {
+        if let Some(reason) = table_ignores.get(new_path) {
+            b.ignore_table(new_path, reason);
         } else {
-            from_core(comparison.verdict)
+            b.record(Evidence::new(
+                new_path,
+                config.default_level,
+                Outcome::OnlyOnNew,
+            ));
+        }
+    }
+
+    let (total, per) = estimates(&mut old_s, &mut new_s, &pairs).await;
+    b.results.estimate = total;
+    b.results.table_estimates = per;
+
+    let before = snapshot(&mut old_s, &mut new_s, &pairs).await;
+
+    for p in &pairs {
+        let started = Instant::now();
+        if p.level == CheckLevel::Structure {
+            let mine: Vec<_> = findings
+                .iter()
+                .filter(|f| structure::table_of(f).as_deref() == Some(p.new_path().as_str()))
+                .cloned()
+                .collect();
+            b.record(Evidence::new(&p.path, p.level, Outcome::Structure(mine)));
+            continue;
+        }
+        let Some(Some((bo, bn))) = before.get(&p.path).cloned() else {
+            b.record(Evidence::new(
+                &p.path,
+                p.level,
+                Outcome::Fault(
+                    "the change counters could not be read, so changes during the check cannot be ruled out"
+                        .into(),
+                ),
+            ));
+            continue;
         };
 
-        add_table(
-            &mut results,
-            TableResult {
-                table: table_path.clone(),
-                level: spec.level,
-                verdict,
-                old_rows: comparison.old_rows,
-                new_rows: comparison.new_rows,
-                columns_covered: Some(spec.columns_covered()),
-                differing_buckets: Some(comparison.differing.len()),
-                missing_buckets: Some(comparison.missing.len()),
-                extra_buckets: Some(comparison.extra.len()),
-                missing_rows,
-                extra_rows,
-                changed_rows,
-                reasons: reasons.clone(),
-            },
+        let ro = replica(&mut old_s, old_info.version_num).await;
+        let rn = replica(&mut new_s, new_info.version_num).await;
+
+        // Resume: reuse a stored conclusive result only if nothing that could
+        // vouch for the table moved since it was stored (counters, storage,
+        // server epoch, replica replay).  Anything else is rescanned.
+        if let (Some(s), Some(ro), Some(rn)) = (&store, &ro, &rn) {
+            if let Loaded::Found(st) = s.load_table(&p.path)? {
+                let now_old = SideMark {
+                    counters: bo.clone(),
+                    epoch: epoch_old.clone().unwrap_or_default(),
+                    replica: ro.clone(),
+                };
+                let now_new = SideMark {
+                    counters: bn.clone(),
+                    epoch: epoch_new.clone().unwrap_or_default(),
+                    replica: rn.clone(),
+                };
+                if st.rescan_reason(p.level, &now_old, &now_new).is_none() {
+                    b.record_resumed(st.result.clone());
+                    continue;
+                }
+            }
+        }
+
+        let mut e = scan_pair(
+            config,
+            &mut old_s,
+            &mut new_s,
+            p,
+            &mapping_hash,
+            &mut b.results,
+        )
+        .await;
+
+        // Replica replay during this table's scans (counters are blind there).
+        let ro_after = replica(&mut old_s, old_info.version_num).await;
+        let rn_after = replica(&mut new_s, new_info.version_num).await;
+        for (side, d) in [
+            ("old", replica_outcome(&ro, &ro_after)),
+            ("new", replica_outcome(&rn, &rn_after)),
+        ] {
+            note_paused(&mut b.results, side, &d);
+            apply_replica(&mut e, side, &d);
+        }
+
+        // Per-table change check, and the marks stored for resume.
+        let ao = counters(&mut old_s, &p.old.0, &p.old.1).await;
+        let an = counters(&mut new_s, &p.new.0, &p.new.1).await;
+        match (ao, an) {
+            (Ok(ao), Ok(an)) => {
+                if bo.moved(&ao) || bn.moved(&an) {
+                    e.changed = true;
+                }
+                if let Some(s) = &store {
+                    // The final, flag-applied verdict (P19 included).
+                    let (result, _) = b.decide_now(&e);
+                    s.save_table(&StoredTableResult {
+                        table: p.path.clone(),
+                        level: p.level,
+                        result,
+                        old: SideMark {
+                            counters: ao,
+                            epoch: epoch_old.clone().unwrap_or_default(),
+                            replica: ro_after.clone().unwrap_or_default(),
+                        },
+                        new: SideMark {
+                            counters: an,
+                            epoch: epoch_new.clone().unwrap_or_default(),
+                            replica: rn_after.clone().unwrap_or_default(),
+                        },
+                        wal_lsn: wal(&mut new_s, new_info.version_num).await,
+                    })?;
+                }
+            }
+            _ => e.changed = true,
+        }
+        b.record(e);
+        b.results
+            .table_elapsed_ms
+            .insert(p.path.clone(), started.elapsed().as_millis() as u64);
+    }
+
+    // Run-level change sweep: any table that moved since the first snapshot is
+    // CHANGED_DURING_CHECK, never PASS.  Unreadable counters count as moved.
+    // Wait first, so writes made during the run reach the statistics.
+    tokio::time::sleep(config.stats_settle).await;
+    let after = snapshot(&mut old_s, &mut new_s, &pairs).await;
+    // A restart or stats reset during the run makes every counter comparison
+    // meaningless: every scanned table is treated as changed.
+    let epoch_moved = epoch_changed(&epoch_old, &epoch(&mut old_s).await)
+        || epoch_changed(&epoch_new, &epoch(&mut new_s).await);
+    if epoch_moved {
+        b.results.warnings.push(
+            "a server restarted or its statistics were reset during the run; changes cannot be ruled out"
+                .into(),
         );
-
-        // Save this finished table to the resume store (counts and hashes only,
-        // never row values).
-        if let Some(s) = store.borrow().as_ref() {
-            if let Some(t) = results.tables.get(&table_path) {
-                let _ = s.save_table(&crate::store::StoredTableResult {
-                    table: table_path.clone(),
-                    level: spec.level,
-                    verdict: t.verdict,
-                    old_rows: t.old_rows,
-                    new_rows: t.new_rows,
-                    bucket_digits: spec.bucket_digits,
-                    buckets_old: Some(old_fp.buckets.clone()),
-                    buckets_new: Some(new_fp.buckets.clone()),
-                    control_totals_old: old_fp.control_totals.clone(),
-                    control_totals_new: new_fp.control_totals.clone(),
-                    needs_review: old_fp.needs_review || new_fp.needs_review,
-                    reasons,
-                });
-            }
+    }
+    for (path, b4) in &before {
+        if epoch_moved || counters_moved(b4, after.get(path)) {
+            b.mark_changed(path);
         }
     }
 
-    // Ignored columns also go into the report.
-    for spec in &specs {
-        for (path, reason) in &spec.ignored_columns {
-            results.ignored_items.push(IgnoredItem {
-                path: path.clone(),
-                reason: reason.clone(),
-            });
-        }
-    }
+    b.results.wal_end_lsn = wal(&mut new_s, new_info.version_num).await;
+    Ok(b.finish())
+}
 
-    // Change detection: any table whose counters moved during the run is
-    // CHANGED_DURING_CHECK, never PASS (PLAN 3.4).
-    let after_old_counters = snapshot_counters(&mut old_session, &specs, Side::Old).await?;
-    let after_new_counters = snapshot_counters(&mut new_session, &specs, Side::New).await?;
-    for spec in &specs {
-        let table_path = format!("{}.{}", spec.old_schema, spec.old_name);
-        let old_moved = before_old_counters.get(&table_path) != after_old_counters.get(&table_path);
-        let new_moved = before_new_counters.get(&table_path) != after_new_counters.get(&table_path);
-        if old_moved || new_moved {
-            if let Some(t) = results.tables.get_mut(&table_path) {
-                t.verdict = Verdict::ChangedDuringCheck;
-                t.reasons
-                    .push("the table changed during the check".to_string());
-            }
-            results.changed_during_check.push(table_path);
+/// Scan one paired table at its level and return the evidence.  Detail for
+/// the report (changed columns, exported keys, differing control totals) goes
+/// into `results.details`.
+async fn scan_pair(
+    config: &RunConfig,
+    old_s: &mut ReadOnlySession,
+    new_s: &mut ReadOnlySession,
+    p: &Pair,
+    mapping_hash: &str,
+    results: &mut RunResults,
+) -> Evidence {
+    let fault = |why: String| Evidence::new(&p.path, p.level, Outcome::Fault(why));
+    let old_live = match live_table(old_s, &p.old.0, &p.old.1).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return fault("the table disappeared from the old database during the run".into())
         }
-    }
+        Err(e) => return fault(format!("the old table could not be read: {e}")),
+    };
+    let new_live = match live_table(new_s, &p.new.0, &p.new.1).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return fault("the table disappeared from the new database during the run".into())
+        }
+        Err(e) => return fault(format!("the new table could not be read: {e}")),
+    };
+    let spec = build_table_spec(
+        &old_live,
+        &new_live,
+        SpecInputs {
+            new_schema: &p.new.0,
+            new_name: &p.new.1,
+            level: p.level,
+            mapping: &config.mapping,
+            control_total_columns: &config.control_total_columns,
+            column_options: &config.column_options,
+            estimated_rows: p.old_rows.max(p.new_rows).max(0) as u64,
+        },
+    );
 
-    if !results.changed_during_check.is_empty() {
-        results.warnings.push(format!(
-            "{} table(s) changed during check",
-            results.changed_during_check.len()
+    let with_coverage = |mut e: Evidence| {
+        e.dropped = spec.dropped.clone();
+        e.added = spec.added.clone();
+        e.ignored_columns = spec.ignored_columns.clone();
+        e.columns_covered = Some(spec.columns_covered());
+        e
+    };
+    if spec.columns.is_empty() {
+        return with_coverage(fault(
+            "no column could be paired between the two sides".into(),
         ));
     }
+    let old_src = Source::Table {
+        schema: p.old.0.clone(),
+        name: p.old.1.clone(),
+    };
+    let new_src = Source::Table {
+        schema: p.new.0.clone(),
+        name: p.new.1.clone(),
+    };
 
-    let verdicts: Vec<Verdict> = results.tables.values().map(|t| t.verdict).collect();
-    if sql_ascii {
-        let v = overall_verdict(&verdicts);
-        results.verdict = if v.is_pass() { Verdict::NeedsReview } else { v };
-    } else {
-        results.verdict = overall_verdict(&verdicts);
+    match p.level {
+        CheckLevel::Structure => unreachable!("structure-level tables are not scanned"),
+        CheckLevel::CountsAndTotals => {
+            let mut old_controls = Vec::new();
+            let mut new_controls = Vec::new();
+            let mut control_names = Vec::new();
+            for m in &spec.columns {
+                match plan_column(m) {
+                    Ok(cp) => {
+                        if let (Some(o), Some(n)) = (cp.old_control, cp.new_control) {
+                            old_controls.push(o);
+                            new_controls.push(n);
+                            control_names.push(m.old_name.clone());
+                        }
+                    }
+                    Err(e) => {
+                        return with_coverage(fault(format!(
+                            "column {} cannot be planned: {e}",
+                            m.old_name
+                        )))
+                    }
+                }
+            }
+            let o = scan_counts(old_s, &p.old.0, &p.old.1, &old_controls).await;
+            let n = scan_counts(new_s, &p.new.0, &p.new.1, &new_controls).await;
+            match (o, n) {
+                (Ok((orows, ototals)), Ok((nrows, ntotals))) => {
+                    export_control_totals(results, &p.path, &control_names, &ototals, &ntotals);
+                    with_coverage(Evidence::new(
+                        &p.path,
+                        p.level,
+                        Outcome::Counts(CountsComparison {
+                            old_rows: orows,
+                            new_rows: nrows,
+                            old_totals: ototals,
+                            new_totals: ntotals,
+                        }),
+                    ))
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    with_coverage(fault(format!("count scan failed: {e}")))
+                }
+            }
+        }
+        CheckLevel::FullValues => {
+            let plan = match core_table_plan(&spec) {
+                Ok(plan) => plan,
+                Err(e) => return with_coverage(fault(format!("the plan cannot be built: {e}"))),
+            };
+            let ofp = scan_fingerprint(old_s, &plan, Side::Old, &old_src, mapping_hash).await;
+            let nfp = scan_fingerprint(new_s, &plan, Side::New, &new_src, mapping_hash).await;
+            let (ofp, nfp) = match (ofp, nfp) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => {
+                    return with_coverage(fault(format!("fingerprint scan failed: {e}")))
+                }
+            };
+            let comparison = match compare(SideOutcome::Ok(&ofp), SideOutcome::Ok(&nfp)) {
+                Ok(c) => c,
+                Err(e) => {
+                    return with_coverage(fault(format!("fingerprints cannot be compared: {e}")))
+                }
+            };
+            let names: Vec<String> = spec.columns.iter().map(|c| c.old_name.clone()).collect();
+            let control_names: Vec<String> = plan
+                .columns()
+                .iter()
+                .zip(names.iter())
+                .filter(|(c, _)| c.old_control.is_some())
+                .map(|(_, n)| n.clone())
+                .collect();
+            export_control_totals(
+                results,
+                &p.path,
+                &control_names,
+                &ofp.control_totals,
+                &nfp.control_totals,
+            );
+
+            let mut e = with_coverage(Evidence::new(
+                &p.path,
+                p.level,
+                Outcome::Full(comparison.clone()),
+            ));
+            drill(
+                config,
+                old_s,
+                new_s,
+                &plan,
+                &old_src,
+                &new_src,
+                &comparison,
+                &names,
+                &p.path,
+                &mut e,
+                results,
+            )
+            .await;
+            e.spot = if plan.is_keyed() {
+                spot_check(old_s, new_s, &plan, &old_src, &new_src, &comparison).await
+            } else {
+                Spot::NotRun("the table has no key; it is compared as a counted set".into())
+            };
+            e
+        }
     }
-    results = apply_coverage(results);
+}
 
-    // Record the write-ahead-log position at run end.
-    let wal_end = new_session
-        .with_read_only("5s", |to| {
-            let v = new_info.version_num;
-            Box::pin(async move {
-                read_wal_position(&*to, v)
-                    .await
-                    .map_err(RunError::from)
-                    .map_err(run_err)
-            })
+fn export_control_totals(
+    results: &mut RunResults,
+    table: &str,
+    names: &[String],
+    old: &[crate::core::fingerprint::Decimal],
+    new: &[crate::core::fingerprint::Decimal],
+) {
+    let differ: Vec<ControlTotalExport> = names
+        .iter()
+        .zip(old.iter().zip(new.iter()))
+        .filter(|(_, (o, n))| o != n)
+        .map(|(c, (o, n))| ControlTotalExport {
+            column: c.clone(),
+            old: o.to_string(),
+            new: n.to_string(),
         })
-        .await?;
-    results.wal_end_lsn = wal_end.lsn;
-
-    let exit_code = exit_code_for(results.verdict);
-    Ok(RunOutcome {
-        results: finalise(results),
-        exit_code,
-    })
-}
-
-fn exit_code_for(v: Verdict) -> u8 {
-    match v {
-        Verdict::Pass => 0,
-        Verdict::Warning | Verdict::NeedsReview => 2,
-        _ => 1,
+        .collect();
+    if !differ.is_empty() {
+        results
+            .details
+            .entry(table.to_string())
+            .or_default()
+            .control_totals = differ;
     }
 }
 
-/// Read every in-scope table's change counters in one pass, keyed by
-/// `schema.table`.  Used for the run-level before/after change-detection sweep.
-async fn snapshot_counters(
-    session: &mut ReadOnlySession,
-    specs: &[TableSpec],
-    side: Side,
-) -> Result<BTreeMap<String, ChangeCounters>, RunError> {
-    let mut out = BTreeMap::new();
-    for spec in specs {
-        let (schema, table) = match side {
-            Side::Old => (&spec.old_schema, &spec.old_name),
-            Side::New => (&spec.new_schema, &spec.new_name),
-        };
-        let counters = session
-            .with_read_only("5s", |to| {
-                let s = schema.clone();
-                let t = table.clone();
-                Box::pin(async move {
-                    read_counters(&*to, &s, &t)
-                        .await
-                        .map_err(RunError::from)
-                        .map_err(run_err)
-                })
+/// The drill-down for a table with differing buckets: missing, extra and
+/// changed rows, and for up to 100 changed rows the differing columns.
+#[allow(clippy::too_many_arguments)]
+async fn drill(
+    config: &RunConfig,
+    old_s: &mut ReadOnlySession,
+    new_s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    old_src: &Source,
+    new_src: &Source,
+    comparison: &Comparison,
+    names: &[String],
+    table: &str,
+    e: &mut Evidence,
+    results: &mut RunResults,
+) {
+    if comparison.non_equal().is_empty() || comparison.verdict == CoreVerdict::Error {
+        return;
+    }
+    let buckets = comparison.drilldown_buckets();
+    let (o, n) = (
+        drill_rows(old_s, plan, Side::Old, old_src, &buckets).await,
+        drill_rows(new_s, plan, Side::New, new_src, &buckets).await,
+    );
+    let (o, n) = match (o, n) {
+        (Ok(o), Ok(n)) => (o, n),
+        (Err(why), _) | (_, Err(why)) => {
+            e.floors.push((
+                crate::results::Verdict::ToolFault,
+                format!("the drill-down scan failed: {why}"),
+            ));
+            return;
+        }
+    };
+    let d = classify(o, n);
+    e.missing_rows = Some(d.missing.len());
+    e.extra_rows = Some(d.extra.len());
+    e.changed_rows = Some(d.changed.len());
+    if !d.explains_difference() {
+        e.drill_unexplained = true;
+    }
+
+    let mut detail = TableDetail::default();
+    if config.export_keys {
+        detail.missing_keys = Some(d.missing.iter().map(|r| r.key.clone()).collect());
+        detail.extra_keys = Some(d.extra.iter().map(|r| r.key.clone()).collect());
+    }
+    if plan.is_keyed() && !d.changed.is_empty() {
+        let take = &d.changed[..d
+            .changed
+            .len()
+            .min(crate::core::drilldown::CHANGED_DETAIL_LIMIT)];
+        let hashes: Vec<String> = take.iter().map(|(o, _)| o.key_hash.clone()).collect();
+        let ov = drill_values(old_s, plan, Side::Old, old_src, &hashes).await;
+        let nv = drill_values(new_s, plan, Side::New, new_src, &hashes).await;
+        match (ov, nv) {
+            (Ok(ov), Ok(nv)) => {
+                let mut all_cols = BTreeSet::new();
+                for (o, _) in take {
+                    let (Some(a), Some(b)) = (ov.get(&o.key_hash), nv.get(&o.key_hash)) else {
+                        // The row vanished between scans: the data moved.
+                        e.drill_unexplained = true;
+                        continue;
+                    };
+                    let (cols, words) = scan::differing_columns(names, a, b);
+                    if cols.is_empty() {
+                        e.drill_unexplained = true;
+                        continue;
+                    }
+                    let cols: Vec<String> = cols.iter().map(|i| names[*i].clone()).collect();
+                    all_cols.extend(cols.iter().cloned());
+                    for w in words {
+                        if !detail.plain_words.contains(&w) {
+                            detail.plain_words.push(w);
+                        }
+                    }
+                    detail.changed_rows.push(ChangedRowExport {
+                        key: config.export_keys.then(|| o.key.clone()),
+                        columns: cols,
+                    });
+                }
+                detail.changed_columns = all_cols.into_iter().collect();
+            }
+            (Err(why), _) | (_, Err(why)) => e.floors.push((
+                crate::results::Verdict::ToolFault,
+                format!("the changed-row detail scan failed: {why}"),
+            )),
+        }
+    }
+    for w in &detail.plain_words {
+        e.notes.push(w.clone());
+    }
+    let entry = results.details.entry(table.to_string()).or_default();
+    entry.changed_columns = detail.changed_columns;
+    entry.changed_rows = detail.changed_rows;
+    entry.missing_keys = detail.missing_keys;
+    entry.extra_keys = detail.extra_keys;
+    entry.plain_words = detail.plain_words;
+}
+
+/// The independent spot check: 200 rows by key hash from each side, compared
+/// by normalised value in the app, judged against the fingerprint.  A spot
+/// query that fails is a disagreement (the check could not vouch for the hash
+/// path), never a silent skip.
+async fn spot_check(
+    old_s: &mut ReadOnlySession,
+    new_s: &mut ReadOnlySession,
+    plan: &TablePlan,
+    old_src: &Source,
+    new_src: &Source,
+    comparison: &Comparison,
+) -> Spot {
+    let failed = |why: String| Spot::Disagrees(format!("the spot check could not run: {why}"));
+    let (so, sn) = (
+        spot_sample(old_s, plan, Side::Old, old_src).await,
+        spot_sample(new_s, plan, Side::New, new_src).await,
+    );
+    let (so, sn) = match (so, sn) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return failed(e),
+    };
+    let khs: Vec<String> = so
+        .iter()
+        .chain(sn.iter())
+        .map(|r| r.kh.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (o, n) = (
+        spot_fetch(old_s, plan, Side::Old, old_src, &khs).await,
+        spot_fetch(new_s, plan, Side::New, new_src, &khs).await,
+    );
+    match (o, n) {
+        (Ok(o), Ok(n)) => {
+            let non_equal: BTreeSet<u32> = comparison.non_equal().into_iter().collect();
+            spot::judge(plan.bucket_digits(), &non_equal, &o, &n)
+        }
+        (Err(e), _) | (_, Err(e)) => failed(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::{Rule, RuleKind, SchemaMapping, TableMapping};
+
+    #[test]
+    fn a_schema_rename_rule_never_renames_a_table() {
+        let mut m = Mapping::new();
+        m.rules.push(Rule {
+            kind: RuleKind::SchemaRename,
+            pattern: "accounts".into(),
+            target: "elsewhere".into(),
+        });
+        // Before the fix the table-rule loop applied this schema rule to the
+        // table name and returned ("s", "elsewhere").
+        assert_eq!(
+            map_table(&m, "s", "accounts"),
+            ("s".into(), "accounts".into())
+        );
+        assert_eq!(
+            map_table(&m, "accounts", "t"),
+            ("elsewhere".into(), "t".into())
+        );
+    }
+
+    #[test]
+    fn explicit_table_mappings_and_prefix_rules() {
+        let mut m = Mapping::new();
+        let mut sm = SchemaMapping::default();
+        sm.table_mappings.insert(
+            "limits".into(),
+            TableMapping {
+                target_table: "product_limits".into(),
+                ..TableMapping::default()
+            },
+        );
+        m.schema_mappings.insert("s".into(), sm);
+        m.rules.push(Rule {
+            kind: RuleKind::PrefixReplace,
+            pattern: "old_".into(),
+            target: "new_".into(),
+        });
+        // An empty target schema keeps the schema (it used to return "").
+        assert_eq!(
+            map_table(&m, "s", "limits"),
+            ("s".into(), "product_limits".into())
+        );
+        assert_eq!(map_table(&m, "s", "old_x"), ("s".into(), "new_x".into()));
+        assert_eq!(map_table(&m, "s", "y"), ("s".into(), "y".into()));
+    }
+
+    fn cc(ins: i64, storage: &str) -> ChangeCounters {
+        ChangeCounters {
+            n_tup_ins: ins,
+            storage: storage.into(),
+            ..ChangeCounters::default()
+        }
+    }
+
+    #[test]
+    fn the_sweep_sees_a_truncate_and_unreadable_counters() {
+        let before = Some((cc(5, "1:1"), cc(5, "2:2")));
+        assert!(!counters_moved(&before, Some(&before.clone())));
+        // Same counts, new relfilenode on the new side: a truncate and reload.
+        assert!(counters_moved(
+            &before,
+            Some(&Some((cc(5, "1:1"), cc(5, "2:9"))))
+        ));
+        assert!(counters_moved(&before, Some(&None)));
+        assert!(counters_moved(&None, Some(&before)));
+        assert!(counters_moved(&before, None));
+    }
+
+    #[test]
+    fn an_epoch_change_during_the_run_is_seen() {
+        let e = Some(ServerEpoch {
+            postmaster_start: Some("t0".into()),
+            stats_reset: None,
+        });
+        assert!(!epoch_changed(&e, &e.clone()));
+        let reset = Some(ServerEpoch {
+            postmaster_start: Some("t0".into()),
+            stats_reset: Some("t1".into()),
+        });
+        assert!(epoch_changed(&e, &reset));
+        assert!(epoch_changed(&e, &None));
+    }
+
+    #[test]
+    fn replica_outcomes_mark_or_record() {
+        let st = |lsn: &str, paused| {
+            Some(ReplicaState {
+                in_recovery: true,
+                replay_lsn: Some(lsn.into()),
+                paused,
             })
-            .await?;
-        let key = match side {
-            Side::Old => spec.old_qualified.clone(),
-            Side::New => spec.old_qualified.clone(), // keyed by old identity on both sides
         };
-        out.insert(key, counters);
+        let mut e = Evidence::new("s.t", CheckLevel::FullValues, Outcome::OnlyOnNew);
+        apply_replica(
+            &mut e,
+            "old",
+            &replica_outcome(&st("0/1", false), &st("0/1", false)),
+        );
+        assert!(!e.changed);
+        apply_replica(
+            &mut e,
+            "old",
+            &replica_outcome(&st("0/1", true), &st("0/1", true)),
+        );
+        assert!(!e.changed);
+        assert!(e.notes.iter().any(|n| n.contains("replay paused")));
+        apply_replica(
+            &mut e,
+            "new",
+            &replica_outcome(&st("0/1", false), &st("0/2", false)),
+        );
+        assert!(e.changed, "replay advanced during the scans");
+        let mut e = Evidence::new("s.t", CheckLevel::FullValues, Outcome::OnlyOnNew);
+        apply_replica(&mut e, "new", &replica_outcome(&st("0/1", false), &None));
+        assert!(e.changed, "an unreadable state is moved");
+        let mut r = RunResults::default();
+        note_paused(&mut r, "old", &ReplicaDecision::Paused);
+        note_paused(&mut r, "old", &ReplicaDecision::Paused);
+        assert_eq!(r.warnings.len(), 1);
     }
-    Ok(out)
+
+    #[test]
+    fn the_definition_hash_ignores_passwords_but_not_scope() {
+        let base = RunConfig::default();
+        let mut pw = base.clone();
+        if let Input::Live(p) = &mut pw.old {
+            p.password = "something else".into();
+        }
+        assert_eq!(definition_hash(&base), definition_hash(&pw));
+        let mut lvl = base.clone();
+        lvl.default_level = CheckLevel::CountsAndTotals;
+        assert_ne!(definition_hash(&base), definition_hash(&lvl));
+        let mut db = base.clone();
+        if let Input::Live(p) = &mut db.new {
+            p.dbname = "demo_bank".into();
+        }
+        assert_ne!(definition_hash(&base), definition_hash(&db));
+    }
+
+    #[tokio::test]
+    async fn parallel_limits_below_one_are_rejected() {
+        let c = RunConfig {
+            old_parallelism: 0,
+            ..RunConfig::default()
+        };
+        assert!(matches!(run(&c).await, Err(RunError::Config(_))));
+    }
 }

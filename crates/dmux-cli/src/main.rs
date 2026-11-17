@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use dmux_engine::core::normalise::ColumnOptions;
 use dmux_engine::db::{probe_server, ConnProfile, DbError, ReadOnlySession, TlsMode};
 use dmux_engine::fingerprint_file::FingerprintFile;
 use dmux_engine::inventory::collect_inventory;
@@ -389,15 +390,15 @@ async fn run_capture(args: CaptureArgs) -> ExitCode {
     };
     let control_total: BTreeSet<String> = args.control_total.into_iter().collect();
 
-    let file = match capture::capture(
-        &profile,
+    let column_options = BTreeMap::new();
+    let opts = capture::CaptureOptions {
         level,
-        &control_total,
-        &mapping,
-        args.conn.allow_superuser,
-    )
-    .await
-    {
+        control_total_columns: &control_total,
+        column_options: &column_options,
+        mapping: &mapping,
+        allow_superuser: args.conn.allow_superuser,
+    };
+    let file = match capture::capture(&profile, &opts).await {
         Ok(f) => f,
         Err(e) => {
             eprintln!("dmux capture failed: {e}");
@@ -806,6 +807,42 @@ struct RunDefinition {
     reason: Option<String>,
     #[serde(default)]
     export_keys: bool,
+    /// Per-column options (PLAN.md 3.2), by old `schema.table.column`.
+    #[serde(default)]
+    options: BTreeMap<String, OptionsDef>,
+    /// Wait before the final change-counter read, in milliseconds (default
+    /// and minimum 2000: the statistics flush lag; see dmux_engine::consistency).
+    #[serde(default)]
+    stats_settle_ms: Option<u64>,
+}
+
+/// The smallest accepted `stats_settle_ms`.
+const MIN_STATS_SETTLE_MS: u64 = 2000;
+
+/// The four recorded per-column options, strictly parsed (unknown keys are
+/// rejected: a definition file is untrusted input).
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct OptionsDef {
+    #[serde(default)]
+    ignore_trailing_spaces: bool,
+    #[serde(default)]
+    null_equals_empty: bool,
+    #[serde(default)]
+    date_only: bool,
+    #[serde(default)]
+    round_decimals: Option<u8>,
+}
+
+impl From<OptionsDef> for ColumnOptions {
+    fn from(o: OptionsDef) -> Self {
+        ColumnOptions {
+            ignore_trailing_spaces: o.ignore_trailing_spaces,
+            null_equals_empty: o.null_equals_empty,
+            date_only: o.date_only,
+            round_decimals: o.round_decimals,
+        }
+    }
 }
 
 fn default_level() -> String {
@@ -839,11 +876,7 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     };
 
     let conn_def_to_profile = |c: &ConnDef| -> Result<ConnProfile, String> {
-        let tls_mode = if c.tls == "disable" {
-            TlsMode::Disable(c.reason.clone().unwrap_or_default())
-        } else {
-            TlsMode::VerifyFull
-        };
+        let tls_mode = parse_tls_mode(&c.tls, &c.reason)?;
         let password = match (&c.password, &c.password_env) {
             (Some(p), _) => p.clone(),
             (None, Some(var)) => std::env::var(var)
@@ -892,6 +925,21 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     if def.allow_superuser && def.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
         return Err("allow_superuser requires a non-empty reason".to_string());
     }
+    let stats_settle = match def.stats_settle_ms {
+        None => dmux_engine::run::DEFAULT_STATS_SETTLE,
+        Some(ms) if ms >= MIN_STATS_SETTLE_MS => std::time::Duration::from_millis(ms),
+        Some(ms) => {
+            return Err(format!(
+                "stats_settle_ms must be at least {MIN_STATS_SETTLE_MS} (got {ms}): \
+                 shorter waits can miss writes the server has not counted yet"
+            ))
+        }
+    };
+    let old_parallelism = def.old_parallelism.unwrap_or(2);
+    let new_parallelism = def.new_parallelism.unwrap_or(4);
+    if old_parallelism == 0 || new_parallelism == 0 {
+        return Err("old_parallelism and new_parallelism must be at least 1".to_string());
+    }
 
     Ok(RunConfig {
         old,
@@ -900,35 +948,27 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         default_level,
         levels,
         control_total_columns: def.control_total.into_iter().collect(),
-        old_parallelism: def.old_parallelism.unwrap_or(2),
-        new_parallelism: def.new_parallelism.unwrap_or(4),
+        column_options: def
+            .options
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect(),
+        old_parallelism,
+        new_parallelism,
         allow_superuser: def.allow_superuser,
         export_keys: def.export_keys,
         resume_store: None,
+        stats_settle,
     })
 }
 
-/// Minimal `RunResults` for the `apply_hook_verdict` tests (the engine type,
-/// but built by hand so no live run is needed).
+/// Minimal `RunResults` for the `apply_hook_verdict` tests (the real engine
+/// type; built via `Default` so it stays correct as the results schema grows).
 #[cfg(test)]
 fn minimal_run_results(verdict: Verdict) -> RunResults {
     RunResults {
-        results_version: 1,
-        run_id: "run".into(),
-        tool_version: "0.0.1".into(),
-        mapping_hash: "m".into(),
         verdict,
-        coverage_line: String::new(),
-        fully_checked: 0,
-        counts_only: 0,
-        ignored: 0,
-        tables: BTreeMap::new(),
-        ignored_items: vec![],
-        changed_during_check: vec![],
-        warnings: vec![],
-        wal_start_lsn: None,
-        wal_end_lsn: None,
-        results_sha256: String::new(),
+        ..RunResults::default()
     }
 }
 
@@ -936,8 +976,8 @@ fn minimal_run_results(verdict: Verdict) -> RunResults {
 mod tests {
     use super::{
         allow_superuser_requires_reason, apply_hook_verdict, hook_causes_non_pass, hook_exit_code,
-        minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs, Severity,
-        EXIT_FAIL, EXIT_PASS, EXIT_WARN,
+        load_definition, minimal_run_results, parse_level, parse_tls_mode, Cli, Command, DiffArgs,
+        Severity, EXIT_FAIL, EXIT_PASS, EXIT_WARN,
     };
     use clap::Parser;
     use dmux_engine::db::TlsMode;
@@ -1317,5 +1357,54 @@ mod tests {
             dmux_engine::results::sha256_of(&results),
             results.results_sha256
         );
+    }
+
+    fn definition(name: &str, body: &str) -> Result<dmux_engine::run::RunConfig, String> {
+        let dir = std::env::temp_dir().join(format!("dmux-def-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("def.toml");
+        std::fs::write(&path, body).unwrap();
+        let r = load_definition(path.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        r
+    }
+
+    const CONNS: &str = r#"
+old = { host = "127.0.0.1", port = 5433, db = "d", user = "u", tls = "disable", reason = "lab" }
+new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", reason = "lab" }
+"#;
+
+    #[test]
+    fn definition_options_reach_the_run() {
+        let c = definition(
+            "opts",
+            &format!("{CONNS}\n[options.\"s.t.c\"]\nignore_trailing_spaces = true\n"),
+        )
+        .unwrap();
+        assert!(c.column_options["s.t.c"].ignore_trailing_spaces);
+    }
+
+    #[test]
+    fn definition_rejects_unknown_option_keys_and_zero_limits() {
+        assert!(definition(
+            "unknown",
+            &format!("{CONNS}\n[options.\"s.t.c\"]\ntrim = true\n")
+        )
+        .is_err());
+        assert!(definition("zero", &format!("old_parallelism = 0\n{CONNS}")).is_err());
+        assert!(definition(
+            "tls",
+            &CONNS.replace("tls = \"disable\", reason = \"lab\"", "tls = \"bogus\"")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stats_settle_defaults_to_two_seconds_and_cannot_go_lower() {
+        let c = definition("settle-default", CONNS).unwrap();
+        assert_eq!(c.stats_settle, std::time::Duration::from_secs(2));
+        let c = definition("settle-5s", &format!("stats_settle_ms = 5000\n{CONNS}")).unwrap();
+        assert_eq!(c.stats_settle, std::time::Duration::from_secs(5));
+        assert!(definition("settle-low", &format!("stats_settle_ms = 500\n{CONNS}")).is_err());
     }
 }
