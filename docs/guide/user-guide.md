@@ -213,30 +213,48 @@ up. Nothing is compared until it is mapped or deliberately ignored.
 
 **Steps.**
 
-1. Dmux applies your rules first, then exact name matches, then matches that differ only in
-   upper or lower case. You only see what is left.
-2. Work through the **Needs attention** queue from the top. Each item shows the old name,
-   the suggested new name and a confidence score.
-3. Tick a suggestion to accept it, or drag the correct table onto it. One decision can
-   cover many tables when a renaming rule applies.
-4. For a table that should not be checked, choose **Ignore** and type the reason. The
+1. Optional: add **rename rules** at the top. A schema rename says that everything in the
+   old schema `legacy` now lives in the new schema `public`. A prefix or suffix rule says
+   that a table whose name starts (or ends) with some text has that text replaced, for
+   example `tbl_` becomes nothing. Press **Preview rules** to see how many tables the rules
+   pair, then **Apply rules and rebuild mapping**. Rules rename schemas and tables only,
+   never columns. Applying rules starts the mapping again, so do it before you pair
+   anything by hand.
+2. Dmux applies your rules first, then exact name matches, then matches that differ only in
+   upper or lower case. You only see what is left, in the **Needs attention** queue.
+3. Work through the queue from the top. For an item with no partner Dmux may show a
+   **suggestion**: the closest name in the new database and a percentage for how alike the
+   names are. A suggestion is only a guess and is never used by itself. Press
+   **Use suggestion** to accept it. Weak guesses (under 40 percent) are not shown.
+4. If there is no suggestion, or it is wrong, press **Choose counterpart**. A search box
+   lists the tables (or, for a column, the columns) that exist only in the new database.
+   Type to narrow the list, then click one, or use the arrow keys and Enter. Escape closes
+   the list without choosing.
+5. Two old tables can never map to the same new table, and neither can two old columns.
+   If you try, Dmux refuses and says which old table already has that partner. Pair or
+   ignore one of them differently.
+6. For a table that should not be checked, choose **Ignore** and type the reason. The
    reason is required and appears in the report.
-5. When the queue is empty, press **Continue**.
+7. When the queue is empty, press **Choose checks**.
 
 **What you see.** A queue, not a thousand-row board. Suggestions are never accepted
 automatically: a "close enough" name match is exactly how the wrong columns get compared.
-The count of unmapped and ignored tables stays visible at the top.
+Items that exist only in the new database are counted below the queue and offered when you
+choose a counterpart.
 
 **If something goes wrong.**
 
-- *"Two candidates match equally well"*: Dmux will not guess. Pick one.
-- *You ignored a table by mistake*: reopen it from the ignored list; the reason is removed
-  with it.
-- *You cannot find a table*: check the case-insensitive option and the search; a table
-  folded under a parent partition will not appear on its own.
+- *"Two old tables cannot map to one new table"*: Dmux will not guess which one the new
+  table really is. Unpair one or choose a different partner.
+- *You ignored a table by mistake*: pair it again from the queue; pairing removes the ignore
+  and its reason.
+- *You cannot find a table in the picker*: it may already be paired with another old table,
+  or it may be in a different schema. A table can only be paired within the schema its old
+  schema maps to; use a schema rename rule to change that.
+- *The rules paired fewer tables than you expected*: the preview shows how many. A rule only
+  pairs a table when the renamed table really exists in the new database.
 
-> **TODO (wiring):** screenshot of the queue with a suggestion and an ignore dialog;
-> confirm the wording of the confidence column.
+> **TODO (wiring):** screenshot of the queue with a suggestion and the pairing list.
 
 ### 4. Choose checks
 
@@ -246,13 +264,22 @@ take before you start.
 **Steps.**
 
 1. Pick a preset: full values for everything; counts for everything with full values for
-   selected tables; or structure only.
+   selected tables; or structure only. Changing a table by hand switches the preset to
+   **Custom**.
 2. Adjust individual tables if needed. Each table has one of three levels: **Structure**,
    **Counts and totals**, or **Full values**.
-3. Confirm the control-total columns. Dmux suggests number columns whose names look like
-   amounts or balances; tick the ones your auditors expect.
-4. Read the estimate: a range per table and in total.
-5. Press **Start**.
+3. To change many tables at once, tick them in the first column, or use the selection tools:
+   **Select schema**, **Select by name** (type a pattern; `*` stands for any text, upper
+   and lower case do not matter, so `acct_*` finds every table that starts with `acct_`),
+   or **Select by size** (larger or smaller than a number of megabytes). Selecting replaces
+   the earlier selection. Then choose a level under **Set level for the selection** and
+   press **Apply**. Tables with no size on record are skipped by the size selection, and
+   the screen says how many.
+4. Confirm the control-total columns. Dmux suggests number columns whose names look like
+   amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
+   column is added up in every table that has a column with that name.
+5. Read the estimate: a range per table and in total.
+6. Press **Run**.
 
 **What you see.** A list of tables with their level, their size on disk and an estimated
 time. The estimate is a range, because it is measured on your servers at that moment, and
@@ -261,15 +288,14 @@ pass, because Dmux then goes back for the rows.
 
 **If something goes wrong.**
 
-- *The estimate is far longer than the window you have*: drop the largest tables to
-  counts and totals, or ask for a longer window. The report will say which tables got
-  which level, so nothing is hidden.
+- *The estimate is far longer than the window you have*: select the largest tables by size
+  and set them to counts and totals, or ask for a longer window. The report will say which
+  tables got which level, so nothing is hidden.
 - *A table has no suggested totals*: its columns may not be numeric, or the names are
-  unfamiliar. Tick them by hand or leave counts only.
+  unfamiliar. Counts alone are still checked.
 - *The run window is set outside your quiet hours*: change it in settings before starting.
 
-> **TODO (wiring):** screenshot of the level picker and the estimate panel; confirm the
-> three preset names.
+> **TODO (wiring):** screenshot of the selection tools and the estimate panel.
 
 ### 5. Run
 
@@ -395,5 +421,6 @@ options ticked and every query sent.
 ## Keyboard and accessibility
 
 The whole flow works by keyboard, including mapping: arrow keys move through the queue,
-space ticks a suggestion, and escape closes a dialog. Status is never shown by colour
+the buttons under an item accept a suggestion or open the search list for a counterpart,
+and escape closes the list or a dialog. Status is never shown by colour
 alone; every verdict carries a word and an icon.

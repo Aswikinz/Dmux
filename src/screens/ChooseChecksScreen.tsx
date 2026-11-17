@@ -3,11 +3,20 @@ import { Panel } from '../design/Panel';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { Select } from '../design/Select';
+import { Input } from '../design/Input';
 import { DataTable } from '../components/DataTable';
 import { ErrorCard } from '../design/ErrorCard';
 import { Tooltip } from '../design/Tooltip';
 import { formatDurationRange } from '../components/duration';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
+import {
+  MEGABYTE,
+  formatSize,
+  selectByPattern,
+  selectBySchema,
+  selectBySize,
+  unknownSizeCount,
+} from './checkSelection';
 import type { Engine } from '../api/engine';
 import type { CheckLevel, CheckPlan, Mapping, TableCheck } from '../api/contract';
 
@@ -71,6 +80,14 @@ export function ChooseChecksScreen({
   const [error, setError] = useState<string | null>(null);
   const [selectedPreset, setSelectedPreset] = useState<PresetId>('suggested');
   const [presetNote, setPresetNote] = useState<string | null>(null);
+  // The tables ticked for a bulk change, by table id.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectionNote, setSelectionNote] = useState<string | null>(null);
+  const [schemaChoice, setSchemaChoice] = useState('');
+  const [patternText, setPatternText] = useState('');
+  const [sizeDirection, setSizeDirection] = useState<'larger' | 'smaller'>('larger');
+  const [sizeMegabytes, setSizeMegabytes] = useState('');
+  const [bulkLevel, setBulkLevel] = useState<CheckLevel>('full-values');
   // The levels the engine suggested, captured once, so "Suggested levels"
   // can always restore them.
   const suggestedRef = useRef<Record<string, CheckLevel> | null>(null);
@@ -133,9 +150,77 @@ export function ChooseChecksScreen({
     });
   };
 
+  const replaceSelection = (ids: string[], what: string) => {
+    setSelected(new Set(ids));
+    setSelectionNote(
+      ids.length === 1 ? `1 table selected (${what}).` : `${ids.length} tables selected (${what}).`,
+    );
+  };
+
+  const toggleSelected = (tableId: string, on: boolean) => {
+    setSelectionNote(null);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(tableId);
+      else next.delete(tableId);
+      return next;
+    });
+  };
+
+  const applyBulkLevel = () => {
+    if (!plan || selected.size === 0) return;
+    setSelectedPreset('custom');
+    setPresetNote(null);
+    onPlanChange({
+      ...plan,
+      tables: plan.tables.map((t) => (selected.has(t.tableId) ? { ...t, level: bulkLevel } : t)),
+    });
+    const label = levelOptions.find((o) => o.value === bulkLevel)?.label ?? bulkLevel;
+    setSelectionNote(
+      `Set ${selected.size === 1 ? '1 table' : `${selected.size} tables`} to "${label}".`,
+    );
+  };
+
+  /** Tick or untick a suggested control-total column.  Only ticked columns are
+   *  checked as control totals. */
+  const toggleControl = (tableId: string, column: string, on: boolean) => {
+    if (!plan) return;
+    setPresetNote(null);
+    onPlanChange({
+      ...plan,
+      tables: plan.tables.map((t) => {
+        if (t.tableId !== tableId) return t;
+        const confirmed = new Set(t.controlTotalColumns ?? []);
+        if (on) confirmed.add(column);
+        else confirmed.delete(column);
+        return { ...t, controlTotalColumns: confirmed.size > 0 ? [...confirmed] : undefined };
+      }),
+    });
+  };
+
+  // The table's cells read the latest state and handlers through this ref, so
+  // the column list keeps its identity.  A new column list makes the table
+  // rebuild every cell, which would drop keyboard focus after each tick.
+  const live = useRef({ selected, toggleSelected, toggleControl, updateLevel });
+  live.current = { selected, toggleSelected, toggleControl, updateLevel };
+
   const columns = useMemo(() => {
     const col = createColumnHelper<TableCheck>();
     return [
+      col.display({
+        id: 'select',
+        header: () => <span className="sr-only">Select</span>,
+        size: 60,
+        cell: ({ row }) => (
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-accent-600"
+            aria-label={`Select ${row.original.schemaName}.${row.original.tableName}`}
+            checked={live.current.selected.has(row.original.tableId)}
+            onChange={(e) => live.current.toggleSelected(row.original.tableId, e.target.checked)}
+          />
+        ),
+      }),
       col.accessor('schemaName', { header: 'Schema' }),
       col.accessor('tableName', { header: 'Table' }),
       col.accessor('level', {
@@ -145,12 +230,20 @@ export function ChooseChecksScreen({
             options={levelOptions}
             aria-label={`Check level for ${row.original.schemaName}.${row.original.tableName}`}
             value={row.original.level}
-            onChange={(e) => updateLevel(row.original.tableId, e.target.value as CheckLevel)}
+            onChange={(e) =>
+              live.current.updateLevel(row.original.tableId, e.target.value as CheckLevel)
+            }
             className="w-48"
           />
         ),
       }),
-      col.accessor('controlTotalColumns', {
+      col.accessor('sizeBytes', {
+        header: 'Size',
+        size: 90,
+        cell: ({ getValue }) => formatSize(getValue() as number | undefined),
+      }),
+      col.display({
+        id: 'controlTotals',
         header: () => (
           <Tooltip
             label="Control totals"
@@ -159,10 +252,36 @@ export function ChooseChecksScreen({
             Control totals
           </Tooltip>
         ),
-        cell: ({ getValue }) => (getValue() as string[] | undefined)?.join(', ') ?? '—',
+        size: 220,
+        cell: ({ row }) => {
+          const t = row.original;
+          const suggestions = t.controlTotalSuggestions ?? [];
+          if (suggestions.length === 0) return '—';
+          return (
+            <div className="flex flex-nowrap gap-x-3 whitespace-nowrap">
+              {suggestions.map((column) => (
+                <label key={column} className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-accent-600"
+                    aria-label={`Use ${column} as a control total for ${t.schemaName}.${t.tableName}`}
+                    checked={(t.controlTotalColumns ?? []).includes(column)}
+                    onChange={(e) => live.current.toggleControl(t.tableId, column, e.target.checked)}
+                  />
+                  {column}
+                </label>
+              ))}
+            </div>
+          );
+        },
       }),
     ] as ColumnDef<TableCheck>[];
-  }, [plan]);
+  }, []);
+
+  const schemas = useMemo(
+    () => [...new Set((plan?.tables ?? []).map((t) => t.schemaName))].sort(),
+    [plan],
+  );
 
   const totals = useMemo(() => {
     if (!plan) return null;
@@ -214,6 +333,134 @@ export function ChooseChecksScreen({
                 <span><strong>{totals.structure}</strong> structure only</span>
               </div>
             )}
+            <div
+              role="group"
+              aria-label="Select tables"
+              className="space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+            >
+              <p className="text-sm font-medium">Select tables, then change their level together</p>
+              <div className="flex flex-wrap items-end gap-3">
+                <Select
+                  label="Schema"
+                  options={[{ value: '', label: 'Choose a schema' }, ...schemas.map((x) => ({ value: x, label: x }))]}
+                  value={schemaChoice}
+                  onChange={(e) => setSchemaChoice(e.target.value)}
+                  className="w-44"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!schemaChoice}
+                  onClick={() =>
+                    replaceSelection(selectBySchema(plan.tables, schemaChoice), `schema ${schemaChoice}`)
+                  }
+                >
+                  Select schema
+                </Button>
+                <Input
+                  label="Name pattern"
+                  placeholder="acct_* (* matches anything)"
+                  value={patternText}
+                  onChange={(e) => setPatternText(e.target.value)}
+                  className="w-56"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!patternText.trim()}
+                  onClick={() =>
+                    replaceSelection(selectByPattern(plan.tables, patternText), `names matching ${patternText.trim()}`)
+                  }
+                >
+                  Select by name
+                </Button>
+                <Select
+                  label="Size"
+                  options={[
+                    { value: 'larger', label: 'Larger than' },
+                    { value: 'smaller', label: 'Smaller than' },
+                  ]}
+                  value={sizeDirection}
+                  onChange={(e) => setSizeDirection(e.target.value as 'larger' | 'smaller')}
+                  className="w-36"
+                />
+                <Input
+                  label="Megabytes"
+                  type="number"
+                  min={0}
+                  value={sizeMegabytes}
+                  onChange={(e) => setSizeMegabytes(e.target.value)}
+                  className="w-28"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={sizeMegabytes.trim() === '' || !(Number(sizeMegabytes) >= 0)}
+                  onClick={() =>
+                    replaceSelection(
+                      selectBySize(plan.tables, sizeDirection, Number(sizeMegabytes)),
+                      `${sizeDirection} than ${Number(sizeMegabytes) * MEGABYTE === 0 ? '0' : sizeMegabytes} MB`,
+                    )
+                  }
+                >
+                  Select by size
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <Select
+                  label="Set level for the selection"
+                  options={levelOptions}
+                  value={bulkLevel}
+                  onChange={(e) => setBulkLevel(e.target.value as CheckLevel)}
+                  className="w-52"
+                />
+                <Button
+                  size="sm"
+                  variant="primary"
+                  disabled={selected.size === 0}
+                  onClick={applyBulkLevel}
+                >
+                  Apply to {selected.size} selected
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={selected.size === 0}
+                  onClick={() => {
+                    setSelected(new Set());
+                    setSelectionNote('Selection cleared.');
+                  }}
+                >
+                  Clear selection
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() =>
+                    replaceSelection(
+                      plan.tables.map((t) => t.tableId),
+                      'all tables',
+                    )
+                  }
+                >
+                  Select all tables
+                </Button>
+              </div>
+              {selectionNote && (
+                <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
+                  {selectionNote}
+                </p>
+              )}
+              {unknownSizeCount(plan.tables) > 0 && (
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  {unknownSizeCount(plan.tables)} tables have no size on record, so selecting by size skips them.
+                </p>
+              )}
+            </div>
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              A control-total column you tick is added up in every table that has a column with that
+              name. Nothing is added up until you tick it.
+            </p>
             <DataTable
               data={plan.tables}
               columns={columns}

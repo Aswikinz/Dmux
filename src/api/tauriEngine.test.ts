@@ -618,6 +618,7 @@ describe('data half is wired to the backend', () => {
               table_name: 'accounts',
               level: 'full_values',
               control_total_columns: ['balance'],
+              size_bytes: 5242880,
             },
           ],
           presets: ['full values everywhere'],
@@ -635,7 +636,10 @@ describe('data half is wired to the backend', () => {
     expect(invoke).toHaveBeenCalledWith('build_check_plan', expect.objectContaining({}));
     expect(plan.tables).toHaveLength(1);
     expect(plan.tables[0].level).toBe('full-values');
-    expect(plan.tables[0].controlTotalColumns).toEqual(['balance']);
+    // What the backend lists is a suggestion; nothing is confirmed yet.
+    expect(plan.tables[0].controlTotalSuggestions).toEqual(['balance']);
+    expect(plan.tables[0].controlTotalColumns).toBeUndefined();
+    expect(plan.tables[0].sizeBytes).toBe(5242880);
     expect(plan.estimateSecondsMin).toBe(2);
   });
 
@@ -898,3 +902,212 @@ function inventory(): Inventory {
     newCollation: 'C',
   };
 }
+
+describe('mapping suggestions, edits and rules', () => {
+  /** A build with one unmatched table (with a suggestion) and one new-only table. */
+  function editableBuild() {
+    return {
+      mapping: {
+        version: 1,
+        rules: [{ kind: 'prefix_replace', pattern: 'tbl_', target: '' }],
+        schema_mappings: {
+          public: {
+            target_schema: 'public',
+            table_mappings: {
+              notes: { target_table: 'notes', status: 'exact', column_mappings: {} },
+            },
+          },
+        },
+        ignored: [],
+        mapping_hash: 'h1',
+      },
+      needs_attention: [
+        { path: 'public.acct', schema: 'public', table: 'acct', column: null, issue: 'missing_in_new', candidates: [] },
+        { path: 'public.accounts', schema: 'public', table: 'accounts', column: null, issue: 'add_back_review', candidates: [] },
+        { path: 'public.audit', schema: 'public', table: 'audit', column: null, issue: 'add_back_review', candidates: [] },
+      ],
+      suggestions: [
+        { path: 'public.acct', schema: 'public', table: 'acct', column: null, candidate: 'accounts', confidence: 71 },
+      ],
+    };
+  }
+
+  async function ready() {
+    const engine = createTauriEngine();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(editableBuild());
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const structure = await engine.compareStructure(profile(), profile());
+    const built = await engine.buildMapping(structure);
+    return { engine, built };
+  }
+
+  it('shows suggestions with a confidence, an unmatched item with no new name, and the new-only items', async () => {
+    const { built } = await ready();
+    expect(built.suggestions).toEqual([
+      {
+        id: 'public.acct',
+        ref: { schema: 'public', table: 'acct' },
+        candidate: 'accounts',
+        confidence: 71,
+      },
+    ]);
+    const item = built.needsAttention.find((m) => m.id === 'public.acct');
+    expect(item?.newName).toBe('');
+    expect(item?.ref).toEqual({ schema: 'public', table: 'acct' });
+    // New-only tables are not decisions; they feed the pairing picker.
+    expect(built.needsAttention.some((m) => m.id === 'public.accounts')).toBe(false);
+    expect(built.unmatchedNew?.map((u) => u.ref.table)).toEqual(['accounts', 'audit']);
+    expect(built.ruleSpecs).toEqual([{ kind: 'prefix_replace', pattern: 'tbl_', target: '' }]);
+  });
+
+  it('accepting a suggestion goes through edit_mapping and changes what saveMapping and startRun send', async () => {
+    const { engine, built } = await ready();
+    const edited = editableBuild().mapping;
+    edited.mapping_hash = 'h2';
+    (edited.schema_mappings.public.table_mappings as Record<string, unknown>).acct = {
+      target_table: 'accounts',
+      status: 'confirmed',
+      column_mappings: {},
+    };
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'edit_mapping') return Promise.resolve(edited);
+      if (cmd === 'export_mapping') return Promise.resolve({ json: '{}', hash: 'h2' });
+      if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-x' });
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+
+    const next = await engine.editMapping(built, [
+      { kind: 'pair_table', schema: 'public', table: 'acct', newTable: 'accounts' },
+    ]);
+
+    // The wire form carries separate names, and the backend's own mapping, never the webview's.
+    const call = invoke.mock.calls.find((c) => c[0] === 'edit_mapping');
+    expect(call?.[1]).toMatchObject({
+      edits: [{ kind: 'pair_table', schema: 'public', table: 'acct', new_table: 'accounts' }],
+      mapping: expect.objectContaining({ mapping_hash: 'h1' }),
+    });
+    // The pairing is now a confirmed match; the item, its suggestion and the
+    // new table it took have left the lists.
+    const pair = next.matches.find((m) => m.id === 'public.acct');
+    expect(pair).toMatchObject({ newName: 'public.accounts', confidence: 'confirmed', approved: true });
+    expect(next.needsAttention.some((m) => m.id === 'public.acct')).toBe(false);
+    expect(next.suggestions).toEqual([]);
+    expect(next.unmatchedNew?.map((u) => u.ref.table)).toEqual(['audit']);
+
+    await engine.saveMapping(next);
+    expect(invoke).toHaveBeenCalledWith(
+      'export_mapping',
+      expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h2' }) }),
+    );
+    await engine.startRun({
+      oldProfile: defaultOldProfile(),
+      newProfile: defaultOldProfile(),
+      mapping: next,
+      plan: { tables: [], presets: [], estimateSecondsMin: 0, estimateSecondsMax: 0 },
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      'start_run',
+      expect.objectContaining({
+        input: expect.objectContaining({
+          mapping: expect.objectContaining({ mapping_hash: 'h2' }),
+        }),
+      }),
+    );
+  });
+
+  it('a refused edit is thrown as its plain message and leaves the mapping as it was', async () => {
+    const { engine, built } = await ready();
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'edit_mapping'
+        ? Promise.reject({
+            kind: 'invalid_mapping',
+            message: 'public.a is already paired with public.accounts. Two old tables cannot map to one new table: unpair one of them first.',
+          })
+        : Promise.reject(new Error(`unexpected command ${cmd}`)),
+    );
+    await expect(
+      engine.editMapping(built, [
+        { kind: 'pair_table', schema: 'public', table: 'acct', newTable: 'accounts' },
+      ]),
+    ).rejects.toThrow(/Two old tables cannot map to one new table/);
+    // The held mapping is unchanged: saving still sends the original.
+    invoke.mockImplementation(() => Promise.resolve({ json: '{}', hash: 'h1' }));
+    await engine.saveMapping(built);
+    expect(invoke).toHaveBeenLastCalledWith(
+      'export_mapping',
+      expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h1' }) }),
+    );
+  });
+
+  it('previews rules without changing the mapping, and rebuilds with them', async () => {
+    const { engine } = await ready();
+    const rules = [{ kind: 'prefix_replace' as const, pattern: 'a_', target: 'b_' }];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'preview_rules')
+        return Promise.resolve({ tables_total: 10, tables_by_rules: 4, tables_matched: 9 });
+      if (cmd === 'rebuild_mapping') {
+        const b = editableBuild();
+        b.mapping.rules = [{ kind: 'prefix_replace', pattern: 'a_', target: 'b_' }];
+        b.mapping.mapping_hash = 'h3';
+        return Promise.resolve(b);
+      }
+      if (cmd === 'export_mapping') return Promise.resolve({ json: '{}', hash: 'h3' });
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    await expect(engine.previewRules(rules)).resolves.toEqual({
+      tablesTotal: 10,
+      tablesByRules: 4,
+      tablesMatched: 9,
+    });
+    expect(invoke).toHaveBeenCalledWith('preview_rules', expect.objectContaining({ rules }));
+    // A preview alone changes nothing the run would use.
+    await engine.saveMapping(mapping());
+    expect(invoke).toHaveBeenLastCalledWith(
+      'export_mapping',
+      expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h1' }) }),
+    );
+
+    const rebuilt = await engine.rebuildMapping(rules);
+    expect(rebuilt.ruleSpecs).toEqual(rules);
+    await engine.saveMapping(rebuilt);
+    expect(invoke).toHaveBeenLastCalledWith(
+      'export_mapping',
+      expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h3' }) }),
+    );
+  });
+
+  it('only confirmed control-total columns are sent to start_run', async () => {
+    const { engine, built } = await ready();
+    invoke.mockImplementation((cmd: string) =>
+      cmd === 'start_run' ? Promise.resolve({ run_id: 'r' }) : Promise.reject(new Error(cmd)),
+    );
+    const table = (name: string, confirmed?: string[]) => ({
+      tableId: `public.${name}`,
+      schemaName: 'public',
+      tableName: name,
+      level: 'full-values' as const,
+      controlTotalSuggestions: ['amount', 'balance'],
+      controlTotalColumns: confirmed,
+    });
+    await engine.startRun({
+      oldProfile: defaultOldProfile(),
+      newProfile: defaultOldProfile(),
+      mapping: built,
+      plan: {
+        tables: [table('a'), table('b', ['balance'])],
+        presets: [],
+        estimateSecondsMin: 0,
+        estimateSecondsMax: 0,
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      'start_run',
+      expect.objectContaining({
+        input: expect.objectContaining({ control_total_columns: ['balance'] }),
+      }),
+    );
+  });
+});

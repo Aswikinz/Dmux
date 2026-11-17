@@ -1,18 +1,43 @@
 import { useEffect, useRef, useState } from 'react';
-import { Ban, Check, Undo2 } from 'lucide-react';
+import { Ban, Check, Search, Sparkles, Undo2 } from 'lucide-react';
 import { cn } from '../design/cn';
 import { Button } from '../design/Button';
 import { StatusBadge } from '../design/StatusBadge';
-import type { MappingMatch } from '../api/contract';
+import { PairPicker, type PickerOption } from './PairPicker';
+import type { MappingMatch, MappingSuggestion } from '../api/contract';
+
+/** Suggestions weaker than this are noise, so they are not shown. */
+export const MIN_SUGGESTION_PERCENT = 40;
 
 interface MappingQueueProps {
   queue: MappingMatch[];
   onApprove: (id: string) => void;
   onIgnore: (id: string, reason: string) => void;
+  /** Guesses for unmatched items.  Each is used only when the user accepts it. */
+  suggestions?: MappingSuggestion[];
+  /** The user accepted the suggestion for this item. */
+  onAcceptSuggestion?: (item: MappingMatch, suggestion: MappingSuggestion) => void;
+  /** The counterparts the picker offers for an item (a bare name each). */
+  pickerOptions?: (item: MappingMatch) => PickerOption[];
+  /** The user picked a counterpart for this item. */
+  onPick?: (item: MappingMatch, value: string) => void;
+  /** Disables the buttons while a change is being checked. */
+  busy?: boolean;
   className?: string;
 }
 
-export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQueueProps) {
+export function MappingQueue({
+  queue,
+  onApprove,
+  onIgnore,
+  suggestions,
+  onAcceptSuggestion,
+  pickerOptions,
+  onPick,
+  busy = false,
+  className,
+}: MappingQueueProps) {
+  const [pickingId, setPickingId] = useState<string | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [ignoreReason, setIgnoreReason] = useState('');
   const [ignoringId, setIgnoringId] = useState<string | null>(null);
@@ -30,6 +55,8 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (queue.length === 0) return;
+      // The pairing picker handles its own keys.
+      if (pickingId) return;
       // While the user types in a field (the ignore reason), only Enter and
       // Escape act on the queue; Backspace, Delete and arrows edit the text.
       const target = e.target as HTMLElement | null;
@@ -39,6 +66,8 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
         target instanceof HTMLSelectElement ||
         target?.isContentEditable === true;
       if (typing && e.key !== 'Enter' && e.key !== 'Escape') return;
+      // A focused button handles its own Enter; the queue must not swallow it.
+      if (target instanceof HTMLButtonElement) return;
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -55,7 +84,10 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
             setIgnoreReason('');
           }
         } else {
-          onApprove(queue[selectedIndex]?.id ?? '');
+          // Only an item that already has a new name can be approved; one with
+          // no counterpart needs a suggestion accepted or a pick made.
+          const item = queue[selectedIndex];
+          if (item?.newName) onApprove(item.id);
         }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
@@ -71,7 +103,7 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [queue, selectedIndex, ignoringId, ignoreReason, onApprove, onIgnore]);
+  }, [queue, selectedIndex, ignoringId, ignoreReason, pickingId, onApprove, onIgnore]);
 
   useEffect(() => {
     const el = listRef.current?.querySelector(`[data-index="${selectedIndex}"]`);
@@ -106,7 +138,7 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
         </span>
         <span className="text-xs text-slate-600 dark:text-slate-400">
           Click an item, then choose Approve or Ignore. With the keyboard: the arrow keys move,
-          Enter approves, Delete ignores.
+          Enter approves, Delete ignores. A suggestion is only used when you accept it.
         </span>
       </div>
       <div
@@ -119,6 +151,10 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
         {queue.map((item, index) => {
           const isSelected = index === selectedIndex;
           const isIgnoring = ignoringId === item.id;
+          const suggestion = suggestions?.find(
+            (x) => x.id === item.id && x.confidence >= MIN_SUGGESTION_PERCENT,
+          );
+          const isPicking = pickingId === item.id;
           return (
             <div
               key={item.id}
@@ -127,6 +163,7 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
               aria-current={isSelected ? 'true' : undefined}
               onClick={() => {
                 if (!isSelected) {
+                  setPickingId(null);
                   setSelectedIndex(index);
                   setIgnoringId(null);
                   setIgnoreReason('');
@@ -143,12 +180,29 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
                 <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
                   {item.oldName}
                 </span>
-                <span className="text-slate-400">→</span>
-                <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
-                  {item.newName}
-                </span>
+                {item.newName ? (
+                  <>
+                    <span className="text-slate-400">→</span>
+                    <span className="text-sm font-medium text-slate-800 dark:text-slate-100">
+                      {item.newName}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-sm text-slate-600 dark:text-slate-300">
+                    has no partner in the new database yet
+                  </span>
+                )}
                 <StatusBadge status={item.confidence === 'exact' ? 'same' : 'changed'} className="ml-auto" />
               </div>
+              {suggestion && (
+                <p className="mt-1 text-sm text-slate-700 dark:text-slate-300" data-testid="suggestion-line">
+                  <Sparkles className="mr-1 inline h-3.5 w-3.5 text-accent-600 dark:text-accent-300" aria-hidden="true" />
+                  Suggested: <span className="font-medium">{suggestion.candidate}</span>{' '}
+                  <span className="text-slate-600 dark:text-slate-400">
+                    ({suggestion.confidence}% match, not used until you accept it)
+                  </span>
+                </p>
+              )}
               {isSelected && (
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   {isIgnoring ? (
@@ -187,12 +241,47 @@ export function MappingQueue({ queue, onApprove, onIgnore, className }: MappingQ
                         Ignore
                       </Button>
                     </>
+                  ) : isPicking && pickerOptions && onPick ? (
+                    <PairPicker
+                      className="w-full"
+                      label={`Counterpart for ${item.oldName}`}
+                      options={pickerOptions(item)}
+                      onPick={(value) => {
+                        setPickingId(null);
+                        onPick(item, value);
+                      }}
+                      onCancel={() => setPickingId(null)}
+                    />
                   ) : (
                     <>
-                      <Button size="sm" variant="primary" onClick={() => onApprove(item.id)}>
-                        <Check className="h-4 w-4" />
-                        Approve
-                      </Button>
+                      {item.newName && (
+                        <Button size="sm" variant="primary" onClick={() => onApprove(item.id)}>
+                          <Check className="h-4 w-4" />
+                          Approve
+                        </Button>
+                      )}
+                      {suggestion && onAcceptSuggestion && (
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={busy}
+                          onClick={() => onAcceptSuggestion(item, suggestion)}
+                        >
+                          <Check className="h-4 w-4" />
+                          Use suggestion
+                        </Button>
+                      )}
+                      {pickerOptions && onPick && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={() => setPickingId(item.id)}
+                        >
+                          <Search className="h-4 w-4" />
+                          Choose counterpart
+                        </Button>
+                      )}
                       <Button size="sm" variant="secondary" onClick={() => setIgnoringId(item.id)}>
                         <Ban className="h-4 w-4" />
                         Ignore

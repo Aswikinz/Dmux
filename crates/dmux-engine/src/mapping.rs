@@ -132,6 +132,10 @@ pub enum MappingStatus {
     Exact,
     CaseInsensitive,
     Fuzzy,
+    /// Paired by a rename rule (a schema, prefix or suffix rule).
+    Rule,
+    /// Paired by the user, by accepting a suggestion or picking a counterpart.
+    Confirmed,
     Ignored,
 }
 
@@ -755,6 +759,36 @@ mod tests {
         let json = r#"{"version":1,"rules":[],"schema_mappings":{},"ignored":[{"path":"x.y","reason":"   "}],"mapping_hash":""}"#;
         let err = from_json(json.as_bytes()).unwrap_err();
         assert!(matches!(err, MappingError::EmptyIgnoreReason));
+    }
+
+    #[test]
+    fn rule_and_confirmed_statuses_round_trip_through_a_mapping_file() {
+        let mut m = Mapping::new();
+        let mut table = TableMapping {
+            target_table: "accounts".into(),
+            status: MappingStatus::Rule,
+            ..TableMapping::default()
+        };
+        table.column_mappings.insert(
+            "amt".into(),
+            ColumnMapping {
+                target_column: "amount".into(),
+                status: MappingStatus::Confirmed,
+            },
+        );
+        let mut schema = SchemaMapping {
+            target_schema: "public".into(),
+            ..SchemaMapping::default()
+        };
+        schema.table_mappings.insert("acct".into(), table);
+        m.schema_mappings.insert("public".into(), schema);
+        let bytes = to_json(&m).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"rule\"") && text.contains("\"confirmed\""));
+        let back = from_json(&bytes).unwrap();
+        let tm = &back.schema_mappings["public"].table_mappings["acct"];
+        assert_eq!(tm.status, MappingStatus::Rule);
+        assert_eq!(tm.column_mappings["amt"].status, MappingStatus::Confirmed);
     }
 
     #[test]

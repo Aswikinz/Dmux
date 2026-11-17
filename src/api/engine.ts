@@ -4,12 +4,15 @@ import type {
   ConnectionTestResult,
   Inventory,
   Mapping,
+  MappingEdit,
+  MappingRule,
   ReportRequest,
   ReportResult,
   Results,
   RunDefinition,
   RunProgress,
   SaveProfileResult,
+  RulePreview,
   ServerInfo,
   SuperuserOverride,
 } from './contract';
@@ -56,6 +59,20 @@ export interface Engine {
   buildMapping(
     inventory: Inventory,
   ): Promise<Mapping>;
+
+  /**
+   * Change the mapping: accept a suggestion, pair an item by hand, or ignore
+   * one.  The backend checks every name against the live databases and refuses
+   * a second old table for the same new table; the refusal is the thrown
+   * error's message.  Returns the updated mapping.
+   */
+  editMapping(mapping: Mapping, edits: MappingEdit[]): Promise<Mapping>;
+
+  /** How many tables these rename rules would pair.  Changes nothing. */
+  previewRules(rules: MappingRule[]): Promise<RulePreview>;
+
+  /** Build the mapping again with these rules.  Choices made by hand are cleared. */
+  rebuildMapping(rules: MappingRule[]): Promise<Mapping>;
 
   /** Save the mapping so it can be exported later. */
   saveMapping(mapping: Mapping): Promise<{ hash: string; json: string }>;

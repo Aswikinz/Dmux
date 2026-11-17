@@ -25,6 +25,11 @@ import type {
   Inventory,
   Mapping,
   MappingMatch,
+  MappingEdit,
+  MappingRule,
+  MappingSuggestion,
+  RulePreview,
+  UnmatchedNewItem,
   IgnoreItem,
   MatchConfidence,
   ReportRequest,
@@ -169,14 +174,27 @@ interface RawMappingBuild {
 
 interface RawAttentionEntry {
   path: string;
+  schema: string;
+  table: string | null;
+  column: string | null;
   issue: string;
   candidates: string[];
 }
 
 interface RawSuggestionEntry {
   path: string;
+  schema: string;
+  table: string | null;
+  column: string | null;
   candidate: string;
   confidence: number;
+}
+
+/** `preview_rules` -> `RulePreview`. */
+interface RawRulePreview {
+  tables_total: number;
+  tables_by_rules: number;
+  tables_matched: number;
 }
 
 /** The `export_mapping` command's payload. */
@@ -228,7 +246,9 @@ interface RawTableCheck {
   schema_name: string;
   table_name: string;
   level: EngineLevel;
+  /** The columns Dmux suggests; none is a control total until confirmed. */
   control_total_columns: string[] | null;
+  size_bytes?: number;
 }
 
 interface RawCheckPlan {
@@ -441,6 +461,10 @@ function mapConfidence(status: string): MatchConfidence {
       return 'exact';
     case 'case_insensitive':
       return 'case';
+    case 'rule':
+      return 'rule';
+    case 'confirmed':
+      return 'confirmed';
     default:
       // `fuzzy`, `unmapped` and any unknown status are all "needs attention",
       // never an auto-approved exact/case match.
@@ -448,9 +472,79 @@ function mapConfidence(status: string): MatchConfidence {
   }
 }
 
-/** Only `exact` and `case_insensitive` are auto-approved. */
+/** Exact, case-insensitive, rule and user-confirmed pairings need no decision. */
 function isAutoApproved(status: string): boolean {
-  return status === 'exact' || status === 'case_insensitive';
+  return (
+    status === 'exact' || status === 'case_insensitive' || status === 'rule' || status === 'confirmed'
+  );
+}
+
+/** The `edit_mapping` wire form of an edit (snake_case fields). */
+function toRawEdit(edit: MappingEdit): Record<string, string> {
+  switch (edit.kind) {
+    case 'pair_table':
+      return {
+        kind: 'pair_table',
+        schema: edit.schema,
+        table: edit.table,
+        new_table: edit.newTable,
+      };
+    case 'pair_column':
+      return {
+        kind: 'pair_column',
+        schema: edit.schema,
+        table: edit.table,
+        column: edit.column,
+        new_column: edit.newColumn,
+      };
+    case 'ignore':
+      return { kind: 'ignore', path: edit.path, reason: edit.reason };
+  }
+}
+
+/**
+ * Lay an edited engine mapping over the queue the build produced: an item that
+ * is now paired or ignored leaves the queue, a new item that is now taken
+ * leaves the picker's list, and a suggestion goes with its item.
+ */
+function pruneBuild(build: RawMappingBuild, raw: RawMapping): RawMappingBuild {
+  const ignored = new Set(raw.ignored.map((i) => i.path));
+  const tableOf = (schema: string, table: string) =>
+    raw.schema_mappings[schema]?.table_mappings[table];
+  const paired = (e: { schema: string; table: string | null; column: string | null }) => {
+    if (!e.table) return false;
+    const tm = tableOf(e.schema, e.table);
+    if (!tm) return false;
+    return e.column ? e.column in tm.column_mappings : true;
+  };
+  const taken = (e: { schema: string; table: string | null; column: string | null }) => {
+    if (!e.table) return false;
+    if (e.column) {
+      const tm = tableOf(e.schema, e.table);
+      return Object.values(tm?.column_mappings ?? {}).some((c) => c.target_column === e.column);
+    }
+    return Object.values(raw.schema_mappings[e.schema]?.table_mappings ?? {}).some(
+      (t) => t.target_table === e.table,
+    );
+  };
+  const needs_attention = build.needs_attention.filter((a) =>
+    a.issue === 'add_back_review'
+      ? !taken(a) && !ignored.has(a.path)
+      : !paired(a) && !ignored.has(a.path),
+  );
+  const kept = new Set(
+    needs_attention.filter((a) => a.issue !== 'add_back_review').map((a) => a.path),
+  );
+  const suggestions = build.suggestions.filter(
+    (s) =>
+      kept.has(s.path) &&
+      !taken({ schema: s.schema, table: s.column ? s.table : s.candidate, column: s.column ? s.candidate : null }),
+  );
+  return { mapping: raw, needs_attention, suggestions };
+}
+
+function isRuleKind(kind: string): kind is MappingRule['kind'] {
+  return kind === 'schema_rename' || kind === 'prefix_replace' || kind === 'suffix_replace';
 }
 
 /** Project the engine `Mapping` + attention queue onto the contract `Mapping`. */
@@ -468,10 +562,11 @@ function translateMapping(
     }
   };
 
+  const ignoredPaths = new Set(build.mapping.ignored.map((i) => i.path));
   for (const [schema, schemaMapping] of Object.entries(build.mapping.schema_mappings)) {
     for (const [oldTable, tableMapping] of Object.entries(schemaMapping.table_mappings)) {
       const tableStatus = tableMapping.status;
-      if (tableStatus === 'ignored') {
+      if (tableStatus === 'ignored' || ignoredPaths.has(`${schema}.${oldTable}`)) {
         continue; // surfaced through build.mapping.ignored
       }
       addMatch(
@@ -486,7 +581,7 @@ function translateMapping(
       );
       for (const [oldCol, colMapping] of Object.entries(tableMapping.column_mappings)) {
         const colStatus = colMapping.status;
-        if (colStatus === 'ignored') {
+        if (colStatus === 'ignored' || ignoredPaths.has(`${schema}.${oldTable}.${oldCol}`)) {
           continue;
         }
         addMatch(
@@ -503,13 +598,46 @@ function translateMapping(
     }
   }
 
+  const unmatchedNew: UnmatchedNewItem[] = [];
   for (const attention of build.needs_attention) {
+    const ref = attention.table
+      ? {
+          schema: attention.schema,
+          table: attention.table,
+          ...(attention.column ? { column: attention.column } : {}),
+        }
+      : undefined;
+    if (attention.issue === 'add_back_review') {
+      // Only the new database has it: not a decision for the user, but a
+      // counterpart the pairing picker can offer for an unmatched old item.
+      if (ref) unmatchedNew.push({ id: attention.path, ref });
+      continue;
+    }
+    // Nothing is paired yet, so there is no new name to approve.  The user
+    // accepts a suggestion or picks a counterpart.
     needsAttention.push({
       id: attention.path,
       oldName: attention.path,
-      newName: attention.candidates[0] ?? '',
+      newName: '',
       confidence: 'fuzzy',
       approved: false,
+      ...(ref ? { ref } : {}),
+      candidates: attention.candidates,
+    });
+  }
+
+  const suggestions: MappingSuggestion[] = [];
+  for (const s of build.suggestions) {
+    if (!s.table) continue;
+    suggestions.push({
+      id: s.path,
+      ref: {
+        schema: s.schema,
+        table: s.table,
+        ...(s.column ? { column: s.column } : {}),
+      },
+      candidate: s.candidate,
+      confidence: s.confidence,
     });
   }
 
@@ -526,7 +654,12 @@ function translateMapping(
   // An encoding difference is not a mapping decision: Dmux converts every
   // value to UTF-8 before comparing.  It is shown as information on Compare
   // structure, never as a blocking "needs attention" item.
-  return { rules, matches, needsAttention, ignored };
+  const ruleSpecs: MappingRule[] = build.mapping.rules.flatMap((rule) =>
+    isRuleKind(rule.kind)
+      ? [{ kind: rule.kind, pattern: rule.pattern, target: rule.target }]
+      : [],
+  );
+  return { rules, ruleSpecs, matches, needsAttention, ignored, suggestions, unmatchedNew };
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +856,9 @@ function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
     schemaName: t.schema_name,
     tableName: t.table_name,
     level: mapLevel(t.level),
-    controlTotalColumns: t.control_total_columns ?? undefined,
+    // The backend's list is what it *suggests*; nothing is confirmed yet.
+    controlTotalSuggestions: t.control_total_columns ?? undefined,
+    sizeBytes: t.size_bytes ?? undefined,
   }));
   return {
     tables,
@@ -837,6 +972,8 @@ export function createTauriEngine(): Engine {
   let lastOldProfile: ConnectionProfile | null = null;
   let lastNewProfile: ConnectionProfile | null = null;
   let lastRawMapping: RawMapping | null = null;
+  /** The build behind `lastRawMapping`: its queue, suggestions and new-only items. */
+  let lastBuild: RawMappingBuild | null = null;
   let superuserOverride: SuperuserOverride | null = null;
   /** The backend's `SuperuserOverride { allow, reason }`, or null (refuse). */
   const allowSuperuser = () =>
@@ -932,7 +1069,73 @@ export function createTauriEngine(): Engine {
         allowSuperuser: allowSuperuser(),
       });
       lastRawMapping = build.mapping;
+      lastBuild = build;
       return translateMapping(build);
+    },
+
+    // The webview's mapping is a projection and is never sent back: the backend
+    // changes its own copy, after checking every name against the live databases.
+    async editMapping(_mapping: Mapping, edits: MappingEdit[]): Promise<Mapping> {
+      if (!lastOldProfile || !lastNewProfile || !lastRawMapping) {
+        throw new Error('buildMapping must run before editMapping');
+      }
+      // A refusal (such as two old tables for one new table) is thrown as its
+      // plain-language message and leaves the mapping as it was.
+      let raw: RawMapping;
+      try {
+        raw = await invoke<RawMapping>('edit_mapping', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          mapping: lastRawMapping,
+          edits: edits.map(toRawEdit),
+          allowSuperuser: allowSuperuser(),
+        });
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
+      lastRawMapping = raw;
+      lastBuild = pruneBuild(lastBuild ?? { mapping: raw, needs_attention: [], suggestions: [] }, raw);
+      return translateMapping(lastBuild);
+    },
+
+    async previewRules(rules: MappingRule[]): Promise<RulePreview> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before previewRules');
+      }
+      try {
+        const raw = await invoke<RawRulePreview>('preview_rules', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          rules,
+          allowSuperuser: allowSuperuser(),
+        });
+        return {
+          tablesTotal: raw.tables_total,
+          tablesByRules: raw.tables_by_rules,
+          tablesMatched: raw.tables_matched,
+        };
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
+    },
+
+    async rebuildMapping(rules: MappingRule[]): Promise<Mapping> {
+      if (!lastOldProfile || !lastNewProfile) {
+        throw new Error('compareStructure must run before rebuildMapping');
+      }
+      try {
+        const build = await invoke<RawMappingBuild>('rebuild_mapping', {
+          old: toConnectInput(lastOldProfile),
+          new: toConnectInput(lastNewProfile),
+          rules,
+          allowSuperuser: allowSuperuser(),
+        });
+        lastRawMapping = build.mapping;
+        lastBuild = build;
+        return translateMapping(build);
+      } catch (error) {
+        throw new Error(describeError(error), { cause: error });
+      }
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the projected mapping is rebuilt from the backend `lastRawMapping`

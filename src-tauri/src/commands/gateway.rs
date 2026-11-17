@@ -5,7 +5,7 @@
 //! construction), and the mapping build only calls the exported
 //! `match_tables` / `match_columns` / `Mapping` helpers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -398,6 +398,10 @@ pub struct MappingBuild {
 #[serde(rename_all = "snake_case")]
 pub struct AttentionEntry {
     pub path: String,
+    /// The pieces of `path`, so the UI never has to split a dotted name.
+    pub schema: String,
+    pub table: Option<String>,
+    pub column: Option<String>,
     pub issue: String,
     pub candidates: Vec<String>,
 }
@@ -407,6 +411,11 @@ pub struct AttentionEntry {
 #[serde(rename_all = "snake_case")]
 pub struct SuggestionEntry {
     pub path: String,
+    /// The pieces of `path` (old side).  `candidate` is a bare table or column
+    /// name in the matching new schema or table.
+    pub schema: String,
+    pub table: Option<String>,
+    pub column: Option<String>,
     pub candidate: String,
     pub confidence: u8,
 }
@@ -456,7 +465,58 @@ pub fn build_from_inventories(
     old: &DatabaseInventory,
     new: &DatabaseInventory,
 ) -> (Mapping, Vec<AttentionEntry>, Vec<SuggestionEntry>) {
+    build_with_rules(old, new, &[])
+}
+
+/// The part of `path` after `prefix.`, when it starts with it.  Paths are built
+/// as `schema.table` and `schema.table.column` by the engine matcher; the
+/// structured fields sent to the UI are cut from them here, where the schema and
+/// table are known, so a name that itself contains a dot is never split wrongly.
+fn tail<'a>(path: &'a str, prefix: &str) -> &'a str {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(path)
+}
+
+fn table_attention(schema: &str, item: mapping::AttentionItem) -> AttentionEntry {
+    AttentionEntry {
+        schema: schema.to_string(),
+        table: Some(tail(&item.path, schema).to_string()),
+        column: None,
+        issue: attention_issue(&item.issue),
+        candidates: attention_candidates(&item.issue),
+        path: item.path,
+    }
+}
+
+fn column_attention(schema: &str, table: &str, item: mapping::AttentionItem) -> AttentionEntry {
+    let prefix = format!("{schema}.{table}");
+    AttentionEntry {
+        schema: schema.to_string(),
+        table: Some(table.to_string()),
+        column: Some(tail(&item.path, &prefix).to_string()),
+        issue: attention_issue(&item.issue),
+        candidates: attention_candidates(&item.issue),
+        path: item.path,
+    }
+}
+
+/// [`build_from_inventories`] with the user's rename rules applied first.
+///
+/// Rules apply to **table** names only (a schema rename renames a schema, a
+/// prefix or suffix rule renames tables); column names are never renamed by a
+/// rule.  A rule pairs an old table with the renamed one only when that table
+/// really exists in the new database; the engine's own `apply_rule` does the
+/// renaming, so the build and the run can never disagree.  Two old tables that
+/// a rule sends to one new table are not silently double-mapped: the second one
+/// is flagged for a decision.
+pub fn build_with_rules(
+    old: &DatabaseInventory,
+    new: &DatabaseInventory,
+    rules: &[mapping::Rule],
+) -> (Mapping, Vec<AttentionEntry>, Vec<SuggestionEntry>) {
     let mut mapping = Mapping::new();
+    mapping.rules = rules.to_vec();
     let mut needs_attention: Vec<AttentionEntry> = Vec::new();
     let mut suggestions: Vec<SuggestionEntry> = Vec::new();
 
@@ -472,21 +532,75 @@ pub fn build_from_inventories(
             .find_map(|r| mapping::apply_rule(r, schema_name))
             .unwrap_or_else(|| (*schema_name).to_string());
 
-        let new_schema = new_schemas.get(target_schema.as_str());
-        if new_schema.is_none() {
+        let Some(new_schema) = new_schemas.get(target_schema.as_str()) else {
             needs_attention.push(AttentionEntry {
                 path: schema_name.to_string(),
+                schema: schema_name.to_string(),
+                table: None,
+                column: None,
                 issue: "missing_in_new".to_string(),
                 candidates: Vec::new(),
             });
             // Nothing to map at table level for a missing target schema.
             continue;
-        }
-        let new_schema = new_schema.unwrap();
+        };
 
         let old_names: Vec<String> = old_schema.tables.iter().map(|t| t.name.clone()).collect();
         let new_names: Vec<String> = new_schema.tables.iter().map(|t| t.name.clone()).collect();
-        let tables = mapping::match_tables(schema_name, &old_names, &new_names);
+
+        // Rules come first (PLAN 4.3): a prefix or suffix rule pairs a table
+        // with its renamed counterpart when that exists in the new schema.
+        let mut rule_mapped: BTreeMap<String, dmux_engine::mapping::TableMapping> = BTreeMap::new();
+        let mut rule_targets: BTreeSet<String> = BTreeSet::new();
+        for old_name in &old_names {
+            let renamed = mapping
+                .rules
+                .iter()
+                .filter(|r| !matches!(r.kind, mapping::RuleKind::SchemaRename))
+                .find_map(|r| mapping::apply_rule(r, old_name));
+            let Some(renamed) = renamed else { continue };
+            if renamed == *old_name || !new_names.contains(&renamed) {
+                continue;
+            }
+            if rule_targets.contains(&renamed) {
+                // A second old table for the same new table: never double-map.
+                needs_attention.push(AttentionEntry {
+                    path: format!("{schema_name}.{old_name}"),
+                    schema: schema_name.to_string(),
+                    table: Some(old_name.clone()),
+                    column: None,
+                    issue: "ambiguous_case_insensitive".to_string(),
+                    candidates: vec![renamed],
+                });
+                continue;
+            }
+            rule_targets.insert(renamed.clone());
+            rule_mapped.insert(
+                old_name.clone(),
+                dmux_engine::mapping::TableMapping {
+                    target_table: renamed,
+                    status: mapping::MappingStatus::Rule,
+                    ..Default::default()
+                },
+            );
+        }
+        let rest_old: Vec<String> = old_names
+            .iter()
+            .filter(|n| !rule_mapped.contains_key(*n))
+            .cloned()
+            .collect();
+        let rest_new: Vec<String> = new_names
+            .iter()
+            .filter(|n| !rule_targets.contains(*n))
+            .cloned()
+            .collect();
+        let mut tables = mapping::match_tables(schema_name, &rest_old, &rest_new);
+        tables.mapped.extend(rule_mapped);
+        let taken: BTreeSet<String> = tables
+            .mapped
+            .values()
+            .map(|m| m.target_table.clone())
+            .collect();
 
         let mut schema_mapping = dmux_engine::mapping::SchemaMapping {
             target_schema: target_schema.clone(),
@@ -511,22 +625,29 @@ pub fn build_from_inventories(
 
             let (column_mappings, col_attention, col_suggestions) =
                 mapping::match_columns(schema_name, old_name, &old_cols, &new_cols);
-            table_mapping.column_mappings = column_mappings;
+            let taken_cols: BTreeSet<&str> = column_mappings
+                .values()
+                .map(|c| c.target_column.as_str())
+                .collect();
 
             for a in col_attention {
-                needs_attention.push(AttentionEntry {
-                    path: a.path,
-                    issue: attention_issue(&a.issue),
-                    candidates: attention_candidates(&a.issue),
-                });
+                needs_attention.push(column_attention(schema_name, old_name, a));
             }
             for s in col_suggestions {
+                // Only a column nobody has taken can be suggested.
+                if taken_cols.contains(s.candidate.as_str()) {
+                    continue;
+                }
                 suggestions.push(SuggestionEntry {
+                    schema: schema_name.to_string(),
+                    table: Some(old_name.clone()),
+                    column: Some(tail(&s.path, &format!("{schema_name}.{old_name}")).to_string()),
                     path: s.path,
                     candidate: s.candidate,
                     confidence: s.confidence,
                 });
             }
+            table_mapping.column_mappings = column_mappings;
 
             schema_mapping
                 .table_mappings
@@ -534,14 +655,16 @@ pub fn build_from_inventories(
         }
 
         for a in tables.needs_attention {
-            needs_attention.push(AttentionEntry {
-                path: a.path,
-                issue: attention_issue(&a.issue),
-                candidates: attention_candidates(&a.issue),
-            });
+            needs_attention.push(table_attention(schema_name, a));
         }
         for s in tables.suggestions {
+            if taken.contains(&s.candidate) {
+                continue;
+            }
             suggestions.push(SuggestionEntry {
+                schema: schema_name.to_string(),
+                table: Some(tail(&s.path, schema_name).to_string()),
+                column: None,
                 path: s.path,
                 candidate: s.candidate,
                 confidence: s.confidence,
