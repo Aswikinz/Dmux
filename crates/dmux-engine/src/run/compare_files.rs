@@ -12,6 +12,12 @@
 //! column missing live, a changed type) is a TOOL_FAULT for that table, never a
 //! guess; a run option the file cannot honour (a control total it did not
 //! capture, different options) lowers the table to NEEDS_REVIEW.
+//!
+//! Structure is compared exactly as in a live run ([`structure::apply`]): the
+//! file's captured inventory against the other file's, or against the live
+//! database's.  Every red finding (missing index, NOT VALID constraint,
+//! sequence behind, large object missing, ...) fails the run.  A file without
+//! an inventory floors the run at WARNING ("structure not compared").
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,14 +26,38 @@ use crate::core::fingerprint::{Fingerprint, Side, Source, TablePlan};
 use crate::core::normalise::{plan_column, ColumnMapping};
 use crate::db::{probe_server, ConnProfile, ReadOnlySession};
 use crate::fingerprint_file::{CapturedTable, FingerprintFile};
+use crate::inventory::DatabaseInventory;
+use crate::mapping::Mapping;
 use crate::plan::{build_table_spec, LiveColumn, LiveTable, SpecInputs};
 use crate::results::{fresh_run_id, CheckLevel, Verdict};
 
+use super::structure;
 use super::verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 use super::{
-    counters, definition_hash, inventory, live_table, map_table, scan_counts, scan_fingerprint,
-    wal, RunConfig, RunError, RunOutcome,
+    apply_replica, counters, definition_hash, epoch, epoch_changed, inventory, live_table,
+    map_table, note_paused, replica, replica_outcome, scan_counts, scan_fingerprint, wal,
+    RunConfig, RunError, RunOutcome,
 };
+
+/// The run warning when a side has no inventory to compare.
+pub const STRUCTURE_NOT_COMPARED: &str =
+    "structure not compared: a fingerprint file carries no inventory";
+
+/// The structure step of a saved-file comparison, or the WARNING floor when
+/// either inventory is absent.
+fn file_structure(
+    b: &mut Builder,
+    old: Option<&DatabaseInventory>,
+    new: Option<&DatabaseInventory>,
+    mapping: &Mapping,
+) {
+    match (old, new) {
+        (Some(o), Some(n)) => {
+            structure::apply(b, o, n, mapping);
+        }
+        _ => b.floor_run(Verdict::Warning, STRUCTURE_NOT_COMPARED),
+    }
+}
 
 const NO_LIVE: &str =
     "saved fingerprints: no row-level drill-down or spot check without a live old database";
@@ -94,6 +124,27 @@ pub fn compare_two_files_with(
     for (name, t) in new_by.iter().filter(|(n, _)| !old_by.contains_key(*n)) {
         b.record(Evidence::new(*name, t.level, Outcome::OnlyOnNew));
     }
+
+    // The run's mapping is used for the structure diff only when it is the one
+    // the captures were made with; otherwise names are compared as they are.
+    let identity = Mapping::new();
+    let mapping = if config.mapping.mapping_hash == old.mapping_hash {
+        &config.mapping
+    } else {
+        if !old.mapping_hash.is_empty() && old.mapping_hash != identity.mapping_hash {
+            b.results.warnings.push(
+                "the captures' mapping is not available here; structure was compared by name"
+                    .into(),
+            );
+        }
+        &identity
+    };
+    file_structure(
+        &mut b,
+        old.inventory.as_deref(),
+        new.inventory.as_deref(),
+        mapping,
+    );
     Ok(b.finish())
 }
 
@@ -203,8 +254,14 @@ pub async fn compare_file_to_live(
             .push("the live database is SQL_ASCII (P19)".into());
     }
     b.results.wal_start_lsn = wal(&mut s, info.version_num).await;
+    let epoch_start = epoch(&mut s).await;
 
     let live_inv = inventory(&mut s).await?;
+    // Structure: the captured inventory against the live one, oriented.
+    match file_side {
+        Side::Old => file_structure(&mut b, file.inventory.as_deref(), Some(&live_inv), mapping),
+        Side::New => file_structure(&mut b, Some(&live_inv), file.inventory.as_deref(), mapping),
+    }
     let live: BTreeSet<String> = live_inv
         .schemas
         .iter()
@@ -291,8 +348,13 @@ pub async fn compare_file_to_live(
     for (path, _, (ls, lt)) in &pairs {
         before.insert(path.clone(), counters(&mut s, ls, lt).await.ok());
     }
+    let live_side = match file_side {
+        Side::Old => "new",
+        Side::New => "old",
+    };
     for (path, cap, (ls, lt)) in &pairs {
-        let e = file_live_pair(
+        let r_before = replica(&mut s, info.version_num).await;
+        let mut e = file_live_pair(
             config,
             &mut s,
             path,
@@ -303,15 +365,27 @@ pub async fn compare_file_to_live(
             &file.mapping_hash,
         )
         .await;
+        let d = replica_outcome(&r_before, &replica(&mut s, info.version_num).await);
+        note_paused(&mut b.results, live_side, &d);
+        apply_replica(&mut e, live_side, &d);
         b.record(e);
+    }
+    // Let writes made during the run reach the statistics, then sweep.
+    tokio::time::sleep(config.stats_settle).await;
+    let epoch_moved = epoch_changed(&epoch_start, &epoch(&mut s).await);
+    if epoch_moved {
+        b.results.warnings.push(
+            "the live server restarted or its statistics were reset during the run; changes cannot be ruled out"
+                .into(),
+        );
     }
     for (path, _, (ls, lt)) in &pairs {
         let after = counters(&mut s, ls, lt).await.ok();
         let moved = match (before.get(path).cloned().flatten(), after) {
-            (Some(x), Some(y)) => x != y,
+            (Some(x), Some(y)) => x.moved(&y),
             _ => true,
         };
-        if moved {
+        if epoch_moved || moved {
             b.mark_changed(path);
         }
     }
@@ -566,6 +640,12 @@ mod tests {
                 collation: "C".into(),
                 sql_ascii: false,
             },
+            inventory: Some(Box::new(crate::fingerprint_file::test_inventory::of(
+                &tables
+                    .iter()
+                    .map(|t| t.old_qualified.as_str())
+                    .collect::<Vec<_>>(),
+            ))),
             tables,
             sha256: String::new(),
         }
@@ -675,5 +755,64 @@ mod tests {
         let mut other = file(vec![]);
         other.mapping_hash = "something else".into();
         assert!(compare_two_files(&file(vec![]), &other).is_err());
+    }
+
+    #[test]
+    fn a_new_capture_lacking_an_index_is_not_a_pass() {
+        // A: saved-file comparisons used to skip structure entirely, so this
+        // pair passed with exit 0.
+        let old = file(vec![table("s.a", 3)]);
+        let mut new = file(vec![table("s.a", 3)]);
+        new.inventory.as_mut().unwrap().schemas[0].tables[0]
+            .indexes
+            .clear();
+        let out = compare_two_files(&old, &new).unwrap();
+        assert_eq!(out.results.verdict, Verdict::Fail);
+        assert_eq!(out.exit_code, 1);
+        let f = out
+            .results
+            .structure_findings
+            .iter()
+            .find(|f| f.object == "s.a.ix_a")
+            .expect("the missing index is a finding");
+        assert_eq!(f.verdict, Verdict::Fail);
+        // The data itself still compares equal.
+        assert_eq!(out.results.tables["s.a"].verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn red_structure_in_captures_fails_the_run_like_live() {
+        let old = file(vec![table("s.a", 3)]);
+        // A constraint that is NOT VALID on the new side.
+        let mut new = file(vec![table("s.a", 3)]);
+        new.inventory.as_mut().unwrap().schemas[0].tables[0].constraints[0].validated = false;
+        assert_eq!(
+            compare_two_files(&old, &new).unwrap().results.verdict,
+            Verdict::Fail
+        );
+        // A large object lost.
+        let mut old_lo = file(vec![table("s.a", 3)]);
+        old_lo.inventory.as_mut().unwrap().large_object_count = 1;
+        let out = compare_two_files(&old_lo, &file(vec![table("s.a", 3)])).unwrap();
+        assert_eq!(out.results.verdict, Verdict::Fail);
+        assert!(out
+            .results
+            .structure_findings
+            .iter()
+            .any(|f| f.object == "database.large_objects"));
+    }
+
+    #[test]
+    fn a_capture_without_an_inventory_floors_the_run_at_warning() {
+        let mut new = file(vec![table("s.a", 3)]);
+        new.inventory = None;
+        let out = compare_two_files(&file(vec![table("s.a", 3)]), &new).unwrap();
+        assert_eq!(out.results.verdict, Verdict::Warning);
+        assert_eq!(out.exit_code, 2);
+        assert!(out
+            .results
+            .warnings
+            .iter()
+            .any(|w| w == STRUCTURE_NOT_COMPARED));
     }
 }

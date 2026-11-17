@@ -230,7 +230,23 @@ async fn resume_reuses_only_unchanged_tables_and_never_drops_one() {
         let Loaded::Found(mut st) = store.load_table("demo_bank.accounts").unwrap() else {
             panic!("accounts was stored");
         };
-        st.counters_new.n_tup_upd += 1;
+        st.new.counters.n_tup_upd += 1;
+        store.save_table(&st).unwrap();
+        // A truncate-and-reload: the tuple counters match, the storage does not.
+        let Loaded::Found(mut st) = store.load_table("demo_bank.holidays").unwrap() else {
+            panic!("holidays was stored");
+        };
+        st.old.counters.storage.push_str(",1:1");
+        store.save_table(&st).unwrap();
+        // A stats reset since the row was stored: counters cannot vouch.
+        let Loaded::Found(mut st) = store.load_table("demo_bank.cards").unwrap() else {
+            panic!("cards was stored");
+        };
+        assert!(
+            st.new.epoch.postmaster_start.is_some(),
+            "the epoch is recorded"
+        );
+        st.new.epoch.stats_reset = Some("2000-01-01 00:00:00+00".into());
         store.save_table(&st).unwrap();
         store
             .put_raw("demo_bank.branches", "{not a stored result")
@@ -238,7 +254,12 @@ async fn resume_reuses_only_unchanged_tables_and_never_drops_one() {
     }
     let third = go(&c).await;
     assert_eq!(third.run_id, first.run_id);
-    for t in ["demo_bank.accounts", "demo_bank.branches"] {
+    for t in [
+        "demo_bank.accounts",
+        "demo_bank.branches",
+        "demo_bank.holidays",
+        "demo_bank.cards",
+    ] {
         assert!(
             !third.resumed_tables.contains(&t.to_string()),
             "{t} must be rescanned"
@@ -387,4 +408,28 @@ async fn a_capture_cannot_be_made_at_structure_level() {
         allow_superuser: true,
     };
     assert!(capture(&old, &opts).await.is_err());
+}
+
+#[tokio::test]
+async fn counters_cover_partitions_and_record_storage() {
+    let Some((_, new)) = profiles() else { return };
+    let mut s = ReadOnlySession::open(&new, true).await.unwrap();
+    let c = s
+        .with_read_only("10s", |txn| {
+            Box::pin(async move {
+                dmux_engine::consistency::read_counters(&*txn, "demo_bank", "balances_daily")
+                    .await
+                    .map_err(|e| DbError::Postgres {
+                        message: e.to_string(),
+                    })
+            })
+        })
+        .await
+        .unwrap();
+    // The partitioned parent plus each of its partitions, by oid:relfilenode.
+    let entries: Vec<&str> = c.storage.split(',').collect();
+    assert!(entries.len() >= 2, "{}", c.storage);
+    assert!(entries.iter().all(|e| e.split_once(':').is_some()));
+    // The rows live in the partitions: their inserts count for the parent.
+    assert!(c.n_tup_ins > 0, "{c:?}");
 }

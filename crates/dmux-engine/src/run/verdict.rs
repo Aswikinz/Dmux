@@ -311,6 +311,7 @@ pub struct Builder {
     pending: Vec<Evidence>,
     fixed: Vec<(TableResult, bool)>,
     sql_ascii: bool,
+    run_floors: Vec<(Verdict, String)>,
 }
 
 impl Builder {
@@ -325,6 +326,7 @@ impl Builder {
             pending: Vec::new(),
             fixed: Vec::new(),
             sql_ascii: false,
+            run_floors: Vec::new(),
         }
     }
 
@@ -335,6 +337,19 @@ impl Builder {
 
     pub fn sql_ascii(&self) -> bool {
         self.sql_ascii
+    }
+
+    /// Decide `e` exactly as [`Builder::finish`] will, run-level flags (P19)
+    /// included.  The resume store saves this, never a bare [`decide`].
+    pub fn decide_now(&self, e: &Evidence) -> (TableResult, bool) {
+        let mut e = e.clone();
+        e.sql_ascii |= self.sql_ascii;
+        decide(&e)
+    }
+
+    /// A minimum for the overall verdict, with the warning that explains it.
+    pub fn floor_run(&mut self, floor: Verdict, why: impl Into<String>) {
+        self.run_floors.push((floor, why.into()));
     }
 
     /// Record a table's evidence; decided at [`Builder::finish`].
@@ -443,6 +458,12 @@ impl Builder {
             r.warnings
                 .push("nothing was checked: no table reached a conclusion at its level".into());
             v = v.worst(Verdict::Warning);
+        }
+        for (floor, why) in &self.run_floors {
+            if !r.warnings.contains(why) {
+                r.warnings.push(why.clone());
+            }
+            v = v.worst(*floor);
         }
         if self.sql_ascii && v.is_pass() {
             v = Verdict::NeedsReview;
@@ -618,6 +639,36 @@ mod tests {
         b.set_sql_ascii(true);
         b.record(ev(full(true)));
         assert_eq!(b.finish().results.verdict, Verdict::NeedsReview);
+    }
+
+    #[test]
+    fn the_stored_verdict_is_the_final_flag_applied_one() {
+        // MINOR: the resume store used to save decide(&e) before the run's
+        // SQL_ASCII flag was applied, so a stored table could read PASS.
+        let mut b = Builder::new("r".into(), "m".into(), "d".into());
+        b.set_sql_ascii(true);
+        let e = ev(full(true));
+        let (saved, _) = b.decide_now(&e);
+        assert_eq!(saved.verdict, Verdict::NeedsReview);
+        b.record(e);
+        let out = b.finish();
+        assert_eq!(out.results.tables["s.t"].verdict, saved.verdict);
+        assert_eq!(out.results.tables["s.t"].reasons, saved.reasons);
+    }
+
+    #[test]
+    fn a_run_floor_keeps_the_run_off_pass() {
+        let mut b = Builder::new("r".into(), "m".into(), "d".into());
+        b.record(ev(full(true)));
+        b.floor_run(Verdict::Warning, "structure not compared");
+        let out = b.finish();
+        assert_eq!(out.results.verdict, Verdict::Warning);
+        assert!(out
+            .results
+            .warnings
+            .iter()
+            .any(|w| w == "structure not compared"));
+        assert_eq!(out.exit_code, 2);
     }
 
     #[test]

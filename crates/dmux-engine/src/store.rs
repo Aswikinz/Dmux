@@ -8,9 +8,13 @@
 //!   version) and the run id.  [`Store::bind`] keeps the stored results and the
 //!   run id only when the key is identical; otherwise it clears every stored
 //!   table and starts a new run id;
-//! * every saved table carries the change counters of both sides and the WAL
-//!   position at the moment it finished.  The runner re-reads the counters on
-//!   resume and rescans the table if they moved;
+//! * every saved table carries, for both sides, the change counters (tuple
+//!   counters and relfilenodes), the server epoch (postmaster start time and
+//!   the database's stats reset time) and the replica replay position at the
+//!   moment it finished.  On resume the runner reads them again and reuses the
+//!   row only when [`StoredTableResult::rescan_reason`] finds nothing: any
+//!   counter or storage change, a restart, a stats reset, or replica replay
+//!   since the row was stored forces a rescan;
 //! * only conclusive results are reused, and a row that cannot be read back is
 //!   reported as [`Loaded::Unreadable`], which the runner rescans; nothing is
 //!   ever silently dropped.  Every write error is returned to the caller.
@@ -22,7 +26,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::consistency::ChangeCounters;
+use crate::consistency::{ChangeCounters, ReplicaState, ServerEpoch};
 use crate::results::{CheckLevel, TableResult, Verdict};
 
 /// Errors from the resume store.
@@ -36,7 +40,7 @@ pub enum StoreError {
 
 /// Store format version, recorded in `run_meta`; a store from another version
 /// is cleared rather than trusted.
-pub const STORE_VERSION: &str = "2";
+pub const STORE_VERSION: &str = "3";
 
 /// What a saved table result was computed against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +51,38 @@ pub struct RunKey {
     pub tool_version: String,
 }
 
+/// What one side looked like when a table finished (or looks like now).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SideMark {
+    pub counters: ChangeCounters,
+    pub epoch: ServerEpoch,
+    pub replica: ReplicaState,
+}
+
+impl SideMark {
+    /// Why counters read in `self` (stored) and `now` cannot vouch that the
+    /// table is unchanged, if they cannot.
+    pub fn rescan_reason(&self, now: &SideMark) -> Option<&'static str> {
+        if !self.epoch.same_as(&now.epoch) {
+            return Some("the server restarted or its statistics were reset");
+        }
+        if self.counters.moved(&now.counters) {
+            return Some("the table changed since its result was stored");
+        }
+        if self.replica.in_recovery != now.replica.in_recovery {
+            return Some("the server entered or left recovery");
+        }
+        if now.replica.in_recovery
+            && (now.replica.replay_lsn.is_none()
+                || self.replica.replay_lsn != now.replica.replay_lsn)
+        {
+            return Some("the replica replayed changes since the result was stored");
+        }
+        None
+    }
+}
+
 /// One table's saved result (no row values).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -54,9 +90,9 @@ pub struct StoredTableResult {
     pub table: String,
     pub level: CheckLevel,
     pub result: TableResult,
-    /// Change counters of each side when the table finished.
-    pub counters_old: ChangeCounters,
-    pub counters_new: ChangeCounters,
+    /// Each side when the table finished.
+    pub old: SideMark,
+    pub new: SideMark,
     /// New-side WAL position when the table finished.
     pub wal_lsn: Option<String>,
 }
@@ -69,6 +105,25 @@ impl StoredTableResult {
             self.result.verdict,
             Verdict::Pass | Verdict::Fail | Verdict::WidelyDifferent | Verdict::NeedsReview
         )
+    }
+
+    /// Why this stored row must be rescanned rather than reused, given the
+    /// level now requested and both sides as they are now; `None` to reuse.
+    pub fn rescan_reason(
+        &self,
+        level: CheckLevel,
+        old_now: &SideMark,
+        new_now: &SideMark,
+    ) -> Option<&'static str> {
+        if !self.is_reusable() {
+            return Some("the stored result is not conclusive");
+        }
+        if self.level != level || self.result.level != level {
+            return Some("the check level changed");
+        }
+        self.old
+            .rescan_reason(old_now)
+            .or_else(|| self.new.rescan_reason(new_now))
     }
 }
 
@@ -231,6 +286,97 @@ mod tests {
         }
     }
 
+    fn mark() -> SideMark {
+        SideMark {
+            counters: ChangeCounters::default(),
+            epoch: ServerEpoch {
+                postmaster_start: Some("2026-11-17 08:00:00+00".into()),
+                stats_reset: None,
+            },
+            replica: ReplicaState::default(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_table_is_reused() {
+        let st = stored("s.a", Verdict::Pass);
+        assert_eq!(
+            st.rescan_reason(CheckLevel::FullValues, &st.old, &st.new),
+            None
+        );
+        assert!(st
+            .rescan_reason(CheckLevel::CountsAndTotals, &st.old, &st.new)
+            .is_some());
+    }
+
+    #[test]
+    fn a_truncate_since_the_store_forces_a_rescan() {
+        let st = stored("s.a", Verdict::Pass);
+        let mut now = st.new.clone();
+        now.counters.storage = "16384:16999".into();
+        assert!(st
+            .rescan_reason(CheckLevel::FullValues, &st.old, &now)
+            .is_some());
+    }
+
+    #[test]
+    fn a_stats_reset_or_restart_forces_a_rescan() {
+        let st = stored("s.a", Verdict::Pass);
+        // The counters read back identical (both zeroed by the reset), but the
+        // epoch differs: they cannot vouch for the table.
+        let mut now = st.old.clone();
+        now.epoch.stats_reset = Some("2026-11-17 09:00:00+00".into());
+        assert_eq!(
+            st.rescan_reason(CheckLevel::FullValues, &now, &st.new),
+            Some("the server restarted or its statistics were reset")
+        );
+        let mut now = st.new.clone();
+        now.epoch.postmaster_start = Some("2026-11-17 10:00:00+00".into());
+        assert!(st
+            .rescan_reason(CheckLevel::FullValues, &st.old, &now)
+            .is_some());
+        // An unknown start time never vouches.
+        let mut blind = st.clone();
+        blind.old.epoch.postmaster_start = None;
+        let mut now = st.old.clone();
+        now.epoch.postmaster_start = None;
+        assert!(blind
+            .rescan_reason(CheckLevel::FullValues, &now, &st.new)
+            .is_some());
+    }
+
+    #[test]
+    fn replica_replay_since_the_store_forces_a_rescan() {
+        let mut st = stored("s.a", Verdict::Pass);
+        st.new.replica = ReplicaState {
+            in_recovery: true,
+            replay_lsn: Some("0/3000060".into()),
+            paused: false,
+        };
+        let same = st.new.clone();
+        assert_eq!(
+            st.rescan_reason(CheckLevel::FullValues, &st.old, &same),
+            None
+        );
+        let mut moved = st.new.clone();
+        moved.replica.replay_lsn = Some("0/3000148".into());
+        assert!(st
+            .rescan_reason(CheckLevel::FullValues, &st.old, &moved)
+            .is_some());
+        let mut unknown = st.new.clone();
+        unknown.replica.replay_lsn = None;
+        assert!(st
+            .rescan_reason(CheckLevel::FullValues, &st.old, &unknown)
+            .is_some());
+        let promoted = SideMark {
+            replica: ReplicaState::default(),
+            ..st.new.clone()
+        };
+        assert!(st
+            .rescan_reason(CheckLevel::FullValues, &st.old, &promoted)
+            .is_some());
+    }
+
     fn stored(table: &str, verdict: Verdict) -> StoredTableResult {
         StoredTableResult {
             table: table.into(),
@@ -250,11 +396,15 @@ mod tests {
                 changed_rows: Some(0),
                 reasons: vec!["row counts differ".into()],
             },
-            counters_old: ChangeCounters::default(),
-            counters_new: ChangeCounters {
-                n_tup_ins: 1,
-                n_tup_upd: 2,
-                n_tup_del: 3,
+            old: mark(),
+            new: SideMark {
+                counters: ChangeCounters {
+                    n_tup_ins: 1,
+                    n_tup_upd: 2,
+                    n_tup_del: 3,
+                    storage: "16384:16384".into(),
+                },
+                ..mark()
             },
             wal_lsn: Some("0/16B3748".into()),
         }
@@ -329,7 +479,7 @@ mod tests {
     #[test]
     fn stores_no_row_values_by_construction() {
         let json = serde_json::to_string(&stored("s.a", Verdict::Pass)).unwrap();
-        for field in ["counters_old", "result", "wal_lsn"] {
+        for field in ["counters", "epoch", "replica", "result", "wal_lsn"] {
             assert!(json.contains(field));
         }
     }

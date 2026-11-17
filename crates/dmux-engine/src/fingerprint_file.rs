@@ -24,11 +24,14 @@ use thiserror::Error;
 
 use crate::core::fingerprint::{BucketSummary, Decimal, MAX_BUCKET_DIGITS};
 use crate::core::normalise::{ColumnOptions, PgType};
+use crate::inventory::DatabaseInventory;
 use crate::results::CheckLevel;
 
-/// Current fingerprint-file format version.  Version 2 added `column_types`,
+/// Current fingerprint-file format version.  Version 3 added the full
+/// structural `inventory` (PLAN.md 3.3), so saved-file comparisons check
+/// structure exactly like live ones.  Version 2 added `column_types`,
 /// `options` and `control_columns` to every table.
-pub const FINGERPRINT_VERSION: u32 = 2;
+pub const FINGERPRINT_VERSION: u32 = 3;
 
 /// Maximum accepted fingerprint file size (uncompressed), in bytes.
 pub const MAX_FINGERPRINT_BYTES: usize = 512 * 1024 * 1024;
@@ -223,6 +226,10 @@ pub struct FingerprintFile {
     pub mapping_hash: String,
     pub server: CapturedServer,
     pub tables: Vec<CapturedTable>,
+    /// The database's structural inventory at capture time.  Always written
+    /// by `dmux capture`; a file without one is still read, but the run is
+    /// floored at WARNING ("structure not compared").
+    pub inventory: Option<Box<DatabaseInventory>>,
     /// SHA-256 over the canonical content (every field except this one), set by
     /// [`FingerprintFile::to_json`] and verified by [`FingerprintFile::from_bytes`].
     pub sha256: String,
@@ -236,6 +243,7 @@ struct Hashable<'a> {
     mapping_hash: &'a str,
     server: &'a CapturedServer,
     tables: &'a [CapturedTable],
+    inventory: &'a Option<Box<DatabaseInventory>>,
 }
 
 impl<'a> From<&'a FingerprintFile> for Hashable<'a> {
@@ -246,6 +254,7 @@ impl<'a> From<&'a FingerprintFile> for Hashable<'a> {
             mapping_hash: &f.mapping_hash,
             server: &f.server,
             tables: &f.tables,
+            inventory: &f.inventory,
         }
     }
 }
@@ -293,6 +302,9 @@ impl FingerprintFile {
                 )));
             }
             t.validate()?;
+        }
+        if let Some(inv) = &self.inventory {
+            validate_inventory(inv, &self.tables)?;
         }
         Ok(())
     }
@@ -383,6 +395,40 @@ impl FingerprintFile {
     }
 }
 
+/// The inventory's own consistency: unique schema names, unique table and
+/// column names, and every captured table present in it.
+fn validate_inventory(
+    inv: &DatabaseInventory,
+    tables: &[CapturedTable],
+) -> Result<(), FingerprintFileError> {
+    let bad = |what: String| Err(FingerprintFileError::Invalid(format!("inventory: {what}")));
+    let mut schemas = BTreeSet::new();
+    let mut all = BTreeSet::new();
+    for s in &inv.schemas {
+        if !schemas.insert(s.name.as_str()) {
+            return bad(format!("duplicate schema {}", s.name));
+        }
+        for t in &s.tables {
+            if !all.insert(format!("{}.{}", s.name, t.name)) {
+                return bad(format!("duplicate table {}.{}", s.name, t.name));
+            }
+            let mut cols = BTreeSet::new();
+            if !t.columns.iter().all(|c| cols.insert(c.name.as_str())) {
+                return bad(format!("duplicate column in {}.{}", s.name, t.name));
+            }
+        }
+    }
+    for t in tables {
+        if !all.contains(&t.old_qualified) {
+            return bad(format!(
+                "captured table {} is not in the inventory",
+                t.old_qualified
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Collect every object key present in `raw` but absent at the same place in
 /// `canonical`.
 fn unknown_keys(
@@ -412,6 +458,83 @@ fn unknown_keys(
             }
         }
         _ => {}
+    }
+}
+
+/// Test helpers: a small inventory with the given `schema.table` names, each
+/// with an `id` column, a primary key and one index.
+#[cfg(test)]
+pub(crate) mod test_inventory {
+    use crate::inventory::{
+        Column, Constraint, ConstraintKind, DatabaseInventory, Index, Schema, Table,
+    };
+    use std::collections::BTreeMap;
+
+    pub(crate) fn table(name: &str) -> Table {
+        Table {
+            name: name.into(),
+            owner: "o".into(),
+            has_oids: false,
+            is_partitioned: false,
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "integer".into(),
+                length: None,
+                nullable: false,
+                default: None,
+            }],
+            constraints: vec![Constraint {
+                name: format!("{name}_pkey"),
+                kind: ConstraintKind::PrimaryKey,
+                validated: true,
+                definition: "PRIMARY KEY (id)".into(),
+            }],
+            indexes: vec![Index {
+                name: format!("ix_{name}"),
+                valid: true,
+                definition: format!("CREATE INDEX ix_{name} ON {name} (id)"),
+            }],
+            partitions: vec![],
+            inherited_from: vec![],
+            n_live_tup: 0,
+            size_bytes: 0,
+            last_analyze: None,
+            stats_missing: false,
+            warnings: vec![],
+        }
+    }
+
+    pub(crate) fn of(tables: &[&str]) -> DatabaseInventory {
+        let mut schemas: BTreeMap<String, Schema> = BTreeMap::new();
+        for q in tables {
+            let (s, t) = q.split_once('.').expect("schema.table");
+            schemas
+                .entry(s.to_string())
+                .or_insert_with(|| Schema {
+                    name: s.into(),
+                    owner: "o".into(),
+                    tables: vec![],
+                    views: vec![],
+                    materialized_views: vec![],
+                    functions: vec![],
+                    triggers: vec![],
+                    sequences: vec![],
+                })
+                .tables
+                .push(table(t));
+        }
+        DatabaseInventory {
+            server_version: "17".into(),
+            server_version_num: 170000,
+            encoding: "UTF8".into(),
+            collation: "C".into(),
+            ctype: "C".into(),
+            lc_monetary: "C".into(),
+            schemas: schemas.into_values().collect(),
+            extensions: vec![],
+            large_object_count: 0,
+            warnings: vec![],
+        }
     }
 }
 
@@ -462,6 +585,7 @@ mod tests {
                 sql_ascii: false,
             },
             tables: vec![table()],
+            inventory: Some(Box::new(test_inventory::of(&["demo_bank.accounts"]))),
             sha256: String::new(),
         }
     }
@@ -524,6 +648,9 @@ mod tests {
             &["tables", "0", "buckets", "0"][..],
             &["tables", "0", "options", "0"][..],
             &["server"][..],
+            &["inventory"][..],
+            &["inventory", "schemas", "0", "tables", "0"][..],
+            &["inventory", "schemas", "0", "tables", "0", "indexes", "0"][..],
         ] {
             let mut v = base.clone();
             let mut node = &mut v;
@@ -628,5 +755,52 @@ mod tests {
         let mut f = sample();
         f.tables[0].old_qualified = "accounts".into();
         invalid(f, "schema-qualified");
+    }
+
+    #[test]
+    fn carries_and_hashes_the_inventory() {
+        let back = round(sample()).unwrap();
+        assert_eq!(back.inventory, sample().inventory);
+        // Editing the inventory with the old hash kept is tampering.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&sample().to_json().unwrap()).unwrap();
+        v["inventory"]["schemas"][0]["tables"][0]["indexes"] = serde_json::json!([]);
+        assert!(matches!(
+            FingerprintFile::from_bytes(&serde_json::to_vec(&v).unwrap()),
+            Err(FingerprintFileError::HashMismatch { .. })
+        ));
+        // Version 2 files (no inventory) are refused.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&sample().to_json().unwrap()).unwrap();
+        v["format_version"] = serde_json::json!(2);
+        assert_eq!(
+            FingerprintFile::from_bytes(&serde_json::to_vec(&v).unwrap()),
+            Err(FingerprintFileError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
+    fn rejects_an_inconsistent_inventory() {
+        let mut f = sample();
+        let inv = f.inventory.as_mut().unwrap();
+        let dup = inv.schemas[0].clone();
+        inv.schemas.push(dup);
+        invalid(f, "duplicate schema demo_bank");
+        let mut f = sample();
+        let t = f.inventory.as_ref().unwrap().schemas[0].tables[0].clone();
+        f.inventory.as_mut().unwrap().schemas[0].tables.push(t);
+        invalid(f, "duplicate table demo_bank.accounts");
+        let mut f = sample();
+        f.inventory = Some(Box::new(test_inventory::of(&["demo_bank.other"])));
+        invalid(
+            f,
+            "captured table demo_bank.accounts is not in the inventory",
+        );
+        let mut f = sample();
+        let c = f.inventory.as_ref().unwrap().schemas[0].tables[0].columns[0].clone();
+        f.inventory.as_mut().unwrap().schemas[0].tables[0]
+            .columns
+            .push(c);
+        invalid(f, "duplicate column");
     }
 }

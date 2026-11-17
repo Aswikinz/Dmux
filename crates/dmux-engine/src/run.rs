@@ -35,7 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use thiserror::Error;
 
-use crate::consistency::{read_counters, read_wal_position, ChangeCounters};
+use crate::consistency::{
+    read_counters, read_replica_state, read_server_epoch, read_wal_position, replica_decision,
+    ChangeCounters, ReplicaDecision, ReplicaState, ServerEpoch,
+};
 use crate::core::compare::{compare, Comparison, SideOutcome, Verdict as CoreVerdict};
 use crate::core::drilldown::{classify, fetch_rows};
 use crate::core::fingerprint::{fingerprint, Fingerprint, Side, Source, TablePlan};
@@ -48,7 +51,7 @@ use crate::plan::{build_table_spec, core_table_plan, read_live_table_opt, SpecIn
 use crate::results::{
     fresh_run_id, ChangedRowExport, CheckLevel, ControlTotalExport, RunResults, TableDetail,
 };
-use crate::store::{Loaded, RunKey, Store, StoredTableResult};
+use crate::store::{Loaded, RunKey, SideMark, Store, StoredTableResult};
 
 use verdict::{Builder, CountsComparison, Evidence, Outcome, Spot};
 
@@ -81,7 +84,14 @@ pub struct RunConfig {
     pub export_keys: bool,
     /// An optional resume store path (see `crate::store`).
     pub resume_store: Option<std::path::PathBuf>,
+    /// How long to wait before the final change-counter read, so writes made
+    /// during the run have been flushed into the server statistics (see
+    /// `crate::consistency`).  Default 2 s; definition key `stats_settle_ms`.
+    pub stats_settle: std::time::Duration,
 }
+
+/// The default [`RunConfig::stats_settle`].
+pub const DEFAULT_STATS_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Default for RunConfig {
     fn default() -> Self {
@@ -108,6 +118,7 @@ impl Default for RunConfig {
             allow_superuser: false,
             export_keys: false,
             resume_store: None,
+            stats_settle: DEFAULT_STATS_SETTLE,
         }
     }
 }
@@ -311,6 +322,57 @@ pub(crate) async fn counters(
     .map_err(|e| e.to_string())
 }
 
+pub(crate) async fn epoch(s: &mut ReadOnlySession) -> Option<ServerEpoch> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_server_epoch(&*to)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .ok()
+}
+
+pub(crate) async fn replica(s: &mut ReadOnlySession, version_num: i32) -> Option<ReplicaState> {
+    s.with_read_only("10s", |to| {
+        Box::pin(async move {
+            read_replica_state(&*to, version_num)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await
+    .ok()
+}
+
+/// The replica decision for one side, with an unreadable state counted as
+/// moved (fail-closed).
+pub(crate) fn replica_outcome(
+    before: &Option<ReplicaState>,
+    after: &Option<ReplicaState>,
+) -> ReplicaDecision {
+    match (before, after) {
+        (Some(b), Some(a)) => replica_decision(b, a),
+        _ => ReplicaDecision::Moved("the recovery state could not be read"),
+    }
+}
+
+/// Apply a replica decision to a table's evidence: moved replay is a change
+/// during the check, paused replay is recorded.
+pub(crate) fn apply_replica(e: &mut verdict::Evidence, side: &str, d: &ReplicaDecision) {
+    match d {
+        ReplicaDecision::Moved(why) => {
+            e.changed = true;
+            e.notes.push(format!("{side} database: {why}"));
+        }
+        ReplicaDecision::Paused => e.notes.push(format!(
+            "{side} database: replica replay paused during the check"
+        )),
+        ReplicaDecision::Steady | ReplicaDecision::NotReplica => {}
+    }
+}
+
 pub(crate) async fn wal(s: &mut ReadOnlySession, version_num: i32) -> Option<String> {
     s.with_read_only("10s", |to| {
         Box::pin(async move {
@@ -476,6 +538,34 @@ impl Pair {
 /// Before/after change counters of one table (None: could not be read).
 type CounterPair = Option<(ChangeCounters, ChangeCounters)>;
 
+/// Whether a table's (old, new) counters moved; anything unreadable is moved.
+pub(crate) fn counters_moved(before: &CounterPair, after: Option<&CounterPair>) -> bool {
+    match (before, after) {
+        (Some((bo, bn)), Some(Some((ao, an)))) => bo.moved(ao) || bn.moved(an),
+        _ => true,
+    }
+}
+
+/// Whether the server epoch changed between two reads (an unreadable read
+/// after a readable one counts as changed).
+pub(crate) fn epoch_changed(start: &Option<ServerEpoch>, end: &Option<ServerEpoch>) -> bool {
+    match (start, end) {
+        (Some(a), Some(b)) => a != b,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// Record "replay paused" once per side in the run warnings.
+pub(crate) fn note_paused(results: &mut RunResults, side: &str, d: &ReplicaDecision) {
+    if *d == ReplicaDecision::Paused {
+        let w = format!("{side} database is a replica with replay paused during the check");
+        if !results.warnings.contains(&w) {
+            results.warnings.push(w);
+        }
+    }
+}
+
 async fn snapshot(
     old_s: &mut ReadOnlySession,
     new_s: &mut ReadOnlySession,
@@ -588,17 +678,14 @@ async fn run_live(
             .push("new database is SQL_ASCII; never a clean PASS on encoding (P19)".into());
     }
     b.results.wal_start_lsn = wal(&mut new_s, new_info.version_num).await;
+    // What the counters are relative to (see `crate::consistency`).
+    let epoch_old = epoch(&mut old_s).await;
+    let epoch_new = epoch(&mut new_s).await;
 
     // Structure: both inventories, compared after the mapping is applied.
     let old_inv = inventory(&mut old_s).await?;
     let new_inv = inventory(&mut new_s).await?;
-    let mapped_old = structure::map_inventory(&old_inv, &config.mapping);
-    let (findings, ignored) = structure::findings(&mapped_old, &new_inv, &config.mapping);
-    for i in &ignored {
-        b.ignore_item(&i.path, &i.reason);
-    }
-    b.results.structure_findings = findings.clone();
-    b.results.suggestions = structure::suggestions(&mapped_old, &new_inv, &config.mapping);
+    let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
 
     // Pair every old table with its mapped new table.
     let table_ignores: BTreeMap<String, String> = config
@@ -687,15 +774,25 @@ async fn run_live(
             continue;
         };
 
-        // Resume: reuse a stored conclusive result only if the table's counters
-        // have not moved since it was stored.  Anything else is rescanned.
-        if let Some(s) = &store {
+        let ro = replica(&mut old_s, old_info.version_num).await;
+        let rn = replica(&mut new_s, new_info.version_num).await;
+
+        // Resume: reuse a stored conclusive result only if nothing that could
+        // vouch for the table moved since it was stored (counters, storage,
+        // server epoch, replica replay).  Anything else is rescanned.
+        if let (Some(s), Some(ro), Some(rn)) = (&store, &ro, &rn) {
             if let Loaded::Found(st) = s.load_table(&p.path)? {
-                if st.is_reusable()
-                    && st.level == p.level
-                    && st.counters_old == bo
-                    && st.counters_new == bn
-                {
+                let now_old = SideMark {
+                    counters: bo.clone(),
+                    epoch: epoch_old.clone().unwrap_or_default(),
+                    replica: ro.clone(),
+                };
+                let now_new = SideMark {
+                    counters: bn.clone(),
+                    epoch: epoch_new.clone().unwrap_or_default(),
+                    replica: rn.clone(),
+                };
+                if st.rescan_reason(p.level, &now_old, &now_new).is_none() {
                     b.record_resumed(st.result.clone());
                     continue;
                 }
@@ -712,22 +809,42 @@ async fn run_live(
         )
         .await;
 
-        // Per-table change check, and the counters stored for resume.
+        // Replica replay during this table's scans (counters are blind there).
+        let ro_after = replica(&mut old_s, old_info.version_num).await;
+        let rn_after = replica(&mut new_s, new_info.version_num).await;
+        for (side, d) in [
+            ("old", replica_outcome(&ro, &ro_after)),
+            ("new", replica_outcome(&rn, &rn_after)),
+        ] {
+            note_paused(&mut b.results, side, &d);
+            apply_replica(&mut e, side, &d);
+        }
+
+        // Per-table change check, and the marks stored for resume.
         let ao = counters(&mut old_s, &p.old.0, &p.old.1).await;
         let an = counters(&mut new_s, &p.new.0, &p.new.1).await;
         match (ao, an) {
             (Ok(ao), Ok(an)) => {
-                if ao != bo || an != bn {
+                if bo.moved(&ao) || bn.moved(&an) {
                     e.changed = true;
                 }
                 if let Some(s) = &store {
-                    let (result, _) = verdict::decide(&e);
+                    // The final, flag-applied verdict (P19 included).
+                    let (result, _) = b.decide_now(&e);
                     s.save_table(&StoredTableResult {
                         table: p.path.clone(),
                         level: p.level,
                         result,
-                        counters_old: ao,
-                        counters_new: an,
+                        old: SideMark {
+                            counters: ao,
+                            epoch: epoch_old.clone().unwrap_or_default(),
+                            replica: ro_after.clone().unwrap_or_default(),
+                        },
+                        new: SideMark {
+                            counters: an,
+                            epoch: epoch_new.clone().unwrap_or_default(),
+                            replica: rn_after.clone().unwrap_or_default(),
+                        },
                         wal_lsn: wal(&mut new_s, new_info.version_num).await,
                     })?;
                 }
@@ -742,13 +859,21 @@ async fn run_live(
 
     // Run-level change sweep: any table that moved since the first snapshot is
     // CHANGED_DURING_CHECK, never PASS.  Unreadable counters count as moved.
+    // Wait first, so writes made during the run reach the statistics.
+    tokio::time::sleep(config.stats_settle).await;
     let after = snapshot(&mut old_s, &mut new_s, &pairs).await;
+    // A restart or stats reset during the run makes every counter comparison
+    // meaningless: every scanned table is treated as changed.
+    let epoch_moved = epoch_changed(&epoch_old, &epoch(&mut old_s).await)
+        || epoch_changed(&epoch_new, &epoch(&mut new_s).await);
+    if epoch_moved {
+        b.results.warnings.push(
+            "a server restarted or its statistics were reset during the run; changes cannot be ruled out"
+                .into(),
+        );
+    }
     for (path, b4) in &before {
-        let moved = match (b4, after.get(path)) {
-            (Some(x), Some(Some(y))) => x != y,
-            _ => true,
-        };
-        if moved {
+        if epoch_moved || counters_moved(b4, after.get(path)) {
             b.mark_changed(path);
         }
     }
@@ -1142,6 +1267,81 @@ mod tests {
         );
         assert_eq!(map_table(&m, "s", "old_x"), ("s".into(), "new_x".into()));
         assert_eq!(map_table(&m, "s", "y"), ("s".into(), "y".into()));
+    }
+
+    fn cc(ins: i64, storage: &str) -> ChangeCounters {
+        ChangeCounters {
+            n_tup_ins: ins,
+            storage: storage.into(),
+            ..ChangeCounters::default()
+        }
+    }
+
+    #[test]
+    fn the_sweep_sees_a_truncate_and_unreadable_counters() {
+        let before = Some((cc(5, "1:1"), cc(5, "2:2")));
+        assert!(!counters_moved(&before, Some(&before.clone())));
+        // Same counts, new relfilenode on the new side: a truncate and reload.
+        assert!(counters_moved(
+            &before,
+            Some(&Some((cc(5, "1:1"), cc(5, "2:9"))))
+        ));
+        assert!(counters_moved(&before, Some(&None)));
+        assert!(counters_moved(&None, Some(&before)));
+        assert!(counters_moved(&before, None));
+    }
+
+    #[test]
+    fn an_epoch_change_during_the_run_is_seen() {
+        let e = Some(ServerEpoch {
+            postmaster_start: Some("t0".into()),
+            stats_reset: None,
+        });
+        assert!(!epoch_changed(&e, &e.clone()));
+        let reset = Some(ServerEpoch {
+            postmaster_start: Some("t0".into()),
+            stats_reset: Some("t1".into()),
+        });
+        assert!(epoch_changed(&e, &reset));
+        assert!(epoch_changed(&e, &None));
+    }
+
+    #[test]
+    fn replica_outcomes_mark_or_record() {
+        let st = |lsn: &str, paused| {
+            Some(ReplicaState {
+                in_recovery: true,
+                replay_lsn: Some(lsn.into()),
+                paused,
+            })
+        };
+        let mut e = Evidence::new("s.t", CheckLevel::FullValues, Outcome::OnlyOnNew);
+        apply_replica(
+            &mut e,
+            "old",
+            &replica_outcome(&st("0/1", false), &st("0/1", false)),
+        );
+        assert!(!e.changed);
+        apply_replica(
+            &mut e,
+            "old",
+            &replica_outcome(&st("0/1", true), &st("0/1", true)),
+        );
+        assert!(!e.changed);
+        assert!(e.notes.iter().any(|n| n.contains("replay paused")));
+        apply_replica(
+            &mut e,
+            "new",
+            &replica_outcome(&st("0/1", false), &st("0/2", false)),
+        );
+        assert!(e.changed, "replay advanced during the scans");
+        let mut e = Evidence::new("s.t", CheckLevel::FullValues, Outcome::OnlyOnNew);
+        apply_replica(&mut e, "new", &replica_outcome(&st("0/1", false), &None));
+        assert!(e.changed, "an unreadable state is moved");
+        let mut r = RunResults::default();
+        note_paused(&mut r, "old", &ReplicaDecision::Paused);
+        note_paused(&mut r, "old", &ReplicaDecision::Paused);
+        assert_eq!(r.warnings.len(), 1);
     }
 
     #[test]

@@ -491,7 +491,14 @@ struct RunDefinition {
     /// Per-column options (PLAN.md 3.2), by old `schema.table.column`.
     #[serde(default)]
     options: BTreeMap<String, OptionsDef>,
+    /// Wait before the final change-counter read, in milliseconds (default
+    /// and minimum 2000: the statistics flush lag; see dmux_engine::consistency).
+    #[serde(default)]
+    stats_settle_ms: Option<u64>,
 }
+
+/// The smallest accepted `stats_settle_ms`.
+const MIN_STATS_SETTLE_MS: u64 = 2000;
 
 /// The four recorded per-column options, strictly parsed (unknown keys are
 /// rejected: a definition file is untrusted input).
@@ -599,6 +606,16 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
     if def.allow_superuser && def.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
         return Err("allow_superuser requires a non-empty reason".to_string());
     }
+    let stats_settle = match def.stats_settle_ms {
+        None => dmux_engine::run::DEFAULT_STATS_SETTLE,
+        Some(ms) if ms >= MIN_STATS_SETTLE_MS => std::time::Duration::from_millis(ms),
+        Some(ms) => {
+            return Err(format!(
+                "stats_settle_ms must be at least {MIN_STATS_SETTLE_MS} (got {ms}): \
+                 shorter waits can miss writes the server has not counted yet"
+            ))
+        }
+    };
     let old_parallelism = def.old_parallelism.unwrap_or(2);
     let new_parallelism = def.new_parallelism.unwrap_or(4);
     if old_parallelism == 0 || new_parallelism == 0 {
@@ -622,6 +639,7 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         allow_superuser: def.allow_superuser,
         export_keys: def.export_keys,
         resume_store: None,
+        stats_settle,
     })
 }
 
@@ -766,5 +784,14 @@ new = { host = "127.0.0.1", port = 5434, db = "d", user = "u", tls = "disable", 
             &CONNS.replace("tls = \"disable\", reason = \"lab\"", "tls = \"bogus\"")
         )
         .is_err());
+    }
+
+    #[test]
+    fn stats_settle_defaults_to_two_seconds_and_cannot_go_lower() {
+        let c = definition("settle-default", CONNS).unwrap();
+        assert_eq!(c.stats_settle, std::time::Duration::from_secs(2));
+        let c = definition("settle-5s", &format!("stats_settle_ms = 5000\n{CONNS}")).unwrap();
+        assert_eq!(c.stats_settle, std::time::Duration::from_secs(5));
+        assert!(definition("settle-low", &format!("stats_settle_ms = 500\n{CONNS}")).is_err());
     }
 }

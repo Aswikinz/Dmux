@@ -5,7 +5,8 @@
 //! types, options, key and control-total columns, bucket width) so a later
 //! comparison scans the other side with exactly the same plan.  The mapping is
 //! fixed at capture time (its hash is recorded); an in-place upgrade keeps
-//! every name, so the identity mapping works.
+//! every name, so the identity mapping works.  The file also carries the
+//! database's full structural inventory (PLAN.md 3.3).
 //!
 //! Levels: FullValues stores bucket summaries; CountsAndTotals stores the row
 //! count and control totals only.  Structure is refused: a fingerprint file
@@ -169,6 +170,9 @@ pub async fn capture(
             sql_ascii: info.sql_ascii,
         },
         tables: captured,
+        // The full structure, so a saved-file comparison checks indexes,
+        // constraints, sequences and large objects like a live run.
+        inventory: Some(Box::new(inv)),
         sha256: String::new(),
     };
     // A capture must itself be a valid file before anyone relies on it.

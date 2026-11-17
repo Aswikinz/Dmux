@@ -16,6 +16,27 @@ use crate::results::{IgnoredItem, MappingSuggestion, StructureFinding, Verdict};
 use crate::schema_diff::{compare_inventories, DiffStatus, SchemaDiffEntry};
 
 use super::map_table;
+use super::verdict::Builder;
+
+/// The structure step every comparison path shares: map the old inventory,
+/// diff it against the new one, record the findings (each red one fails the
+/// run), the ignored items with their reasons and the suggestions.  Returns
+/// the findings so structure-level tables can take theirs.
+pub fn apply(
+    b: &mut Builder,
+    old: &DatabaseInventory,
+    new: &DatabaseInventory,
+    mapping: &Mapping,
+) -> Vec<StructureFinding> {
+    let mapped_old = map_inventory(old, mapping);
+    let (kept, ignored) = findings(&mapped_old, new, mapping);
+    for i in &ignored {
+        b.ignore_item(&i.path, &i.reason);
+    }
+    b.results.structure_findings = kept.clone();
+    b.results.suggestions = suggestions(&mapped_old, new, mapping);
+    kept
+}
 
 /// The schema an old schema maps to.
 pub fn map_schema(mapping: &Mapping, schema: &str) -> String {
