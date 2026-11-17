@@ -4,27 +4,37 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::error::CommandError;
-use crate::secrets::Keychain;
+use crate::secrets::{Keychain, PasswordStore};
 use crate::store::Store;
 
 /// App-wide state, managed once at startup.
 pub struct AppState {
-    /// The keychain (with its availability flag) guarding secrets.
-    pub keychain: Mutex<Keychain>,
+    /// The password store guarding secrets (the OS keychain in production).
+    pub keychain: Mutex<Box<dyn PasswordStore>>,
     /// The SQLite profile store, opened at startup.
     pub store: Mutex<Store>,
 }
 
 impl AppState {
-    /// Open the profile store (at `data_dir/dmux.db`) and build the state,
-    /// creating the app data directory first so the store always has a home.
+    /// Open the profile store (at `data_dir/dmux.db`) and build the state with
+    /// the OS-keychain password store, creating the app data directory first so
+    /// the store always has a home.
     pub fn new(data_dir: PathBuf) -> Result<Self, CommandError> {
+        Self::with_password_store(data_dir, Box::new(Keychain::default()))
+    }
+
+    /// Build the state with an injected password store (used by tests to avoid
+    /// touching the real OS keychain).
+    pub fn with_password_store(
+        data_dir: PathBuf,
+        keychain: Box<dyn PasswordStore>,
+    ) -> Result<Self, CommandError> {
         std::fs::create_dir_all(&data_dir).map_err(|e| CommandError::Store {
             message: format!("cannot create app data dir: {e}"),
         })?;
         let store = Store::open(&data_dir.join("dmux.db"))?;
         Ok(Self {
-            keychain: Mutex::new(Keychain::default()),
+            keychain: Mutex::new(keychain),
             store: Mutex::new(store),
         })
     }
@@ -36,8 +46,10 @@ impl AppState {
             .map_err(|_| CommandError::internal("store lock poisoned"))
     }
 
-    /// A guard over the keychain.
-    pub fn keychain(&self) -> Result<std::sync::MutexGuard<'_, Keychain>, CommandError> {
+    /// A guard over the password store.
+    pub fn keychain(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Box<dyn PasswordStore>>, CommandError> {
         self.keychain
             .lock()
             .map_err(|_| CommandError::internal("keychain lock poisoned"))

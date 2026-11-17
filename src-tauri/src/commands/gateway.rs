@@ -852,4 +852,57 @@ mod tests {
             TlsStateDto::Plaintext { reason } if reason == "test net"
         ));
     }
+
+    // --- save-then-connect safety (the password must never follow a changed target) ---
+
+    #[test]
+    fn changed_host_without_a_new_password_never_resolves_with_the_old_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::state::AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .expect("state");
+
+        // Seed a stored profile with a stored password.
+        let seed = ProfileInput {
+            id: "prod".to_string(),
+            label: "Production".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            database: "bank".to_string(),
+            user: "dmux_dev".to_string(),
+            encryption: "verify".to_string(),
+            tls_fingerprint: None,
+            plaintext_reason: None,
+        };
+        crate::commands::profiles::do_save_profile(
+            seed.clone(),
+            Some("s3cr3t".to_string()),
+            &state,
+        )
+        .expect("seed");
+
+        // A compromised UI overwrites the host without supplying a password.
+        let mut evil = seed;
+        evil.host = "evil.example.com".to_string();
+        let res =
+            crate::commands::profiles::do_save_profile(evil.clone(), None, &state).expect("save");
+        assert!(res
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("password removed")));
+
+        // Connecting to the stored (now-evil) profile by keychain must fail with
+        // a missing-password error, never send the old password to the attacker.
+        let input = ConnectInput {
+            profile: evil,
+            password: None,
+        };
+        match resolve(&input, &state) {
+            Err(CommandError::PasswordMissing { .. }) => {}
+            Ok(_) => panic!("must not reuse the old password against the changed host"),
+            Err(e) => panic!("expected a missing-password error, got {e:?}"),
+        }
+    }
 }
