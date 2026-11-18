@@ -601,7 +601,13 @@ pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
 /// that belong to the compared tables, and say in one warning what was left
 /// outside: other structure differences, tables only in the new database, and
 /// old tables with no partner (those are also ignored items, with the reason).
-fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, unmapped: usize) {
+fn scope_to_chosen(
+    results: &mut RunResults,
+    pairs: &[Pair],
+    left_out: &[crate::results::StructureFinding],
+    new_only: usize,
+    unmapped: usize,
+) {
     let chosen: BTreeSet<String> = pairs.iter().map(Pair::new_path).collect();
     let belongs = |object: &str| {
         chosen
@@ -611,16 +617,21 @@ fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, un
     // Findings outside the chosen tables that a full check would FAIL on are
     // named (some are about data, such as a changed large-object count), so
     // they cannot be overlooked; the rest are only counted.
+    // Findings on left-out tables were dropped with their table-level ignore
+    // before this point; `left_out` brings them back so they are counted and,
+    // when they would fail, named.
     let mut would_fail: Vec<String> = results
         .structure_findings
         .iter()
+        .chain(left_out.iter())
         .filter(|f| !belongs(&f.object) && f.verdict == crate::results::Verdict::Fail)
         .map(|f| f.object.clone())
         .collect();
     would_fail.sort();
+    would_fail.dedup();
     let before = results.structure_findings.len();
     results.structure_findings.retain(|f| belongs(&f.object));
-    let outside = before - results.structure_findings.len();
+    let outside = before - results.structure_findings.len() + left_out.len();
     let mut parts = Vec::new();
     if outside > 0 {
         let named = if would_fail.is_empty() {
@@ -633,8 +644,10 @@ fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, un
                 .collect::<Vec<_>>()
                 .join(", ");
             let more = would_fail.len().saturating_sub(10);
+            // Bracketed, so the list cannot run into the next part (and a
+            // function signature's own commas stay inside it).
             format!(
-                "; {} of them would fail a full check: {shown}{}",
+                " ({} of them would fail a full check: [{shown}{}])",
                 would_fail.len(),
                 if more > 0 {
                     format!(" and {more} more")
@@ -663,7 +676,7 @@ fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, un
     if !parts.is_empty() {
         results.warnings.push(format!(
             "this run checked only the chosen tables; not part of it: {}. Run a check of every table to review them",
-            parts.join(", ")
+            parts.join("; ")
         ));
     }
 }
@@ -1454,7 +1467,14 @@ async fn run_live(
     }
 
     if config.only_chosen_tables {
-        scope_to_chosen(&mut b.results, &pairs, outside_new_only, outside_unmapped);
+        let left_out = structure::left_out_findings(&old_inv, &new_inv, &config.mapping);
+        scope_to_chosen(
+            &mut b.results,
+            &pairs,
+            &left_out,
+            outside_new_only,
+            outside_unmapped,
+        );
     }
 
     checkpoint(config)?;
@@ -2248,7 +2268,11 @@ mod tests {
             old_rows: 0,
             new_rows: 0,
         };
-        scope_to_chosen(&mut r, &[pair], 4, 1);
+        let left_out = vec![finding(
+            "core.archive.legacy_flag",
+            crate::results::Verdict::Fail,
+        )];
+        scope_to_chosen(&mut r, &[pair], &left_out, 4, 1);
         let kept: Vec<&str> = r
             .structure_findings
             .iter()
@@ -2258,10 +2282,17 @@ mod tests {
         assert_eq!(kept, vec!["core.accounts.balance", "core.accounts"]);
         assert_eq!(r.warnings.len(), 1);
         let w = &r.warnings[0];
-        assert!(w.contains("3 structure differences in other tables"), "{w}");
-        // The ones a full check would fail on are named, not just counted.
+        // Findings on a left-out table count, and the failing ones are named,
+        // in brackets so the list cannot run into the next part.
+        assert!(w.contains("4 structure differences in other tables"), "{w}");
         assert!(
-            w.contains("2 of them would fail a full check: core.accountsx.id, core.loans.idx"),
+            w.contains(
+                "(3 of them would fail a full check: [core.accountsx.id, core.archive.legacy_flag, core.loans.idx])"
+            ),
+            "{w}"
+        );
+        assert!(
+            w.contains("]); 4 tables only in the new database; 1 old table"),
             "{w}"
         );
         assert!(w.contains("4 tables only in the new database"), "{w}");

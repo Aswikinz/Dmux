@@ -205,6 +205,44 @@ pub fn findings(
     (kept, ignored)
 }
 
+/// The structure findings on tables a run of chosen tables left out.  Those
+/// tables are ignored (with an outside-run reason), so [`findings`] drops their
+/// findings with every table-level ignore; this recovers them, so the run's
+/// summary can count them and name the ones a full check would fail on
+/// (decision 30).  Empty when nothing was left out.
+pub fn left_out_findings(
+    old: &DatabaseInventory,
+    new: &DatabaseInventory,
+    mapping: &Mapping,
+) -> Vec<StructureFinding> {
+    let left_out: BTreeSet<String> = mapping
+        .ignored
+        .iter()
+        .filter(|i| super::is_outside_run(&i.reason))
+        .filter_map(|i| {
+            let (s, t) = i.path.split_once('.')?;
+            (!t.contains('.')).then(|| {
+                let (ns, nt) = map_table(mapping, s, t);
+                format!("{ns}.{nt}")
+            })
+        })
+        .collect();
+    if left_out.is_empty() {
+        return Vec::new();
+    }
+    // The same comparison, with only the user's own ignores applied.
+    let mut own = mapping.clone();
+    own.ignored.retain(|i| !super::is_outside_run(&i.reason));
+    let (all, _) = findings(&map_inventory(old, &own), new, &own);
+    all.into_iter()
+        .filter(|f| {
+            left_out
+                .iter()
+                .any(|t| f.object == *t || f.object.starts_with(&format!("{t}.")))
+        })
+        .collect()
+}
+
 /// Suggested matches for tables and columns that stay unpaired after the
 /// mapping (never applied automatically).
 pub fn suggestions(
@@ -320,6 +358,36 @@ mod tests {
             large_object_count: 0,
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn findings_on_left_out_tables_are_recovered_for_the_summary() {
+        // s.loans lost a column in the new database; s.accounts is unchanged.
+        let old = inv(vec![
+            table("accounts", &["id"]),
+            table("loans", &["id", "rate"]),
+        ]);
+        let new = inv(vec![table("accounts", &["id"]), table("loans", &["id"])]);
+        let mut m = Mapping::new();
+        m.ignored.push(MapIgnored {
+            path: "s.loans".into(),
+            reason: super::super::NOT_SELECTED_REASON.into(),
+        });
+        // The normal path drops it with the table-level ignore ...
+        let (kept, _) = findings(&map_inventory(&old, &m), &new, &m);
+        assert!(kept.iter().all(|f| !f.object.starts_with("s.loans")));
+        // ... and this recovers it, verdict included.
+        let left = left_out_findings(&old, &new, &m);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].object, "s.loans.rate");
+        assert_eq!(left[0].verdict, Verdict::Fail);
+        // A person's own ignore is not "left out of the run": nothing recovered.
+        let mut own = Mapping::new();
+        own.ignored.push(MapIgnored {
+            path: "s.loans".into(),
+            reason: "archived before the migration".into(),
+        });
+        assert!(left_out_findings(&old, &new, &own).is_empty());
     }
 
     fn rename_mapping() -> Mapping {

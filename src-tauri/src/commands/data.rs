@@ -1971,6 +1971,39 @@ mod tests {
                 mine(&r).len(),
                 "{chosen}: outside findings kept"
             );
+            // Every structure finding a full check fails on, outside the chosen
+            // table, is accounted for in the summary warning (the real path:
+            // findings on left-out tables are recovered, not lost).
+            let mut outside_fails: Vec<&str> = full
+                .structure_findings
+                .iter()
+                .filter(|f| {
+                    f.verdict == dmux_engine::results::Verdict::Fail
+                        && f.object != *chosen
+                        && !f.object.starts_with(&format!("{chosen}."))
+                })
+                .map(|f| f.object.as_str())
+                .collect();
+            outside_fails.sort();
+            outside_fails.dedup();
+            if !outside_fails.is_empty() {
+                let w = r
+                    .warnings
+                    .iter()
+                    .find(|w| w.starts_with("this run checked only the chosen tables"))
+                    .unwrap_or_else(|| panic!("{chosen}: no scope warning in {:?}", r.warnings));
+                assert!(
+                    w.contains(&format!(
+                        "({} of them would fail a full check: [",
+                        outside_fails.len()
+                    )),
+                    "{chosen}: expected {} named failures {outside_fails:?} in {w}",
+                    outside_fails.len()
+                );
+                for o in outside_fails.iter().take(10) {
+                    assert!(w.contains(o), "{chosen}: {o} not named in {w}");
+                }
+            }
             // The run's verdict comes only from the table and its findings.
             let mut own = vec![r.tables[chosen].verdict];
             own.extend(r.structure_findings.iter().map(|f| f.verdict));
