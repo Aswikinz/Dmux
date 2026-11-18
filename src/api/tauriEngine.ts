@@ -1053,6 +1053,7 @@ function planToLevels(plan: CheckPlan): {
   const levels: Record<string, EngineLevel> = {};
   const controls = new Set<string>();
   for (const table of plan.tables) {
+    if (table.included === false) continue;
     const path = `${table.schemaName}.${table.tableName}`;
     levels[path] = toEngineLevel(table.level);
     for (const column of table.controlTotalColumns ?? []) {
@@ -1485,6 +1486,11 @@ export function createTauriEngine(): Engine {
           control_total_columns: controlTotalColumns,
           allow_superuser: allowSuperuser(),
           run_window: definition.plan.runWindow ?? null,
+          // Tables the user left out: the backend records each as ignored
+          // ("not selected for this run"), so none is dropped silently.
+          skip_tables: definition.plan.tables
+            .filter((t) => t.included === false)
+            .map((t) => `${t.schemaName}.${t.tableName}`),
         },
       });
       return { runId: started.run_id, overallState: 'running', tables: [] };

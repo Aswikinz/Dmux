@@ -21,6 +21,7 @@ import {
 import type { Engine } from '../api/engine';
 import type { CheckLevel, CheckPlan, Mapping, TableCheck } from '../api/contract';
 import { RunWindowControl } from '../components/RunWindowControl';
+import { TableScopePicker, isChosen } from '../components/TableScopePicker';
 
 interface ChooseChecksScreenProps {
   engine: Engine;
@@ -70,6 +71,28 @@ export function applyPreset(
   return { ...plan, tables: plan.tables.map((t) => ({ ...t, level: levelFor(t) })) };
 }
 
+/** A fresh plan starts with no table chosen: the user picks what this run reads. */
+export function withNoneChosen(plan: CheckPlan): CheckPlan {
+  return { ...plan, tables: plan.tables.map((t) => ({ ...t, included: false })) };
+}
+
+/** The plan's estimate scaled to the chosen tables: by size when every table
+ *  has one, else by count.  Whole seconds, at least 1. */
+export function chosenEstimate(plan: CheckPlan): { min: number; max: number } {
+  const chosen = plan.tables.filter(isChosen);
+  if (chosen.length === plan.tables.length) {
+    return { min: plan.estimateSecondsMin, max: plan.estimateSecondsMax };
+  }
+  const sized = plan.tables.every((t) => t.sizeBytes !== undefined);
+  const total = sized ? plan.tables.reduce((n, t) => n + (t.sizeBytes ?? 0), 0) : plan.tables.length;
+  const part = sized ? chosen.reduce((n, t) => n + (t.sizeBytes ?? 0), 0) : chosen.length;
+  const share = total > 0 ? part / total : 0;
+  return {
+    min: Math.max(1, Math.round(plan.estimateSecondsMin * share)),
+    max: Math.max(1, Math.round(plan.estimateSecondsMax * share)),
+  };
+}
+
 export function ChooseChecksScreen({
   engine,
   mapping,
@@ -113,7 +136,11 @@ export function ChooseChecksScreen({
           start === 'full-values' ? 'full' : start === 'suggested' ? 'suggested' : start;
         if (mounted) {
           suggestedRef.current = Object.fromEntries(result.tables.map((t) => [t.tableId, t.level]));
-          onPlanChange(preset === 'suggested' ? result : applyPreset(result, preset, suggestedRef.current));
+          onPlanChange(
+            withNoneChosen(
+              preset === 'suggested' ? result : applyPreset(result, preset, suggestedRef.current),
+            ),
+          );
           setSelectedPreset(preset);
         }
       } catch (e) {
@@ -178,17 +205,16 @@ export function ChooseChecksScreen({
   };
 
   const applyBulkLevel = () => {
-    if (!plan || selected.size === 0) return;
+    const ids = new Set([...selected].filter((id) => plan?.tables.some((t) => t.tableId === id && isChosen(t))));
+    if (!plan || ids.size === 0) return;
     setSelectedPreset('custom');
     setPresetNote(null);
     onPlanChange({
       ...plan,
-      tables: plan.tables.map((t) => (selected.has(t.tableId) ? { ...t, level: bulkLevel } : t)),
+      tables: plan.tables.map((t) => (ids.has(t.tableId) ? { ...t, level: bulkLevel } : t)),
     });
     const label = levelOptions.find((o) => o.value === bulkLevel)?.label ?? bulkLevel;
-    setSelectionNote(
-      `Set ${selected.size === 1 ? '1 table' : `${selected.size} tables`} to "${label}".`,
-    );
+    setSelectionNote(`Set ${ids.size === 1 ? '1 table' : `${ids.size} tables`} to "${label}".`);
   };
 
   /** Tick or untick a suggested control-total column.  Only ticked columns are
@@ -288,22 +314,32 @@ export function ChooseChecksScreen({
     ] as ColumnDef<TableCheck>[];
   }, []);
 
+  // Only the chosen tables take a level; the rest are not read.
+  const chosen = useMemo(() => (plan?.tables ?? []).filter(isChosen), [plan]);
+
   const schemas = useMemo(
-    () => [...new Set((plan?.tables ?? []).map((t) => t.schemaName))].sort(),
-    [plan],
+    () => [...new Set(chosen.map((t) => t.schemaName))].sort(),
+    [chosen],
   );
 
   const totals = useMemo(() => {
-    if (!plan) return null;
-    const full = plan.tables.filter((t) => t.level === 'full-values').length;
-    const counts = plan.tables.filter((t) => t.level === 'counts').length;
-    const structure = plan.tables.filter((t) => t.level === 'structure').length;
+    const full = chosen.filter((t) => t.level === 'full-values').length;
+    const counts = chosen.filter((t) => t.level === 'counts').length;
+    const structure = chosen.filter((t) => t.level === 'structure').length;
     return { full, counts, structure };
-  }, [plan]);
+  }, [chosen]);
+
+  // A bulk selection only ever counts tables that are still chosen.
+  const chosenIds = useMemo(() => new Set(chosen.map((t) => t.tableId)), [chosen]);
+  const selectedChosen = useMemo(
+    () => new Set([...selected].filter((id) => chosenIds.has(id))),
+    [selected, chosenIds],
+  );
+  const estimate = plan ? chosenEstimate(plan) : null;
 
   return (
     <div className="space-y-6">
-      <ScreenHeader title="Choose checks" subtitle="Pick how thoroughly each table is checked. A full-values check compares every value." />
+      <ScreenHeader title="Choose checks" subtitle="Choose which tables this run checks, then how thoroughly. A full-values check compares every value." />
       {loading && (
         <Panel>
           <div className="py-8 text-center text-slate-600 dark:text-slate-300">Building check plan…</div>
@@ -312,177 +348,197 @@ export function ChooseChecksScreen({
       {error && <ErrorCard title="Could not build check plan">{error}</ErrorCard>}
       {plan && (
         <>
-          <Panel className="flex flex-col gap-4">
-            <div className="flex flex-wrap items-end gap-4">
-              <Select
-                label="Preset"
-                options={PRESETS}
-                value={selectedPreset}
-                onChange={(e) => choosePreset(e.target.value as PresetId)}
-                className="w-96"
-                data-testid="preset-select"
-              />
-              <div className="rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
-                <span className="font-medium">Estimated time:</span>{' '}
-                {formatDurationRange(plan.estimateSecondsMin, plan.estimateSecondsMax)}
-                <span className="block text-xs text-slate-500 dark:text-slate-400">
-                  Corrected as each table finishes. A table that fails takes a second pass to list
-                  its differences.
-                </span>
-              </div>
-            </div>
-            {presetNote && (
-              <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
-                {presetNote}
+          <Panel>
+            <TableScopePicker tables={plan.tables} onChange={(tables) => onPlanChange({ ...plan, tables })} />
+          </Panel>
+          {chosen.length === 0 ? (
+            <Panel>
+              <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="levels-waiting">
+                Choose at least one table above. Then you can set how thoroughly each one is checked.
               </p>
-            )}
-            {totals && (
-              <div className="flex gap-4 text-sm text-slate-600 dark:text-slate-300">
-                <span><strong>{totals.full}</strong> full values</span>
-                <span><strong>{totals.counts}</strong> counts</span>
-                <span><strong>{totals.structure}</strong> structure only</span>
-              </div>
-            )}
-            <div
-              role="group"
-              aria-label="Select tables"
-              className="space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700"
-            >
-              <p className="text-sm font-medium">Select tables, then change their level together</p>
-              <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
-                <div className="flex items-end gap-2" data-testid="select-by-schema">
-                  <Select
-                    label="Schema"
-                    options={[{ value: '', label: 'Choose a schema' }, ...schemas.map((x) => ({ value: x, label: x }))]}
-                    value={schemaChoice}
-                    onChange={(e) => setSchemaChoice(e.target.value)}
-                    className="w-44"
-                  />
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    disabled={!schemaChoice}
-                    onClick={() =>
-                      replaceSelection(selectBySchema(plan.tables, schemaChoice), `schema ${schemaChoice}`)
-                    }
-                  >
-                    Select schema
-                  </Button>
+            </Panel>
+          ) : (
+            <Panel className="flex flex-col gap-4">
+              <h3 className="text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">
+                How thoroughly to check the chosen tables
+              </h3>
+              <div className="flex flex-wrap items-end gap-4">
+                <Select
+                  label="Preset"
+                  options={PRESETS}
+                  value={selectedPreset}
+                  onChange={(e) => choosePreset(e.target.value as PresetId)}
+                  className="w-96"
+                  data-testid="preset-select"
+                />
+                <div className="rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
+                  <span className="font-medium">Estimated time:</span>{' '}
+                  {formatDurationRange(estimate?.min ?? plan.estimateSecondsMin, estimate?.max ?? plan.estimateSecondsMax)}
+                  {chosen.length < plan.tables.length && (
+                    <span className="text-slate-500 dark:text-slate-400">
+                      {' '}
+                      for the {chosen.length === 1 ? '1 chosen table' : `${chosen.length} chosen tables`}
+                    </span>
+                  )}
+                  <span className="block text-xs text-slate-500 dark:text-slate-400">
+                    Corrected as each table finishes. A table that fails takes a second pass to list
+                    its differences.
+                  </span>
                 </div>
-                <div className="flex items-end gap-2" data-testid="select-by-name">
-                  <Input
-                    label="Name pattern"
-                    placeholder="acct_* (* matches anything)"
-                    value={patternText}
-                    onChange={(e) => setPatternText(e.target.value)}
+              </div>
+              {presetNote && (
+                <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
+                  {presetNote}
+                </p>
+              )}
+              {chosen.length > 0 && (
+                <div className="flex gap-4 text-sm text-slate-600 dark:text-slate-300">
+                  <span><strong>{totals.full}</strong> full values</span>
+                  <span><strong>{totals.counts}</strong> counts</span>
+                  <span><strong>{totals.structure}</strong> structure only</span>
+                </div>
+              )}
+              <div
+                role="group"
+                aria-label="Select tables"
+                className="space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+              >
+                <p className="text-sm font-medium">Select several chosen tables, then change their level together</p>
+                <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
+                  <div className="flex items-end gap-2" data-testid="select-by-schema">
+                    <Select
+                      label="Schema"
+                      options={[{ value: '', label: 'Choose a schema' }, ...schemas.map((x) => ({ value: x, label: x }))]}
+                      value={schemaChoice}
+                      onChange={(e) => setSchemaChoice(e.target.value)}
+                      className="w-44"
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={!schemaChoice}
+                      onClick={() =>
+                        replaceSelection(selectBySchema(chosen, schemaChoice), `schema ${schemaChoice}`)
+                      }
+                    >
+                      Select schema
+                    </Button>
+                  </div>
+                  <div className="flex items-end gap-2" data-testid="select-by-name">
+                    <Input
+                      label="Name pattern"
+                      placeholder="acct_* (* matches anything)"
+                      value={patternText}
+                      onChange={(e) => setPatternText(e.target.value)}
+                      className="w-52"
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={!patternText.trim()}
+                      onClick={() =>
+                        replaceSelection(selectByPattern(chosen, patternText), `names matching ${patternText.trim()}`)
+                      }
+                    >
+                      Select by name
+                    </Button>
+                  </div>
+                  <div className="flex items-end gap-2" data-testid="select-by-size">
+                    <Select
+                      label="Size"
+                      options={[
+                        { value: 'larger', label: 'Larger than' },
+                        { value: 'smaller', label: 'Smaller than' },
+                      ]}
+                      value={sizeDirection}
+                      onChange={(e) => setSizeDirection(e.target.value as 'larger' | 'smaller')}
+                      className="w-36"
+                    />
+                    <Input
+                      label="Megabytes"
+                      type="number"
+                      min={0}
+                      value={sizeMegabytes}
+                      onChange={(e) => setSizeMegabytes(e.target.value)}
+                      className="w-24"
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={sizeMegabytes.trim() === '' || !(Number(sizeMegabytes) >= 0)}
+                      onClick={() =>
+                        replaceSelection(
+                          selectBySize(chosen, sizeDirection, Number(sizeMegabytes)),
+                          `${sizeDirection} than ${Number(sizeMegabytes) * MEGABYTE === 0 ? '0' : sizeMegabytes} MB`,
+                        )
+                      }
+                    >
+                      Select by size
+                    </Button>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-end gap-3">
+                  <Select
+                    label="Set level for the selection"
+                    options={levelOptions}
+                    value={bulkLevel}
+                    onChange={(e) => setBulkLevel(e.target.value as CheckLevel)}
                     className="w-52"
                   />
                   <Button
                     size="sm"
-                    variant="secondary"
-                    disabled={!patternText.trim()}
-                    onClick={() =>
-                      replaceSelection(selectByPattern(plan.tables, patternText), `names matching ${patternText.trim()}`)
-                    }
+                    variant="primary"
+                    disabled={selectedChosen.size === 0}
+                    onClick={applyBulkLevel}
                   >
-                    Select by name
+                    Apply to {selectedChosen.size} selected
                   </Button>
-                </div>
-                <div className="flex items-end gap-2" data-testid="select-by-size">
-                  <Select
-                    label="Size"
-                    options={[
-                      { value: 'larger', label: 'Larger than' },
-                      { value: 'smaller', label: 'Smaller than' },
-                    ]}
-                    value={sizeDirection}
-                    onChange={(e) => setSizeDirection(e.target.value as 'larger' | 'smaller')}
-                    className="w-36"
-                  />
-                  <Input
-                    label="Megabytes"
-                    type="number"
-                    min={0}
-                    value={sizeMegabytes}
-                    onChange={(e) => setSizeMegabytes(e.target.value)}
-                    className="w-24"
-                  />
                   <Button
                     size="sm"
                     variant="secondary"
-                    disabled={sizeMegabytes.trim() === '' || !(Number(sizeMegabytes) >= 0)}
+                    disabled={selectedChosen.size === 0}
+                    onClick={() => {
+                      setSelected(new Set());
+                      setSelectionNote('Selection cleared.');
+                    }}
+                  >
+                    Clear selection
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
                     onClick={() =>
                       replaceSelection(
-                        selectBySize(plan.tables, sizeDirection, Number(sizeMegabytes)),
-                        `${sizeDirection} than ${Number(sizeMegabytes) * MEGABYTE === 0 ? '0' : sizeMegabytes} MB`,
+                        chosen.map((t) => t.tableId),
+                        'all chosen tables',
                       )
                     }
                   >
-                    Select by size
+                    Select all listed
                   </Button>
                 </div>
+                {selectionNote && (
+                  <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
+                    {selectionNote}
+                  </p>
+                )}
+                {unknownSizeCount(chosen) > 0 && (
+                  <p className="text-xs text-slate-600 dark:text-slate-400">
+                    {unknownSizeCount(chosen)} tables have no size on record, so selecting by size skips them.
+                  </p>
+                )}
               </div>
-              <div className="flex flex-wrap items-end gap-3">
-                <Select
-                  label="Set level for the selection"
-                  options={levelOptions}
-                  value={bulkLevel}
-                  onChange={(e) => setBulkLevel(e.target.value as CheckLevel)}
-                  className="w-52"
-                />
-                <Button
-                  size="sm"
-                  variant="primary"
-                  disabled={selected.size === 0}
-                  onClick={applyBulkLevel}
-                >
-                  Apply to {selected.size} selected
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={selected.size === 0}
-                  onClick={() => {
-                    setSelected(new Set());
-                    setSelectionNote('Selection cleared.');
-                  }}
-                >
-                  Clear selection
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() =>
-                    replaceSelection(
-                      plan.tables.map((t) => t.tableId),
-                      'all tables',
-                    )
-                  }
-                >
-                  Select all tables
-                </Button>
-              </div>
-              {selectionNote && (
-                <p role="status" className="text-sm text-slate-700 dark:text-slate-300">
-                  {selectionNote}
-                </p>
-              )}
-              {unknownSizeCount(plan.tables) > 0 && (
-                <p className="text-xs text-slate-600 dark:text-slate-400">
-                  {unknownSizeCount(plan.tables)} tables have no size on record, so selecting by size skips them.
-                </p>
-              )}
-            </div>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              A control-total column you tick is added up in every table that has a column with that
-              name. Nothing is added up until you tick it.
-            </p>
-            <DataTable
-              data={plan.tables}
-              columns={columns}
-              filterPlaceholder="Filter by schema or table name"
-            />
-          </Panel>
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                A control-total column you tick is added up in every table that has a column with that
+                name. Nothing is added up until you tick it.
+              </p>
+              <DataTable
+                data={chosen}
+                columns={columns}
+                filterPlaceholder="Filter by schema or table name"
+              />
+            </Panel>
+          )}
           <RunWindowControl
             value={plan.runWindow}
             onChange={(runWindow) => onPlanChange({ ...plan, runWindow })}
@@ -491,9 +547,16 @@ export function ChooseChecksScreen({
             <Button onClick={onBack} variant="secondary">
               Back
             </Button>
-            <Button onClick={onNext} variant="primary" size="lg">
-              Run
-            </Button>
+            <div className="flex items-center gap-4">
+              {chosen.length === 0 && (
+                <span className="text-sm text-slate-600 dark:text-slate-300">
+                  Choose at least one table to run.
+                </span>
+              )}
+              <Button onClick={onNext} variant="primary" size="lg" disabled={chosen.length === 0}>
+                Run
+              </Button>
+            </div>
           </div>
         </>
       )}

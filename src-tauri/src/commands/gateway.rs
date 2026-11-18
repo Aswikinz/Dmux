@@ -1630,6 +1630,7 @@ mod tests {
                 run_window: None,
                 export_keys: None,
                 allow_superuser: su(),
+                skip_tables: vec![],
             },
             &state,
         )

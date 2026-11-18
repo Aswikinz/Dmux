@@ -64,6 +64,8 @@ export async function completeRun(page: Page, fixture: string): Promise<void> {
 
   // Map -> Choose checks
   await cta(page, 'Choose checks').click();
+  // Nothing is chosen until the user picks the tables to check.
+  await page.getByRole('button', { name: 'Select all', exact: true }).click();
   await expect(page.getByText('Estimated time:')).toBeVisible();
 
   // Choose checks -> Run

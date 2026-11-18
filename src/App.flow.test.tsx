@@ -3,6 +3,14 @@ import { describe, expect, it } from 'vitest';
 import App from './App';
 import type { FixtureName } from './api/mockEngine';
 
+/** Nothing is chosen on Choose checks until the user picks: choose every
+ *  table, then wait for the level controls. */
+async function chooseAllTables() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Select all' }));
+  return screen.findByText('Estimated time:');
+}
+
+
 type Win = typeof window & { __dmuxForcedFixture?: FixtureName };
 
 function renderForced(fixture: FixtureName) {
@@ -43,7 +51,7 @@ describe('App full flow', () => {
 
       // Map -> Choose checks
       fireEvent.click(cta('Choose checks'));
-      await screen.findByText('Estimated time:');
+      await chooseAllTables();
 
       // Choose checks -> Run
       fireEvent.click(cta('Run'));
@@ -71,7 +79,7 @@ describe('App full flow', () => {
       fireEvent.click(cta('Map tables'));
       await screen.findByText(/No items need attention|items need attention/);
       fireEvent.click(cta('Choose checks'));
-      await screen.findByText('Estimated time:');
+      await chooseAllTables();
       fireEvent.click(cta('Run'));
       await screen.findByText('The run has finished.');
       fireEvent.click(cta('See results'));

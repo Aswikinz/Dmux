@@ -292,33 +292,42 @@ choose a counterpart.
 
 ### 4. Choose checks
 
-**Purpose.** Decide how hard Dmux should look at each table, and see how long that will
-take before you start.
+**Purpose.** Decide which tables this run reads and how hard Dmux should look at each one,
+and see how long that will take before you start.
 
 **Steps.**
 
-1. Pick a preset: full values for everything; counts for everything with full values for
+1. Under **Tables to check**, choose the tables this run reads. Nothing is chosen at first.
+   Tick a schema's box to choose all of its tables, open a schema with the arrow to tick
+   single tables, type in **Find a schema or table** and press **Select N matching**, or
+   press **Select all**. **Clear all** starts again. A schema with only some tables chosen
+   shows a dash in its box. During busy hours, choose only the few tables you need: Dmux
+   never reads a table you leave out. Each left-out table is listed in the results and on
+   the first page of every report as "not selected for this run", and it counts as ignored
+   in the coverage line, so a reader always sees what this run did not check. **Run** stays
+   unavailable until at least one table is chosen.
+2. Pick a preset: full values for everything; counts for everything with full values for
    selected tables; or structure only. Changing a table by hand switches the preset to
    **Custom**.
-2. Adjust individual tables if needed. Each table has one of three levels: **Structure**,
+3. Adjust individual tables if needed. Each table has one of three levels: **Structure**,
    **Counts and totals**, or **Full values**.
-3. To change many tables at once, tick them in the first column, or use the selection tools:
+4. To change many tables at once, tick them in the first column, or use the selection tools:
    **Select schema**, **Select by name** (type a pattern; `*` stands for any text, upper
    and lower case do not matter, so `acct_*` finds every table that starts with `acct_`),
    or **Select by size** (larger or smaller than a number of megabytes). Selecting replaces
    the earlier selection. Then choose a level under **Set level for the selection** and
    press **Apply**. Tables with no size on record are skipped by the size selection, and
    the screen says how many.
-4. Confirm the control-total columns. Dmux suggests number columns whose names look like
+5. Confirm the control-total columns. Dmux suggests number columns whose names look like
    amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
    column is added up in every table that has a column with that name.
-5. Read the estimate: a range per table and in total.
-6. If the databases are only quiet at certain hours, switch on **Only run during certain
+6. Read the estimate: a range per table and in total. It covers only the chosen tables.
+7. If the databases are only quiet at certain hours, switch on **Only run during certain
    hours** and set the times, for example 22:00 until 05:00. It is off unless you turn it on.
    Outside those hours Dmux waits between tables, and carries on by itself when the hours
    start again. A window that crosses midnight works. The times are the clock of the
    computer running Dmux.
-6. Press **Run**.
+8. Press **Run**.
 
 **What you see.** A list of tables with their level, their size on disk and an estimated
 time. The estimate is a range, because it is measured on your servers at that moment, and

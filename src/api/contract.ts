@@ -215,6 +215,9 @@ export interface TableCheck {
   controlTotalSuggestions?: string[];
   /** Size on the old database, in bytes, when known. */
   sizeBytes?: number;
+  /** Whether this run reads the table.  `false` leaves it out: it is not read
+   *  and is recorded as "not selected for this run".  Absent means included. */
+  included?: boolean;
 }
 
 export interface CheckPlan {

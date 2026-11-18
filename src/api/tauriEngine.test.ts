@@ -689,6 +689,45 @@ describe('data half is wired to the backend', () => {
     expect(started.overallState).toBe('running');
   });
 
+  it('startRun leaves out the tables the user did not choose, and gives them no level', async () => {
+    const engine = createTauriEngine();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-s' });
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const structure = await engine.compareStructure(profile(), profile());
+    await engine.buildMapping(structure);
+    const t = (name: string, included?: boolean) => ({
+      tableId: name,
+      schemaName: 'demo_bank',
+      tableName: name,
+      level: 'full-values' as const,
+      included,
+    });
+    await engine.startRun({
+      oldProfile: defaultOldProfile(),
+      newProfile: defaultOldProfile(),
+      mapping: mapping(),
+      plan: {
+        tables: [t('accounts', true), t('loans', false), t('ledger')],
+        presets: [],
+        estimateSecondsMin: 1,
+        estimateSecondsMax: 2,
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      'start_run',
+      expect.objectContaining({
+        input: expect.objectContaining({
+          levels: { 'demo_bank.accounts': 'full_values', 'demo_bank.ledger': 'full_values' },
+          skip_tables: ['demo_bank.loans'],
+        }),
+      }),
+    );
+  });
+
   it('startRun passes the run window, and none when it is off', async () => {
     const engine = createTauriEngine();
     invoke.mockImplementation((cmd: string) => {

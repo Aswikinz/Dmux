@@ -7,7 +7,15 @@ import type { Engine } from '../api/engine';
 import type { CheckPlan, Inventory, Mapping } from '../api/contract';
 import { defaultNewProfile, defaultOldProfile } from './ConnectScreen';
 import { MapScreen } from './MapScreen';
-import { ChooseChecksScreen } from './ChooseChecksScreen';
+import { ChooseChecksScreen, chosenEstimate } from './ChooseChecksScreen';
+
+/** Nothing is chosen on Choose checks until the user picks: choose every
+ *  table, then wait for the level controls. */
+async function chooseAllTables() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Select all' }));
+  return screen.findByText('Estimated time:');
+}
+
 
 async function diffSetup() {
   const engine = createMockEngine();
@@ -216,7 +224,7 @@ describe('ChooseChecksScreen selection', () => {
   async function setup() {
     const plans: CheckPlan[] = [];
     wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     const last = () => plans[plans.length - 1];
     return { last };
   }
@@ -273,7 +281,7 @@ describe('ChooseChecksScreen control totals', () => {
   it('lists suggested columns unticked, and ticking one confirms it in the plan', async () => {
     const plans: CheckPlan[] = [];
     wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     const first = plans[plans.length - 1].tables[0];
     expect(first.controlTotalSuggestions).toContain('amount');
     expect(first.controlTotalColumns).toBeUndefined();
@@ -294,7 +302,127 @@ describe('ChooseChecksScreen control totals', () => {
 
   it('says a ticked column is added up in every table that has it', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     expect(screen.getByText(/added up in every table that has a column with that name/)).toBeDefined();
   });
 });
+
+describe('ChooseChecksScreen: which tables to check', () => {
+  const lastPlan = (plans: CheckPlan[]) => plans[plans.length - 1];
+  const chosenIds = (p: CheckPlan) => p.tables.filter((t) => t.included !== false).map((t) => t.tableId);
+
+  it('starts with nothing chosen, and Run waits until a table is chosen', async () => {
+    const plans: CheckPlan[] = [];
+    wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
+    expect(await screen.findByText('No tables chosen yet (40 available).')).toBeDefined();
+    expect(chosenIds(lastPlan(plans))).toEqual([]);
+    expect(screen.getByTestId('levels-waiting')).toBeDefined();
+    expect(screen.queryByText('Estimated time:')).toBeNull();
+    const run = screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement;
+    expect(run.disabled).toBe(true);
+    expect(screen.getByText('Choose at least one table to run.')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Every table in archive' }));
+    expect(await screen.findByText(/4 of 40 tables chosen\. The other 36 will not be read\./)).toBeDefined();
+    expect(run.disabled).toBe(false);
+    expect(screen.queryByText('Choose at least one table to run.')).toBeNull();
+  });
+
+  it('a schema box chooses its tables, and only chosen tables get a level', async () => {
+    const plans: CheckPlan[] = [];
+    wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Every table in archive' }));
+    await screen.findByText('Estimated time:');
+    const archive = lastPlan(plans).tables.filter((t) => t.schemaName === 'archive');
+    expect(chosenIds(lastPlan(plans))).toEqual(archive.map((t) => t.tableId));
+    // The level list shows the 4 chosen tables, none of demo_bank.
+    expect(screen.getAllByRole('combobox', { name: /^Check level for archive\./ })).toHaveLength(4);
+    expect(screen.queryByRole('combobox', { name: /^Check level for demo_bank\./ })).toBeNull();
+    // The estimate covers only the chosen tables.
+    expect(screen.getByText(/for the 4 chosen tables/)).toBeDefined();
+  });
+
+  it('single tables can be ticked, and the schema box then shows "some"', async () => {
+    const plans: CheckPlan[] = [];
+    wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Show the tables in demo_bank' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Check demo_bank.table_0003' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Check demo_bank.table_0005' }));
+    expect(await screen.findByText(/2 of 40 tables chosen/)).toBeDefined();
+    const box = screen.getByRole('checkbox', { name: 'Every table in demo_bank' });
+    expect(box.getAttribute('aria-checked')).toBe('mixed');
+    expect(screen.getByText('2 of 36 chosen')).toBeDefined();
+    // Unticking one leaves the other.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Check demo_bank.table_0003' }));
+    const names = lastPlan(plans)
+      .tables.filter((t) => t.included !== false)
+      .map((t) => t.tableName);
+    expect(names).toEqual(['table_0005']);
+  });
+
+  it('Select all chooses every table and Clear all leaves none', async () => {
+    const plans: CheckPlan[] = [];
+    wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
+    await chooseAllTables();
+    expect(screen.getByText('All 40 tables chosen.')).toBeDefined();
+    expect(chosenIds(lastPlan(plans))).toHaveLength(40);
+    fireEvent.click(screen.getByRole('button', { name: 'Clear all' }));
+    expect(await screen.findByText('No tables chosen yet (40 available).')).toBeDefined();
+    expect(chosenIds(lastPlan(plans))).toEqual([]);
+  });
+
+  it('a search narrows the list, and "Select N matching" chooses just those', async () => {
+    const plans: CheckPlan[] = [];
+    wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
+    fireEvent.change(await screen.findByPlaceholderText('Find a schema or table'), {
+      target: { value: 'table_001' },
+    });
+    // table_0010 .. table_0019, across both schemas.
+    fireEvent.click(screen.getByRole('button', { name: 'Select 10 matching' }));
+    const names = lastPlan(plans)
+      .tables.filter((t) => t.included !== false)
+      .map((t) => t.tableName)
+      .sort();
+    expect(names).toEqual(Array.from({ length: 10 }, (_, i) => `table_00${10 + i}`));
+  });
+});
+
+describe('chosenEstimate', () => {
+  const table = (id: string, sizeBytes: number | undefined, included?: boolean) => ({
+    tableId: id,
+    schemaName: 's',
+    tableName: id,
+    level: 'full-values' as const,
+    sizeBytes,
+    included,
+  });
+  const plan = (tables: ReturnType<typeof table>[]) => ({
+    tables,
+    presets: [],
+    estimateSecondsMin: 100,
+    estimateSecondsMax: 400,
+  });
+
+  it('keeps the whole estimate when every table is chosen', () => {
+    expect(chosenEstimate(plan([table('a', 10), table('b', 30)]))).toEqual({ min: 100, max: 400 });
+  });
+
+  it('scales by size when every size is known', () => {
+    expect(chosenEstimate(plan([table('a', 10, true), table('b', 30, false)]))).toEqual({
+      min: 25,
+      max: 100,
+    });
+  });
+
+  it('scales by count when a size is missing, and never says 0 seconds', () => {
+    expect(chosenEstimate(plan([table('a', undefined, true), table('b', 30, false)]))).toEqual({
+      min: 50,
+      max: 200,
+    });
+    expect(chosenEstimate(plan([table('a', 0, true), table('b', 1000, false)]))).toEqual({
+      min: 1,
+      max: 1,
+    });
+  });
+});
+

@@ -72,6 +72,46 @@ pub struct StartRunInput {
     /// when absent.
     #[serde(default)]
     pub run_window: Option<String>,
+    /// Old-side `schema.table` paths the user left out of this run on the
+    /// Choose checks screen.  Each is recorded as an ignored item with
+    /// [`NOT_SELECTED_REASON`], so it is never read, never silently dropped,
+    /// and shows in the coverage line and on the first page of every report.
+    #[serde(default)]
+    pub skip_tables: Vec<String>,
+}
+
+/// The reason recorded for a table the user did not choose for a run.  Written
+/// by the app, never by the webview, so a report reader can trust it.
+pub const NOT_SELECTED_REASON: &str = "not selected for this run";
+
+/// Add the user's left-out tables to the mapping as ignored items and re-hash
+/// it.  A path must be a plain `schema.table`; one that names no table is
+/// refused later by the engine's unknown-path check, never skipped silently.
+/// A table the mapping already ignores keeps its own reason.
+pub(crate) fn with_skipped_tables(
+    mut mapping: Mapping,
+    skip: &[String],
+) -> Result<Mapping, CommandError> {
+    if skip.is_empty() {
+        return Ok(mapping);
+    }
+    for path in skip {
+        let ok = path
+            .split_once('.')
+            .is_some_and(|(s, t)| !s.is_empty() && !t.is_empty() && !t.contains('.'));
+        if !ok {
+            return Err(CommandError::InvalidInput {
+                message: "a table left out of the run must be named as schema.table".to_string(),
+            });
+        }
+        if !mapping.ignored.iter().any(|i| &i.path == path) {
+            mapping.ignored.push(dmux_engine::mapping::IgnoredItem {
+                path: path.clone(),
+                reason: NOT_SELECTED_REASON.to_string(),
+            });
+        }
+    }
+    validate_mapping(&mapping.with_fresh_hash())
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +562,10 @@ pub(crate) fn start_run_with(
         .map(str::to_string);
     // The webview-supplied mapping is untrusted input (audit L7): validate it
     // exactly like an imported mapping file before it drives the run.
-    let mapping = validate_mapping(&input.mapping)?;
+    let mapping = with_skipped_tables(validate_mapping(&input.mapping)?, &input.skip_tables)?;
+    // A table left out of the run takes no level.
+    let mut levels = input.levels.clone();
+    levels.retain(|t, _| !input.skip_tables.contains(t));
     let old_profile = resolve(&input.old, state)?;
     let new_profile = resolve(&input.new, state)?;
     // The request's limits, else the ones saved in Settings (2 and 4 by default).
@@ -553,7 +596,7 @@ pub(crate) fn start_run_with(
     let config = RunConfig {
         mapping,
         default_level: input.default_level,
-        levels: input.levels.clone(),
+        levels,
         control_total_columns: input.control_total_columns.into_iter().collect(),
         old_parallelism,
         new_parallelism,
@@ -1559,7 +1602,103 @@ mod tests {
                 reason: "local mock login is a superuser".into(),
             }),
             run_window: None,
+            skip_tables: vec![],
         }
+    }
+
+    #[test]
+    fn left_out_tables_become_ignored_items_with_the_apps_reason() {
+        let base = Mapping::new();
+        let m = with_skipped_tables(
+            base.clone(),
+            &["demo_bank.audit_log".into(), "demo_bank.loans".into()],
+        )
+        .unwrap();
+        let paths: Vec<(&str, &str)> = m
+            .ignored
+            .iter()
+            .map(|i| (i.path.as_str(), i.reason.as_str()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("demo_bank.audit_log", NOT_SELECTED_REASON),
+                ("demo_bank.loans", NOT_SELECTED_REASON)
+            ]
+        );
+        // The hash covers the change, so the results name the real mapping.
+        assert_ne!(m.mapping_hash, base.mapping_hash);
+        // Nothing to skip leaves the mapping as it was.
+        assert_eq!(with_skipped_tables(base.clone(), &[]).unwrap(), base);
+    }
+
+    #[test]
+    fn a_table_already_ignored_keeps_its_own_reason() {
+        let mut base = Mapping::new();
+        base.ignored.push(dmux_engine::mapping::IgnoredItem {
+            path: "demo_bank.archive".into(),
+            reason: "archived before the migration".into(),
+        });
+        let m = with_skipped_tables(base.with_fresh_hash(), &["demo_bank.archive".into()]).unwrap();
+        assert_eq!(m.ignored.len(), 1);
+        assert_eq!(m.ignored[0].reason, "archived before the migration");
+    }
+
+    #[test]
+    fn a_left_out_path_that_is_not_schema_dot_table_is_refused() {
+        for bad in ["", "accounts", ".accounts", "demo_bank.", "a.b.c"] {
+            assert!(
+                matches!(
+                    with_skipped_tables(Mapping::new(), &[bad.to_string()]),
+                    Err(CommandError::InvalidInput { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_reads_only_the_chosen_tables_and_records_the_rest() {
+        let Some(old) = env_url("DMUX_TEST_DEMO_OLD_URL") else {
+            return;
+        };
+        let Some(new) = env_url("DMUX_TEST_DEMO_NEW_URL") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        let mut input = start_input(&old, &new, &[]);
+        // Leave out everything except demo_bank.account_types.
+        let tables = run_live(&old, &new).await.tables.into_keys();
+        input.skip_tables = tables.filter(|t| t != "demo_bank.account_types").collect();
+        assert!(!input.skip_tables.is_empty());
+        let id = start_run_with(input.clone(), &state).unwrap().run_id;
+        assert!(
+            wait_until(std::time::Duration::from_secs(120), || {
+                let s = poll_run_with(id.clone(), &state).unwrap().overall_state;
+                async move { s != "running" }
+            })
+            .await
+        );
+        let r = state.runs.results(&id).expect("the run finished");
+        assert_eq!(
+            r.tables.keys().collect::<Vec<_>>(),
+            vec!["demo_bank.account_types"],
+            "only the chosen table was compared"
+        );
+        for t in &input.skip_tables {
+            assert!(
+                r.ignored_items
+                    .iter()
+                    .any(|i| &i.path == t && i.reason == NOT_SELECTED_REASON),
+                "{t} is recorded as not selected"
+            );
+        }
+        assert_eq!(r.ignored, input.skip_tables.len());
     }
 
     /// How many of Dmux's sessions on `url`'s database are running a

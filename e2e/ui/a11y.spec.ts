@@ -69,6 +69,8 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await expect(cta('Choose checks')).toBeVisible();
     await check('map');
     await cta('Choose checks').click();
+    // Nothing is chosen until the user picks the tables to check.
+    await page.getByRole('button', { name: 'Select all', exact: true }).click();
     await expect(page.getByText('Estimated time:')).toBeVisible();
     await check('choose checks');
     await cta('Run').click();

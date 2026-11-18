@@ -15,6 +15,14 @@ import { ChooseChecksScreen } from './ChooseChecksScreen';
 import { ReportScreen } from './ReportScreen';
 import type { CheckPlan } from '../api/contract';
 
+/** Nothing is chosen on Choose checks until the user picks: choose every
+ *  table, then wait for the level controls. */
+async function chooseAllTables() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Select all' }));
+  return screen.findByText('Estimated time:');
+}
+
+
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
@@ -345,7 +353,7 @@ describe('Settings: run defaults, reports and about', () => {
       );
     }
     wrap(<Harness />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     await waitFor(() =>
       expect((screen.getByTestId('preset-select') as HTMLSelectElement).value).toBe('structure'),
     );

@@ -113,7 +113,8 @@ await shot('05-map');
 
 // 6. Choose checks.
 await cta('Choose checks').click();
-await page.getByText('Estimate:').waitFor();
+await page.getByRole('button', { name: 'Select all', exact: true }).click();
+await page.getByText('Estimated time:').waitFor();
 await shot('06-choose-checks');
 
 // 7. Run (finished).
@@ -133,7 +134,8 @@ await page.getByText('Old encoding:').waitFor();
 await cta('Map tables').click();
 await page.getByText(/need attention/i).waitFor();
 await cta('Choose checks').click();
-await page.getByText('Estimate:').waitFor();
+await page.getByRole('button', { name: 'Select all', exact: true }).click();
+await page.getByText('Estimated time:').waitFor();
 await cta('Run').click();
 await page.getByText('Finished').waitFor();
 await cta('See results').click();

@@ -17,6 +17,8 @@ test('completes the full 7-step flow and exports a report', async ({ page }) => 
 
   // 4. Choose checks
   await page.getByRole('main').getByRole('button', { name: 'Choose checks' }).click();
+  // Nothing is chosen until the user picks the tables to check.
+  await page.getByRole('button', { name: 'Select all', exact: true }).click();
   await expect(page.getByText('Estimated time:')).toBeVisible();
 
   // 5. Run

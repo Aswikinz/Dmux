@@ -134,6 +134,13 @@ describe('Dmux real-app flow against the CI service databases', function (this: 
 
       step(5, 'Choose checks');
       await cta('Choose checks').click();
+      await waitForBodyText(
+        (t) => t.includes('No tables chosen yet'),
+        60_000,
+        'the table chooser (nothing chosen yet)',
+      );
+      // Nothing is chosen until the user picks: choose every table.
+      await cta('Select all').click();
       await waitForBodyText((t) => t.includes('Estimate'), 60_000, 'the check plan (Estimate)');
 
       step(6, 'Run');

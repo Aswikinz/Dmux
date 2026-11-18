@@ -22,6 +22,14 @@ import { RunScreen } from './RunScreen';
 import { DRILL_DOWN_PAGE, ResultsScreen } from './ResultsScreen';
 import { ReportScreen } from './ReportScreen';
 
+/** Nothing is chosen on Choose checks until the user picks: choose every
+ *  table, then wait for the level controls. */
+async function chooseAllTables() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Select all' }));
+  return screen.findByText('Estimated time:');
+}
+
+
 function wrap(ui: ReactElement) {
   return render(<ThemeProvider>{ui}</ThemeProvider>);
 }
@@ -562,7 +570,7 @@ describe('MapScreen', () => {
 describe('ChooseChecksScreen', () => {
   it('builds a plan and shows totals', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    expect(await screen.findByText('Estimated time:')).toBeDefined();
+    expect(await chooseAllTables()).toBeDefined();
   });
 
   it('offers an optional run window, off by default, and stores it on the plan', async () => {
@@ -582,7 +590,7 @@ describe('ChooseChecksScreen', () => {
       );
     }
     wrap(<Spy engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     expect((latest as CheckPlan | null)?.runWindow).toBeUndefined();
     fireEvent.click(screen.getByRole('checkbox', { name: 'Only run during certain hours' }));
     expect((latest as CheckPlan | null)?.runWindow).toBe('22:00-05:00');
@@ -606,7 +614,7 @@ describe('ChooseChecksScreen', () => {
       );
     }
     wrap(<ChecksWithState engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     // The level selector is rendered for the first row.
     const selects = screen.getAllByRole('combobox');
     const preset = selects[0]; // the preset select
@@ -618,7 +626,7 @@ describe('ChooseChecksScreen', () => {
 
   it('a preset really reassigns every table level, and Suggested restores them', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     const levels = () =>
       screen
         .getAllByRole('combobox')
@@ -653,7 +661,7 @@ describe('ChooseChecksScreen', () => {
 
   it('shows the estimate in plain words and explains control totals', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     expect(screen.getByText(/about .*(seconds?|minutes?)/)).toBeDefined();
     expect(screen.getByText(/Corrected as each table finishes/)).toBeDefined();
     expect(screen.getByRole('button', { name: 'Control totals' })).toBeDefined();
@@ -661,7 +669,7 @@ describe('ChooseChecksScreen', () => {
 
   it('updates a table level when a row select changes', async () => {
     wrap(<ChecksHarness engine={createMockEngine()} />);
-    await screen.findByText('Estimated time:');
+    await chooseAllTables();
     // Find a level select whose current value is one of the check levels.
     const levelSelects = screen
       .getAllByRole('combobox')

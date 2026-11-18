@@ -26,6 +26,19 @@ function definition(): RunDefinition {
 }
 
 describe('mockEngine', () => {
+  it('a run reads only the chosen tables and records the rest as not selected', async () => {
+    const engine = createMockEngine();
+    const plan = await engine.buildCheckPlan(mapping());
+    const tables = plan.tables.map((t, i) => ({ ...t, included: i < 3 }));
+    const started = await engine.startRun({ ...definition(), plan: { ...plan, tables } });
+    const progress = await engine.pollRun(started.runId);
+    expect(progress.tables.map((t) => t.tableId)).toEqual(plan.tables.slice(0, 3).map((t) => t.tableId));
+    const results = await engine.getResults(started.runId);
+    const left = results.ignored.filter((i) => i.reason === 'not selected for this run');
+    expect(left).toHaveLength(37);
+    expect(left[0].name).toBe(`${plan.tables[3].schemaName}.${plan.tables[3].tableName}`);
+  });
+
   it('reports an error for an unreachable host', async () => {
     const res = await mockEngine.testConnection(profile({ host: 'error' }));
     expect(res.ok).toBe(false);

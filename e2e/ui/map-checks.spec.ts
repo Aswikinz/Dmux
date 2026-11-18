@@ -75,6 +75,8 @@ for (const colorScheme of ['light', 'dark'] as const) {
 
     await page.keyboard.press('Escape');
     await cta(page, 'Choose checks').click();
+    // Nothing is chosen until the user picks the tables to check.
+    await page.getByRole('button', { name: 'Select all', exact: true }).click();
     await expect(page.getByText('Estimated time:')).toBeVisible();
     await page.getByLabel('Schema', { exact: true }).selectOption('archive');
     await page.getByRole('button', { name: 'Select schema' }).click();
@@ -86,6 +88,8 @@ for (const colorScheme of ['light', 'dark'] as const) {
 test('bulk set level marks the preset Custom, and control totals start unticked', async ({ page }) => {
   await openMap(page);
   await cta(page, 'Choose checks').click();
+  // Nothing is chosen until the user picks the tables to check.
+  await page.getByRole('button', { name: 'Select all', exact: true }).click();
   await expect(page.getByText('Estimated time:')).toBeVisible();
   await page.getByLabel('Name pattern').fill('table_000*');
   await page.getByRole('button', { name: 'Select by name' }).click();
