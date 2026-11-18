@@ -1894,6 +1894,96 @@ mod tests {
         );
     }
 
+    /// Scoped runs never invent a failure and never hide one (decision 30):
+    /// each compared table of edge_bank, checked on its own, keeps exactly its
+    /// full-run verdict, and the run's verdict comes only from that table and
+    /// its own structure findings.  Runs only when DMUX_TEST_EDGE_OLD_URL and
+    /// DMUX_TEST_EDGE_NEW_URL point at testdata/edge_bank (owner check).
+    #[tokio::test]
+    async fn a_scoped_run_matches_the_full_run_for_every_table() {
+        let Some(old) = env_url("DMUX_TEST_EDGE_OLD_URL") else {
+            return;
+        };
+        let Some(new) = env_url("DMUX_TEST_EDGE_NEW_URL") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        let run = |input: StartRunInput| {
+            let id = start_run_with(input, &state).unwrap().run_id;
+            let state = &state;
+            async move {
+                assert!(
+                    wait_until(std::time::Duration::from_secs(900), || {
+                        let s = poll_run_with(id.clone(), state).unwrap().overall_state;
+                        async move { s != "running" }
+                    })
+                    .await
+                );
+                state.runs.results(&id).expect("the run finished")
+            }
+        };
+        let full_input = || {
+            let mut i = start_input(&old, &new, &[]);
+            i.default_level = CheckLevel::FullValues;
+            i
+        };
+        let full = run(full_input()).await;
+        let compared: Vec<String> = full
+            .tables
+            .keys()
+            .filter(|t| !full.unmapped.contains_key(*t))
+            .cloned()
+            .collect();
+        assert!(compared.len() > 20, "{compared:?}");
+        for chosen in &compared {
+            let mut input = full_input();
+            input.skip_tables = compared.iter().filter(|t| *t != chosen).cloned().collect();
+            let r = run(input).await;
+            // Only the chosen table was compared, with its full-run verdict.
+            assert_eq!(
+                r.tables.keys().collect::<Vec<_>>(),
+                vec![chosen],
+                "{chosen}"
+            );
+            assert_eq!(
+                r.tables[chosen].verdict, full.tables[chosen].verdict,
+                "{chosen}: scoped verdict differs from the full run"
+            );
+            // Its own structure findings are the same as in the full run.
+            let mine = |res: &RunResults| -> Vec<String> {
+                let mut v: Vec<String> = res
+                    .structure_findings
+                    .iter()
+                    .filter(|f| f.object == *chosen || f.object.starts_with(&format!("{chosen}.")))
+                    .map(|f| format!("{}={:?}", f.object, f.verdict))
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(mine(&r), mine(&full), "{chosen}: findings differ");
+            assert_eq!(
+                r.structure_findings.len(),
+                mine(&r).len(),
+                "{chosen}: outside findings kept"
+            );
+            // The run's verdict comes only from the table and its findings.
+            let mut own = vec![r.tables[chosen].verdict];
+            own.extend(r.structure_findings.iter().map(|f| f.verdict));
+            assert_eq!(
+                r.verdict,
+                dmux_engine::results::overall_verdict(&own),
+                "{chosen}: verdict {:?} not explained by the chosen table; warnings {:?}",
+                r.verdict,
+                r.warnings
+            );
+        }
+    }
+
     /// How many of Dmux's sessions on `url`'s database are running a
     /// statement (`text` filters the statement; `None` counts every session,
     /// active or idle).  The watcher's own session is excluded.

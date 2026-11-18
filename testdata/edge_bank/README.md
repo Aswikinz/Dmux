@@ -169,6 +169,7 @@ The expected verdicts live in `cases.tsv`.
 | File | Purpose |
 |---|---|
 | `build.sh` | Builds both databases, plants the differences, creates the logins. |
+| `check_reports.py` | Checks that the PDF-side reports (HTML and Excel) tell the truth for a results file, in all 16 leave-out choices: verdict, coverage, data differences and not-mapped tables always present, no false data alarms, left-out parts named. |
 | `old.sql` | Creates and fills the old database (valid on Postgres 9.4 and up). |
 | `new.sql` | Plants the differences in the new database (Postgres 10 and up). |
 | `grants.sql` | Gives the read-only logins SELECT. |

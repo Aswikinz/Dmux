@@ -608,13 +608,43 @@ fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, un
             .iter()
             .any(|t| object == t || object.starts_with(&format!("{t}.")))
     };
+    // Findings outside the chosen tables that a full check would FAIL on are
+    // named (some are about data, such as a changed large-object count), so
+    // they cannot be overlooked; the rest are only counted.
+    let mut would_fail: Vec<String> = results
+        .structure_findings
+        .iter()
+        .filter(|f| !belongs(&f.object) && f.verdict == crate::results::Verdict::Fail)
+        .map(|f| f.object.clone())
+        .collect();
+    would_fail.sort();
     let before = results.structure_findings.len();
     results.structure_findings.retain(|f| belongs(&f.object));
     let outside = before - results.structure_findings.len();
     let mut parts = Vec::new();
     if outside > 0 {
+        let named = if would_fail.is_empty() {
+            String::new()
+        } else {
+            let shown = would_fail
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = would_fail.len().saturating_sub(10);
+            format!(
+                "; {} of them would fail a full check: {shown}{}",
+                would_fail.len(),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
         parts.push(format!(
-            "{outside} structure difference{} in other tables and database objects (extensions, functions and so on)",
+            "{outside} structure difference{} in other tables and database objects (extensions, functions and so on){named}",
             if outside == 1 { "" } else { "s" }
         ));
     }
@@ -2229,6 +2259,11 @@ mod tests {
         assert_eq!(r.warnings.len(), 1);
         let w = &r.warnings[0];
         assert!(w.contains("3 structure differences in other tables"), "{w}");
+        // The ones a full check would fail on are named, not just counted.
+        assert!(
+            w.contains("2 of them would fail a full check: core.accountsx.id, core.loans.idx"),
+            "{w}"
+        );
         assert!(w.contains("4 tables only in the new database"), "{w}");
         assert!(w.contains("1 old table with no partner"), "{w}");
     }
