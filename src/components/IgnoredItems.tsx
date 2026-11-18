@@ -1,6 +1,6 @@
 import { useId, useState } from 'react';
 import { Button } from '../design/Button';
-import { isOutsideRun } from '../api/contract';
+import { isTableOutsideRun } from '../api/contract';
 import type { IgnoreItem } from '../api/contract';
 
 /**
@@ -12,9 +12,10 @@ export function IgnoredItems({ ignored }: { ignored: IgnoreItem[] }) {
   const [open, setOpen] = useState(false);
   const listId = useId();
   // Tables a run of chosen tables left out are counted, not listed: their own
-  // report lists them.  A person's own ignores are listed on request.
-  const outside = ignored.filter((i) => isOutsideRun(i.reason)).length;
-  const own = ignored.filter((i) => !isOutsideRun(i.reason));
+  // report lists them.  A person's own ignores, and columns left out of a
+  // checked table, are listed on request.
+  const outside = ignored.filter(isTableOutsideRun).length;
+  const own = ignored.filter((i) => !isTableOutsideRun(i));
   if (ignored.length === 0) {
     return null;
   }

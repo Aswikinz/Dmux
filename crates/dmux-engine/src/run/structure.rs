@@ -243,6 +243,48 @@ pub fn left_out_findings(
         .collect()
 }
 
+/// The structure findings on columns the person left out of a run ("not
+/// selected for this run").  [`findings`] moves them to ignored items with
+/// that reason; this recovers them so the run can name them, and a left-out
+/// column can never hide a difference silently.  Empty when no column was left
+/// out.
+pub fn left_out_column_findings(
+    old: &DatabaseInventory,
+    new: &DatabaseInventory,
+    mapping: &Mapping,
+) -> Vec<StructureFinding> {
+    let left_out: BTreeSet<String> = mapping
+        .ignored
+        .iter()
+        .filter(|i| super::is_outside_run(&i.reason))
+        .filter_map(|i| {
+            let parts: Vec<&str> = i.path.split('.').collect();
+            let [s, t, c] = parts.as_slice() else {
+                return None;
+            };
+            let (ns, nt) = map_table(mapping, s, t);
+            let nc = column_renames(mapping, s, t)
+                .get(*c)
+                .cloned()
+                .unwrap_or_else(|| (*c).to_string());
+            Some(format!("{ns}.{nt}.{nc}"))
+        })
+        .collect();
+    if left_out.is_empty() {
+        return Vec::new();
+    }
+    let mut own = mapping.clone();
+    own.ignored.retain(|i| !super::is_outside_run(&i.reason));
+    let (all, _) = findings(&map_inventory(old, &own), new, &own);
+    all.into_iter()
+        .filter(|f| {
+            left_out
+                .iter()
+                .any(|c| f.object == *c || f.object.starts_with(&format!("{c}.")))
+        })
+        .collect()
+}
+
 /// Suggested matches for tables and columns that stay unpaired after the
 /// mapping (never applied automatically).
 pub fn suggestions(
@@ -388,6 +430,36 @@ mod tests {
             reason: "archived before the migration".into(),
         });
         assert!(left_out_findings(&old, &new, &own).is_empty());
+    }
+
+    #[test]
+    fn findings_on_left_out_columns_are_recovered_and_only_theirs() {
+        // s.loans lost "rate" and "fee"; only "rate" is left out of the run.
+        let old = inv(vec![table("loans", &["id", "rate", "fee"])]);
+        let new = inv(vec![table("loans", &["id"])]);
+        let mut m = Mapping::new();
+        m.ignored.push(MapIgnored {
+            path: "s.loans.rate".into(),
+            reason: super::super::NOT_SELECTED_REASON.into(),
+        });
+        let (kept, _) = findings(&map_inventory(&old, &m), &new, &m);
+        // The checked column's difference is still a finding of the run ...
+        assert!(kept.iter().any(|f| f.object == "s.loans.fee"), "{kept:?}");
+        assert!(kept.iter().all(|f| f.object != "s.loans.rate"));
+        // ... and the left-out column's is recovered, not lost.
+        let left = left_out_column_findings(&old, &new, &m);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].object, "s.loans.rate");
+        assert_eq!(left[0].verdict, Verdict::Fail);
+        // A person's own column ignore is not "left out of the run".
+        let mut own = Mapping::new();
+        own.ignored.push(MapIgnored {
+            path: "s.loans.rate".into(),
+            reason: "retired in the new design".into(),
+        });
+        assert!(left_out_column_findings(&old, &new, &own).is_empty());
+        // Table-level left-outs are the other function's job.
+        assert!(left_out_column_findings(&old, &new, &Mapping::new()).is_empty());
     }
 
     fn rename_mapping() -> Mapping {

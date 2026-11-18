@@ -57,6 +57,9 @@ import type {
   TlsState,
   Verdict,
   MappingSaveResult,
+  CheckChoices,
+  SaveChoicesResult,
+  OpenChoicesResult,
   IssueKind,
 } from './contract';
 
@@ -313,6 +316,55 @@ interface RawTableCheck {
   /** The columns Dmux suggests; none is a control total until confirmed. */
   control_total_columns: string[] | null;
   size_bytes?: number;
+  columns?: { name: string; type_name: string; key: boolean; number: boolean }[];
+}
+
+/** `save_check_choices` / `open_check_choices`: the file's own snake_case form. */
+interface RawTableChoice {
+  table: string;
+  level: EngineLevel;
+  left_out_columns?: string[];
+  control_totals?: string[];
+}
+
+interface RawCheckChoices {
+  format: string;
+  version: number;
+  run_window?: string | null;
+  tables: RawTableChoice[];
+}
+
+type RawSaveChoices = { status: 'saved'; path: string } | { status: 'cancelled' };
+type RawOpenChoices =
+  | { status: 'opened'; path: string; choices: RawCheckChoices }
+  | { status: 'cancelled' };
+
+/** Contract choices -> the file's form (the backend validates it again). */
+export function toRawChoices(choices: CheckChoices): RawCheckChoices {
+  return {
+    format: 'dmux-check-choices',
+    version: 1,
+    run_window: choices.runWindow ?? null,
+    tables: choices.tables.map((t) => ({
+      table: t.table,
+      level: toEngineLevel(t.level),
+      left_out_columns: t.leftOutColumns,
+      control_totals: t.controlTotals,
+    })),
+  };
+}
+
+/** The file's form (already validated by the backend) -> contract choices. */
+export function fromRawChoices(raw: RawCheckChoices): CheckChoices {
+  return {
+    runWindow: raw.run_window ?? undefined,
+    tables: raw.tables.map((t) => ({
+      table: t.table,
+      level: mapLevel(t.level),
+      leftOutColumns: t.left_out_columns ?? [],
+      controlTotals: t.control_totals ?? [],
+    })),
+  };
 }
 
 interface RawCheckPlan {
@@ -1052,22 +1104,31 @@ export function describeError(error: unknown): string {
 // Data-half mapping (engine -> contract), all strict.
 // ---------------------------------------------------------------------------
 
-/** Fold the contract `CheckPlan` into the engine's `levels` map + control totals. */
-function planToLevels(plan: CheckPlan): {
+/** Fold the contract `CheckPlan` into the engine's `levels` map, control
+ *  totals and left-out columns.  Control totals are named `schema.table.column`
+ *  so each one applies to its own table only.  A key column is never sent as
+ *  left out (the engine would compare it anyway). */
+export function planToLevels(plan: CheckPlan): {
   levels: Record<string, EngineLevel>;
   controlTotalColumns: string[];
+  skipColumns: string[];
 } {
   const levels: Record<string, EngineLevel> = {};
-  const controls = new Set<string>();
+  const controls: string[] = [];
+  const skip: string[] = [];
   for (const table of plan.tables) {
     if (table.included === false) continue;
     const path = `${table.schemaName}.${table.tableName}`;
     levels[path] = toEngineLevel(table.level);
     for (const column of table.controlTotalColumns ?? []) {
-      controls.add(column);
+      controls.push(`${path}.${column}`);
+    }
+    const keys = new Set((table.columns ?? []).filter((c) => c.key).map((c) => c.name));
+    for (const column of table.leftOutColumns ?? []) {
+      if (!keys.has(column)) skip.push(`${path}.${column}`);
     }
   }
-  return { levels, controlTotalColumns: [...controls] };
+  return { levels, controlTotalColumns: controls, skipColumns: skip };
 }
 
 function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
@@ -1079,6 +1140,12 @@ function translateCheckPlan(raw: RawCheckPlan): CheckPlan {
     // The backend's list is what it *suggests*; nothing is confirmed yet.
     controlTotalSuggestions: t.control_total_columns ?? undefined,
     sizeBytes: t.size_bytes ?? undefined,
+    columns: t.columns?.map((c) => ({
+      name: c.name,
+      typeName: c.type_name,
+      key: c.key,
+      number: c.number,
+    })),
   }));
   return {
     tables,
@@ -1472,6 +1539,22 @@ export function createTauriEngine(): Engine {
       }
     },
 
+    async saveCheckChoices(choices: CheckChoices): Promise<SaveChoicesResult> {
+      // The backend validates the choices, opens the save dialog and writes
+      // the file itself: no path crosses the IPC.
+      const raw = await invoke<RawSaveChoices>('save_check_choices', {
+        choices: toRawChoices(choices),
+      });
+      return raw.status === 'saved' ? { status: 'saved', path: raw.path } : { status: 'cancelled' };
+    },
+
+    async openCheckChoices(): Promise<OpenChoicesResult> {
+      const raw = await invoke<RawOpenChoices>('open_check_choices');
+      return raw.status === 'opened'
+        ? { status: 'opened', path: raw.path, choices: fromRawChoices(raw.choices) }
+        : { status: 'cancelled' };
+    },
+
     // --- Data half: wired to the real engine (never fabricate a verdict). ---
 
     async buildCheckPlan(): Promise<CheckPlan> {
@@ -1497,7 +1580,7 @@ export function createTauriEngine(): Engine {
       if (!lastRawMapping) {
         throw new Error('buildMapping must run before startRun');
       }
-      const { levels, controlTotalColumns } = planToLevels(definition.plan);
+      const { levels, controlTotalColumns, skipColumns } = planToLevels(definition.plan);
       const started = await invoke<RawStartRun>('start_run', {
         input: {
           old: toConnectInput(lastOldProfile),
@@ -1513,6 +1596,8 @@ export function createTauriEngine(): Engine {
           skip_tables: definition.plan.tables
             .filter((t) => t.included === false)
             .map((t) => `${t.schemaName}.${t.tableName}`),
+          // Columns left out of chosen tables, recorded the same way.
+          skip_columns: skipColumns,
         },
       });
       return { runId: started.run_id, overallState: 'running', tables: [] };

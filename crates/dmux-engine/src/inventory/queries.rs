@@ -230,6 +230,40 @@ pub(crate) async fn list_constraints<T: GenericClient>(
         .collect()
 }
 
+/// Every primary-key column, as (schema, table, column).  One catalogue read
+/// for the whole database, valid on PostgreSQL 9.4 and later; no value is
+/// interpolated into the SQL.
+pub(crate) async fn list_primary_key_columns<T: GenericClient>(
+    client: &T,
+) -> Result<Vec<(String, String, String)>, InventoryError> {
+    let rows = client
+        .query(
+            "SELECT \
+                 n.nspname AS schema_name, \
+                 c.relname AS table_name, \
+                 a.attname AS column_name \
+             FROM pg_catalog.pg_index i \
+             JOIN pg_catalog.pg_class c ON c.oid = i.indrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_attribute a \
+               ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey) \
+             WHERE i.indisprimary \
+               AND n.nspname !~ '^(pg_catalog|information_schema|pg_toast|pg_temp_[0-9]+|pg_toast_temp_[0-9]+)$' \
+             ORDER BY n.nspname, c.relname, a.attname",
+            &[],
+        )
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                req_string(&row, 0)?,
+                req_string(&row, 1)?,
+                req_string(&row, 2)?,
+            ))
+        })
+        .collect()
+}
+
 pub(crate) async fn list_indexes<T: GenericClient>(
     client: &T,
 ) -> Result<Vec<IndexInTable>, InventoryError> {

@@ -78,6 +78,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     // Nothing is chosen until the user picks the tables to check.
     await page.getByRole('button', { name: 'Select all', exact: true }).click();
     await expect(page.getByText('Estimated time:')).toBeVisible();
+    await page.getByText('Change several tables at once').click();
     await page.getByLabel('Schema', { exact: true }).selectOption('archive');
     await page.getByRole('button', { name: 'Select schema' }).click();
     await expect(page.getByText(/tables? selected \(schema archive\)/)).toBeVisible();
@@ -107,13 +108,28 @@ test('bulk set level marks the preset Custom, and control totals start unticked'
   // Nothing is chosen until the user picks the tables to check.
   await page.getByRole('button', { name: 'Select all', exact: true }).click();
   await expect(page.getByText('Estimated time:')).toBeVisible();
+  // The bulk tools stay folded away until asked for.
+  await expect(page.getByLabel('Name pattern')).toBeHidden();
+  await page.getByText('Change several tables at once').click();
   await page.getByLabel('Name pattern').fill('table_000*');
   await page.getByRole('button', { name: 'Select by name' }).click();
   await page.getByLabel('Set level for the selection').selectOption('structure');
   await page.getByRole('button', { name: /^Apply to \d+ selected$/ }).click();
   await expect(page.getByTestId('preset-select')).toHaveValue('custom');
-  const control = page.getByRole('checkbox', { name: /Use amount as a control total/ }).first();
-  await expect(control).not.toBeChecked();
-  await control.check();
-  await expect(control).toBeChecked();
+  await expect(page.getByTestId('totals-helper')).toContainText('nothing is added up yet');
+  // A table's columns open in place: keys locked in, totals per table.
+  await page.getByRole('button', { name: /^Choose columns of / }).first().click();
+  const chooser = page.getByTestId('column-chooser');
+  await expect(chooser.getByRole('heading', { name: /^Columns of / })).toBeFocused();
+  await expect(chooser.getByRole('checkbox', { name: 'Compare id' })).toBeDisabled();
+  await chooser.getByRole('checkbox', { name: 'Compare note' }).uncheck();
+  await expect(page.getByTestId('left-out-columns')).toContainText('1 column is left out');
+  await noSeriousViolations(page, 'choose checks with a column chooser open');
+  await chooser.getByRole('button', { name: 'Done' }).click();
+  await expect(chooser).toBeHidden();
+  await page.getByRole('button', { name: 'Add up all suggested' }).click();
+  await expect(page.getByTestId('totals-helper')).toContainText('added up');
+  // The browser demo cannot save files, and says so.
+  await page.getByRole('button', { name: 'Save these choices…' }).click();
+  await expect(page.getByTestId('check-choices-message')).toContainText('browser demo cannot save files');
 });

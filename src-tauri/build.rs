@@ -16,6 +16,8 @@ fn main() {
             "update_mapping",
             "export_mapping",
             "save_mapping",
+            "save_check_choices",
+            "open_check_choices",
             "import_mapping",
             "edit_mapping",
             "preview_rules",

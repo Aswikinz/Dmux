@@ -8,7 +8,7 @@
 pub mod queries;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tokio_postgres::{Error as PgError, GenericClient, Row};
 
@@ -185,6 +185,21 @@ pub struct Extension {
 ///
 /// The caller is responsible for opening a read-only transaction and applying
 /// the canonical settings block; this function only issues `SELECT` statements.
+/// Every table's primary-key column names, keyed by `schema.table`, read in
+/// one catalogue query.  Used to keep key columns in every run: rows are
+/// matched on them, so they can never be left out of a comparison.
+pub async fn primary_key_columns<T: GenericClient>(
+    client: &T,
+) -> Result<BTreeMap<String, BTreeSet<String>>, InventoryError> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (schema, table, column) in queries::list_primary_key_columns(client).await? {
+        out.entry(format!("{schema}.{table}"))
+            .or_default()
+            .insert(column);
+    }
+    Ok(out)
+}
+
 pub async fn collect_inventory<T: GenericClient>(
     client: &mut T,
 ) -> Result<DatabaseInventory, InventoryError> {

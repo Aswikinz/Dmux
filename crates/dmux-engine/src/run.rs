@@ -124,6 +124,13 @@ pub fn is_outside_run(reason: &str) -> bool {
 
 /// The reason recorded for an old table with no partner in a run that checks
 /// only the chosen tables.
+/// A whole table left out of the run (its own report lists it).  A column
+/// left out of a checked table is not: it stays in the main report, beside its
+/// table's verdict, so a PASS can never hide that a column was not compared.
+pub fn is_table_outside_run(path: &str, reason: &str) -> bool {
+    is_outside_run(reason) && path.split('.').count() == 2
+}
+
 pub const NOT_MAPPED_OUTSIDE_RUN: &str =
     "not mapped: no table in the new database; outside this run, which checked only the chosen tables";
 
@@ -681,6 +688,36 @@ fn scope_to_chosen(
     }
 }
 
+/// One warning naming the structure differences on columns the person left
+/// out of the run, so a chosen-away column can never hide one silently.  The
+/// differences themselves are not findings of this run (the columns were not
+/// checked); nothing is added when no left-out column has a difference.
+fn name_left_out_columns(results: &mut RunResults, left_out: &[crate::results::StructureFinding]) {
+    if left_out.is_empty() {
+        return;
+    }
+    let mut columns: Vec<String> = left_out.iter().map(|f| f.object.clone()).collect();
+    columns.sort();
+    columns.dedup();
+    let fail = left_out
+        .iter()
+        .filter(|f| f.verdict == crate::results::Verdict::Fail)
+        .count();
+    let shown = columns
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = columns.len().saturating_sub(10);
+    results.warnings.push(format!(
+        "{} structure difference{} on columns not selected for this run ({fail} would fail a full check: [{shown}{}]). Check those columns to review them",
+        left_out.len(),
+        if left_out.len() == 1 { "" } else { "s" },
+        if more > 0 { format!(" and {more} more") } else { String::new() }
+    ));
+}
+
 /// A UTC instant as RFC 3339 with whole seconds ("2026-11-18T09:14:03Z").
 pub fn utc_rfc3339(t: jiff::Timestamp) -> String {
     t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -726,6 +763,45 @@ pub(crate) async fn inventory(s: &mut ReadOnlySession) -> Result<DatabaseInvento
         })
     })
     .await?)
+}
+
+/// Every primary-key column on one side, keyed by `schema.table`.
+pub(crate) async fn primary_keys(
+    s: &mut ReadOnlySession,
+) -> Result<BTreeMap<String, BTreeSet<String>>, RunError> {
+    Ok(s.with_read_only("60s", |txn| {
+        Box::pin(async move {
+            crate::inventory::primary_key_columns(&*txn)
+                .await
+                .map_err(|e| run_err(RunError::from(e)))
+        })
+    })
+    .await?)
+}
+
+/// The mapping with any "not selected for this run" ignore of a key column
+/// removed: rows are matched on key columns, so they are always compared (see
+/// `plan::build_table_spec`), and no report may list them as ignored.
+pub(crate) fn keep_key_columns(
+    mapping: &Mapping,
+    keys: &BTreeMap<String, BTreeSet<String>>,
+) -> Mapping {
+    let mut m = mapping.clone();
+    m.ignored.retain(|i| {
+        if !is_outside_run(&i.reason) {
+            return true;
+        }
+        let mut parts = i.path.rsplitn(2, '.');
+        let (Some(column), Some(table)) = (parts.next(), parts.next()) else {
+            return true;
+        };
+        // Only a schema.table.column path names a column.
+        if !table.contains('.') {
+            return true;
+        }
+        !keys.get(table).is_some_and(|k| k.contains(column))
+    });
+    m
 }
 
 pub(crate) async fn live_table(
@@ -1199,8 +1275,11 @@ async fn snapshot(
     let mut out = BTreeMap::new();
     for p in pairs.iter().filter(|p| p.level != CheckLevel::Structure) {
         checkpoint(config)?;
-        let o = counters(old_s, &p.old.0, &p.old.1).await;
-        let n = counters(new_s, &p.new.0, &p.new.1).await;
+        let (o, n) = futures_util::future::join(
+            counters(old_s, &p.old.0, &p.old.1),
+            counters(new_s, &p.new.0, &p.new.1),
+        )
+        .await;
         out.insert(p.path.clone(), o.ok().zip(n.ok()));
     }
     Ok(out)
@@ -1373,7 +1452,10 @@ async fn run_live(
     // Foreign tables have no change counters (M3).
     let old_foreign = foreign_tables_set(&mut old_s).await?;
     let new_foreign = foreign_tables_set(&mut new_s).await?;
-    let findings = structure::apply(&mut b, &old_inv, &new_inv, &config.mapping);
+    // Key columns are never left out of a run of chosen columns.
+    let old_keys = primary_keys(&mut old_s).await?;
+    let run_mapping = keep_key_columns(&config.mapping, &old_keys);
+    let findings = structure::apply(&mut b, &old_inv, &new_inv, &run_mapping);
 
     // Pair every old table with its mapped new table.
     let table_ignores: BTreeMap<String, String> = config
@@ -1466,8 +1548,12 @@ async fn run_live(
         }
     }
 
+    name_left_out_columns(
+        &mut b.results,
+        &structure::left_out_column_findings(&old_inv, &new_inv, &run_mapping),
+    );
     if config.only_chosen_tables {
-        let left_out = structure::left_out_findings(&old_inv, &new_inv, &config.mapping);
+        let left_out = structure::left_out_findings(&old_inv, &new_inv, &run_mapping);
         scope_to_chosen(
             &mut b.results,
             &pairs,
@@ -1539,8 +1625,11 @@ async fn run_live(
         let new_cd = SideChangeDetection::of(new_track_counts, new_foreign.contains(&p.new_path()));
         let cd_floor = change_detection_floor(old_cd, new_cd);
 
-        let ro = replica(&mut old_s, old_info.version_num).await;
-        let rn = replica(&mut new_s, new_info.version_num).await;
+        let (ro, rn) = futures_util::future::join(
+            replica(&mut old_s, old_info.version_num),
+            replica(&mut new_s, new_info.version_num),
+        )
+        .await;
 
         // Resume: reuse a stored conclusive result only if nothing that could
         // vouch for the table moved since it was stored (counters, storage,
@@ -1592,8 +1681,11 @@ async fn run_live(
         }
 
         // Replica replay during this table's scans (counters are blind there).
-        let ro_after = replica(&mut old_s, old_info.version_num).await;
-        let rn_after = replica(&mut new_s, new_info.version_num).await;
+        let (ro_after, rn_after) = futures_util::future::join(
+            replica(&mut old_s, old_info.version_num),
+            replica(&mut new_s, new_info.version_num),
+        )
+        .await;
         for (side, d) in [
             ("old", replica_outcome(&ro, &ro_after)),
             ("new", replica_outcome(&rn, &rn_after)),
@@ -1603,8 +1695,11 @@ async fn run_live(
         }
 
         // Per-table change check, and the marks stored for resume.
-        let ao = counters(&mut old_s, &p.old.0, &p.old.1).await;
-        let an = counters(&mut new_s, &p.new.0, &p.new.1).await;
+        let (ao, an) = futures_util::future::join(
+            counters(&mut old_s, &p.old.0, &p.old.1),
+            counters(&mut new_s, &p.new.0, &p.new.1),
+        )
+        .await;
         checkpoint(config)?;
         match (ao, an) {
             (Ok(ao), Ok(an)) => {
@@ -1687,7 +1782,12 @@ async fn scan_pair(
 ) -> Result<Evidence, RunError> {
     let fault = |why: String| Ok(Evidence::new(&p.path, p.level, Outcome::Fault(why)));
     checkpoint(config)?;
-    let old_live = live_table(old_s, &p.old.0, &p.old.1).await;
+    // Both sides at once: separate servers, separate read-only sessions.
+    let (old_live, new_live) = futures_util::future::join(
+        live_table(old_s, &p.old.0, &p.old.1),
+        live_table(new_s, &p.new.0, &p.new.1),
+    )
+    .await;
     checkpoint(config)?;
     let old_live = match old_live {
         Ok(Some(t)) => t,
@@ -1696,8 +1796,6 @@ async fn scan_pair(
         }
         Err(e) => return fault(format!("the old table could not be read: {e}")),
     };
-    let new_live = live_table(new_s, &p.new.0, &p.new.1).await;
-    checkpoint(config)?;
     let new_live = match new_live {
         Ok(Some(t)) => t,
         Ok(None) => {
@@ -1779,9 +1877,11 @@ async fn scan_pair(
                 }
             }
             checkpoint(config)?;
-            let o = scan_counts(old_s, &p.old.0, &p.old.1, &old_controls).await;
-            checkpoint(config)?;
-            let n = scan_counts(new_s, &p.new.0, &p.new.1, &new_controls).await;
+            let (o, n) = futures_util::future::join(
+                scan_counts(old_s, &p.old.0, &p.old.1, &old_controls),
+                scan_counts(new_s, &p.new.0, &p.new.1, &new_controls),
+            )
+            .await;
             checkpoint(config)?;
             match (o, n) {
                 (Ok((orows, ototals)), Ok((nrows, ntotals))) => {
@@ -1832,25 +1932,25 @@ async fn scan_pair(
             checkpoint(config)?;
             let (ofp, nfp) = match split {
                 None => {
-                    let ofp = scan_fingerprint(
-                        old_s,
-                        &plan,
-                        Side::Old,
-                        &old_src,
-                        mapping_hash,
-                        modes.old,
-                        None,
-                    )
-                    .await;
-                    checkpoint(config)?;
-                    let nfp = scan_fingerprint(
-                        new_s,
-                        &plan,
-                        Side::New,
-                        &new_src,
-                        mapping_hash,
-                        modes.new,
-                        None,
+                    let (ofp, nfp) = futures_util::future::join(
+                        scan_fingerprint(
+                            old_s,
+                            &plan,
+                            Side::Old,
+                            &old_src,
+                            mapping_hash,
+                            modes.old,
+                            None,
+                        ),
+                        scan_fingerprint(
+                            new_s,
+                            &plan,
+                            Side::New,
+                            &new_src,
+                            mapping_hash,
+                            modes.new,
+                            None,
+                        ),
                     )
                     .await;
                     (ofp, nfp)
@@ -1865,31 +1965,32 @@ async fn scan_pair(
                             })
                             .collect()
                     };
-                    let ofp = scan_side_in_ranges(
-                        config,
-                        op,
-                        old_s,
-                        &plan,
-                        Side::Old,
-                        &old_src,
-                        mapping_hash,
-                        modes.old,
-                        filters(&old_col),
-                        config.old_parallelism,
-                    )
-                    .await;
-                    checkpoint(config)?;
-                    let nfp = scan_side_in_ranges(
-                        config,
-                        np,
-                        new_s,
-                        &plan,
-                        Side::New,
-                        &new_src,
-                        mapping_hash,
-                        modes.new,
-                        filters(&new_col),
-                        config.new_parallelism,
+                    // Each side keeps its own limit on its own server.
+                    let (ofp, nfp) = futures_util::future::join(
+                        scan_side_in_ranges(
+                            config,
+                            op,
+                            old_s,
+                            &plan,
+                            Side::Old,
+                            &old_src,
+                            mapping_hash,
+                            modes.old,
+                            filters(&old_col),
+                            config.old_parallelism,
+                        ),
+                        scan_side_in_ranges(
+                            config,
+                            np,
+                            new_s,
+                            &plan,
+                            Side::New,
+                            &new_src,
+                            mapping_hash,
+                            modes.new,
+                            filters(&new_col),
+                            config.new_parallelism,
+                        ),
                     )
                     .await;
                     results.warnings.push(format!(
@@ -2093,9 +2194,11 @@ async fn drill(
     }
     let buckets = comparison.drilldown_buckets();
     checkpoint(config)?;
-    let o = drill_rows(old_s, plan, Side::Old, old_src, &buckets, modes.old).await;
-    checkpoint(config)?;
-    let n = drill_rows(new_s, plan, Side::New, new_src, &buckets, modes.new).await;
+    let (o, n) = futures_util::future::join(
+        drill_rows(old_s, plan, Side::Old, old_src, &buckets, modes.old),
+        drill_rows(new_s, plan, Side::New, new_src, &buckets, modes.new),
+    )
+    .await;
     checkpoint(config)?;
     let (o, n) = match (o, n) {
         (Ok(o), Ok(n)) => (o, n),
@@ -2127,9 +2230,11 @@ async fn drill(
             .min(crate::core::drilldown::CHANGED_DETAIL_LIMIT)];
         let hashes: Vec<String> = take.iter().map(|(o, _)| o.key_hash.clone()).collect();
         checkpoint(config)?;
-        let ov = drill_values(old_s, plan, Side::Old, old_src, &hashes, modes.old).await;
-        checkpoint(config)?;
-        let nv = drill_values(new_s, plan, Side::New, new_src, &hashes, modes.new).await;
+        let (ov, nv) = futures_util::future::join(
+            drill_values(old_s, plan, Side::Old, old_src, &hashes, modes.old),
+            drill_values(new_s, plan, Side::New, new_src, &hashes, modes.new),
+        )
+        .await;
         checkpoint(config)?;
         match (ov, nv) {
             (Ok(ov), Ok(nv)) => {
@@ -2192,9 +2297,11 @@ async fn spot_check(
 ) -> Result<Spot, RunError> {
     let failed = |why: String| Spot::Disagrees(format!("the spot check could not run: {why}"));
     checkpoint(config)?;
-    let so = spot_sample(old_s, plan, Side::Old, old_src).await;
-    checkpoint(config)?;
-    let sn = spot_sample(new_s, plan, Side::New, new_src).await;
+    let (so, sn) = futures_util::future::join(
+        spot_sample(old_s, plan, Side::Old, old_src),
+        spot_sample(new_s, plan, Side::New, new_src),
+    )
+    .await;
     checkpoint(config)?;
     let (so, sn) = match (so, sn) {
         (Ok(a), Ok(b)) => (a, b),
@@ -2207,9 +2314,11 @@ async fn spot_check(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let o = spot_fetch(old_s, plan, Side::Old, old_src, &khs).await;
-    checkpoint(config)?;
-    let n = spot_fetch(new_s, plan, Side::New, new_src, &khs).await;
+    let (o, n) = futures_util::future::join(
+        spot_fetch(old_s, plan, Side::Old, old_src, &khs),
+        spot_fetch(new_s, plan, Side::New, new_src, &khs),
+    )
+    .await;
     checkpoint(config)?;
     Ok(match (o, n) {
         (Ok(o), Ok(n)) => {
@@ -2300,6 +2409,65 @@ mod tests {
     }
 
     #[test]
+    fn differences_on_left_out_columns_are_named_and_nothing_is_said_otherwise() {
+        let mut r = RunResults::default();
+        name_left_out_columns(&mut r, &[]);
+        assert!(r.warnings.is_empty());
+        let f = |object: &str, verdict| crate::results::StructureFinding {
+            object: object.into(),
+            path: vec![],
+            verdict,
+            message: String::new(),
+        };
+        name_left_out_columns(
+            &mut r,
+            &[
+                f("core.accounts.note", crate::results::Verdict::Fail),
+                f("core.accounts.code", crate::results::Verdict::Warning),
+            ],
+        );
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].starts_with(
+                "2 structure differences on columns not selected for this run (1 would fail a full check: [core.accounts.code, core.accounts.note])"
+            ),
+            "{}",
+            r.warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_key_column_left_out_by_choice_is_kept_but_a_persons_ignore_is_not_touched() {
+        let mut m = Mapping::new();
+        for (path, reason) in [
+            ("core.accounts.id", NOT_SELECTED_REASON),
+            ("core.accounts.note", NOT_SELECTED_REASON),
+            ("core.accounts.code", "retired in the new design"),
+            ("core.loans", NOT_SELECTED_REASON),
+        ] {
+            m.ignored.push(crate::mapping::IgnoredItem {
+                path: path.into(),
+                reason: reason.into(),
+            });
+        }
+        let keys = BTreeMap::from([(
+            "core.accounts".to_string(),
+            BTreeSet::from(["id".to_string(), "code".to_string()]),
+        )]);
+        let kept: Vec<String> = keep_key_columns(&m, &keys)
+            .ignored
+            .into_iter()
+            .map(|i| i.path)
+            .collect();
+        // The chosen-away key column goes back in; a non-key column, a table,
+        // and a person's own ignore (even of a key column) are untouched.
+        assert_eq!(
+            kept,
+            vec!["core.accounts.note", "core.accounts.code", "core.loans"]
+        );
+    }
+
+    #[test]
     fn the_scope_is_part_of_the_definition_and_a_full_check_keeps_its_hash() {
         let mut c = RunConfig::new(live("x"), live("x"));
         let full = definition_hash(&c);
@@ -2308,6 +2476,15 @@ mod tests {
         assert!(is_outside_run(NOT_SELECTED_REASON));
         assert!(is_outside_run(NOT_MAPPED_OUTSIDE_RUN));
         assert!(!is_outside_run("archived before the migration"));
+        assert!(is_table_outside_run("core.loans", NOT_SELECTED_REASON));
+        assert!(!is_table_outside_run(
+            "core.loans.rate",
+            NOT_SELECTED_REASON
+        ));
+        assert!(!is_table_outside_run(
+            "core.loans",
+            "archived before the migration"
+        ));
     }
 
     #[test]

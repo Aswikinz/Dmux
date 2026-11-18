@@ -20,6 +20,9 @@ import type {
   ServerInfo,
   SuperuserOverride,
   MappingSaveResult,
+  CheckChoices,
+  SaveChoicesResult,
+  OpenChoicesResult,
 } from './contract';
 
 /**
@@ -88,6 +91,13 @@ export interface Engine {
   /** Save the mapping to a file the user chooses in a save dialog.  The file
    *  can be used again by `dmux run` (`mapping = "<file>"`). */
   saveMapping(mapping: Mapping): Promise<MappingSaveResult>;
+
+  /** Save the check choices to a file the user picks in a save dialog. */
+  saveCheckChoices(choices: CheckChoices): Promise<SaveChoicesResult>;
+
+  /** Open a check choices file the user picks in an open dialog.  The file is
+   *  checked by the backend; applying it to the plan is the screen's job. */
+  openCheckChoices(): Promise<OpenChoicesResult>;
 
   /** Build a default check plan from the mapping. */
   buildCheckPlan(

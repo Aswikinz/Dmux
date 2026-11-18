@@ -252,6 +252,14 @@ pub struct SpecInputs<'a> {
 /// resolved.  This is a pure function: it pairs columns by name (through the
 /// mapping), records ignores, and splits unpaired columns into `dropped` and
 /// `added` for the P3 coverage rule.
+/// Whether a column is added up as a control total.  An entry is either a
+/// bare column name (every table with that column, as `--control-total` and
+/// run definition files have always meant) or an old-side
+/// `schema.table.column` path (that one table only, as Choose checks sends).
+pub fn is_control_total(requested: &BTreeSet<String>, old_path: &str, column: &str) -> bool {
+    requested.contains(column) || requested.contains(old_path)
+}
+
 pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -> TableSpec {
     let mapping = inp.mapping;
     let new_by_name: BTreeMap<_, _> = new.columns.iter().map(|c| (c.name.clone(), c)).collect();
@@ -291,13 +299,20 @@ pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -
     for old_c in &old.columns {
         let path = format!("{}.{}.{}", old.schema, old.name, old_c.name);
         // An explicit ignore wins even when a counterpart exists: the column is
-        // deliberately not compared, and the reason goes into the report.
+        // deliberately not compared, and the reason goes into the report.  The
+        // one exception: a key column is never left out of a run of chosen
+        // columns ("not selected for this run"), because rows are matched on it;
+        // it is compared as usual.
         if let Some(reason) = ignore_reason(&path) {
-            ignored_reasons.insert(path, reason);
-            if let Some(target) = new_name_for(&old_c.name) {
-                ignored_targets.insert(target);
+            let key_left_out =
+                old_pk_set.contains(&old_c.name) && crate::run::is_outside_run(&reason);
+            if !key_left_out {
+                ignored_reasons.insert(path, reason);
+                if let Some(target) = new_name_for(&old_c.name) {
+                    ignored_targets.insert(target);
+                }
+                continue;
             }
-            continue;
         }
         match new_name_for(&old_c.name) {
             Some(new_col_name) => {
@@ -308,7 +323,7 @@ pub fn build_table_spec(old: &LiveTable, new: &LiveTable, inp: SpecInputs<'_>) -
                     old_type: old_c.resolved_type.clone(),
                     new_type: new_c.resolved_type.clone(),
                     options: inp.column_options.get(&path).cloned().unwrap_or_default(),
-                    control_total: inp.control_total_columns.contains(&old_c.name),
+                    control_total: is_control_total(inp.control_total_columns, &path, &old_c.name),
                 });
                 if old_pk_set.contains(&old_c.name) {
                     key_names.push(old_c.name.clone());
@@ -639,6 +654,78 @@ pub(crate) mod tests {
         let s = spec(&old, &new, &m);
         assert!(s.coverage_complete);
         assert_eq!(s.ignored_columns["s.t.gone"], "retired in the new design");
+    }
+
+    #[test]
+    fn a_key_column_is_never_left_out_of_a_run_of_chosen_columns() {
+        let old = live(
+            "t",
+            vec![col("id", "integer"), col("note", "text")],
+            &["id"],
+        );
+        let new = live(
+            "t",
+            vec![col("id", "integer"), col("note", "text")],
+            &["id"],
+        );
+        let mut m = Mapping::new();
+        for c in ["id", "note"] {
+            m.ignored.push(IgnoredItem {
+                path: format!("s.t.{c}"),
+                reason: crate::run::NOT_SELECTED_REASON.into(),
+            });
+        }
+        let s = spec(&old, &new, &m);
+        // The key is still compared and still the key; the other column is out.
+        assert_eq!(s.columns_covered(), vec!["id"]);
+        assert_eq!(s.key, vec![0]);
+        assert!(s.ignored_columns.contains_key("s.t.note"));
+        assert!(!s.ignored_columns.contains_key("s.t.id"));
+        assert!(s.coverage_complete);
+    }
+
+    #[test]
+    fn a_control_total_is_for_every_table_by_name_or_one_table_by_path() {
+        let by_name = BTreeSet::from(["amount".to_string()]);
+        assert!(is_control_total(&by_name, "s.loans.amount", "amount"));
+        assert!(is_control_total(&by_name, "s.fees.amount", "amount"));
+        let by_path = BTreeSet::from(["s.loans.amount".to_string()]);
+        assert!(is_control_total(&by_path, "s.loans.amount", "amount"));
+        assert!(!is_control_total(&by_path, "s.fees.amount", "amount"));
+        assert!(!is_control_total(&by_path, "s.loans.balance", "balance"));
+        // And it reaches the plan: only the named table's column is added up.
+        let old = live(
+            "loans",
+            vec![col("id", "integer"), col("amount", "numeric")],
+            &["id"],
+        );
+        let opts = BTreeMap::new();
+        let m = Mapping::new();
+        let spec_for = |t: &LiveTable| {
+            build_table_spec(
+                t,
+                t,
+                SpecInputs {
+                    new_schema: "s",
+                    new_name: &t.name,
+                    level: CheckLevel::FullValues,
+                    mapping: &m,
+                    control_total_columns: &by_path,
+                    column_options: &opts,
+                    estimated_rows: 0,
+                },
+            )
+        };
+        let fees = live(
+            "fees",
+            vec![col("id", "integer"), col("amount", "numeric")],
+            &["id"],
+        );
+        assert!(spec_for(&old)
+            .columns
+            .iter()
+            .any(|c| c.old_name == "amount" && c.control_total));
+        assert!(spec_for(&fees).columns.iter().all(|c| !c.control_total));
     }
 
     #[test]

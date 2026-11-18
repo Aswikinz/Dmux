@@ -15,6 +15,8 @@
     "allow-update-mapping",
     "allow-export-mapping",
     "allow-save-mapping",
+    "allow-save-check-choices",
+    "allow-open-check-choices",
     "allow-import-mapping",
     "allow-edit-mapping",
     "allow-preview-rules",

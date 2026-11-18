@@ -22,6 +22,9 @@ import type { Engine } from '../api/engine';
 import type { CheckLevel, CheckPlan, Mapping, TableCheck } from '../api/contract';
 import { RunWindowControl } from '../components/RunWindowControl';
 import { TableScopePicker, isChosen } from '../components/TableScopePicker';
+import { ColumnChooser } from '../components/ColumnChooser';
+import { CheckChoicesFile } from '../components/CheckChoicesFile';
+import { addSuggestedTotals, clearTotals, columnCounts, openSuggestions } from './checkChoices';
 
 interface ChooseChecksScreenProps {
   engine: Engine;
@@ -83,6 +86,7 @@ export function matchesCheck(t: TableCheck, query: string): boolean {
     `${t.schemaName}.${t.tableName}`,
     level,
     ...(t.controlTotalSuggestions ?? []),
+    ...(t.columns ?? []).map((c) => c.name),
   ].some((v) => v.toLowerCase().includes(q));
 }
 
@@ -129,6 +133,8 @@ export function ChooseChecksScreen({
   const [sizeDirection, setSizeDirection] = useState<'larger' | 'smaller'>('larger');
   const [sizeMegabytes, setSizeMegabytes] = useState('');
   const [bulkLevel, setBulkLevel] = useState<CheckLevel>('full-values');
+  // The table whose columns are open for choosing, by table id.
+  const [columnsOf, setColumnsOf] = useState<string | null>(null);
   // The levels the engine suggested, captured once, so "Suggested levels"
   // can always restore them.
   const suggestedRef = useRef<Record<string, CheckLevel> | null>(null);
@@ -233,28 +239,20 @@ export function ChooseChecksScreen({
     setSelectionNote(`Set ${ids.size === 1 ? '1 table' : `${ids.size} tables`} to "${label}".`);
   };
 
-  /** Tick or untick a suggested control-total column.  Only ticked columns are
-   *  checked as control totals. */
-  const toggleControl = (tableId: string, column: string, on: boolean) => {
+  /** Replace one table's choices (its columns and control totals). */
+  const updateTable = (table: TableCheck) => {
     if (!plan) return;
-    setPresetNote(null);
     onPlanChange({
       ...plan,
-      tables: plan.tables.map((t) => {
-        if (t.tableId !== tableId) return t;
-        const confirmed = new Set(t.controlTotalColumns ?? []);
-        if (on) confirmed.add(column);
-        else confirmed.delete(column);
-        return { ...t, controlTotalColumns: confirmed.size > 0 ? [...confirmed] : undefined };
-      }),
+      tables: plan.tables.map((t) => (t.tableId === table.tableId ? table : t)),
     });
   };
 
   // The table's cells read the latest state and handlers through this ref, so
   // the column list keeps its identity.  A new column list makes the table
   // rebuild every cell, which would drop keyboard focus after each tick.
-  const live = useRef({ selected, toggleSelected, toggleControl, updateLevel });
-  live.current = { selected, toggleSelected, toggleControl, updateLevel };
+  const live = useRef({ selected, toggleSelected, updateLevel, columnsOf, setColumnsOf });
+  live.current = { selected, toggleSelected, updateLevel, columnsOf, setColumnsOf };
 
   const columns = useMemo(() => {
     const col = createColumnHelper<TableCheck>();
@@ -295,11 +293,25 @@ export function ChooseChecksScreen({
         cell: ({ getValue }) => formatSize(getValue() as number | undefined),
       }),
       col.display({
+        id: 'columns',
+        header: 'Columns',
+        size: 150,
+        cell: ({ row }) => {
+          const { compared, total } = columnCounts(row.original);
+          if (total === 0) return <span className="text-sm">All</span>;
+          return (
+            <span className="text-sm" data-testid="columns-cell">
+              {compared === total ? `All ${total}` : `${compared} of ${total}`}
+            </span>
+          );
+        },
+      }),
+      col.display({
         id: 'controlTotals',
         header: () => (
           <Tooltip
             label="Control totals"
-            explanation="Number columns, such as amounts and balances, that Dmux adds up on both sides. The sums must match, so you know the money adds up the same."
+            explanation="Number columns, such as amounts and balances, that Dmux adds up on both sides of this table. The sums must match, so you know the money adds up the same."
           >
             Control totals
           </Tooltip>
@@ -307,28 +319,44 @@ export function ChooseChecksScreen({
         size: 220,
         cell: ({ row }) => {
           const t = row.original;
-          const suggestions = t.controlTotalSuggestions ?? [];
-          if (suggestions.length === 0) return '—';
+          const on = t.controlTotalColumns ?? [];
+          const open = t.level === 'structure' ? [] : openSuggestions(t);
           return (
-            <div className="flex flex-nowrap gap-x-3 whitespace-nowrap">
-              {suggestions.map((column) => (
-                <label key={column} className="flex items-center gap-1.5 text-sm">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 accent-accent-600"
-                    aria-label={`Use ${column} as a control total for ${t.schemaName}.${t.tableName}`}
-                    checked={(t.controlTotalColumns ?? []).includes(column)}
-                    onChange={(e) => live.current.toggleControl(t.tableId, column, e.target.checked)}
-                  />
-                  {column}
-                </label>
-              ))}
-            </div>
+            <span className="text-sm" data-testid="totals-cell">
+              {on.length > 0 ? on.join(', ') : 'None'}
+              {open.length > 0 && (
+                <span className="block text-xs text-slate-500 dark:text-slate-400">
+                  {open.length === 1 ? `Suggested: ${open[0]}` : `${open.length} suggested`}
+                </span>
+              )}
+            </span>
+          );
+        },
+      }),
+      col.display({
+        id: 'choose',
+        header: () => <span className="sr-only">Choose columns</span>,
+        size: 130,
+        cell: ({ row }) => {
+          const t = row.original;
+          const isOpen = live.current.columnsOf === t.tableId;
+          return (
+            <Button
+              size="sm"
+              variant={isOpen ? 'primary' : 'secondary'}
+              aria-expanded={isOpen}
+              aria-label={`Choose columns of ${t.schemaName}.${t.tableName}`}
+              onClick={() => live.current.setColumnsOf(isOpen ? null : t.tableId)}
+            >
+              Columns…
+            </Button>
           );
         },
       }),
     ] as ColumnDef<TableCheck>[];
-  }, []);
+    // Rebuilt when columnsOf changes, so the Columns… button shows which
+    // table is open (cells read it through the live ref).
+  }, [columnsOf]);
 
   // Only the chosen tables take a level; the rest are not read.
   const chosen = useMemo(() => (plan?.tables ?? []).filter(isChosen), [plan]);
@@ -352,6 +380,20 @@ export function ChooseChecksScreen({
     [selected, chosenIds],
   );
   const estimate = plan ? chosenEstimate(plan) : null;
+  const openTable = chosen.find((t) => t.tableId === columnsOf) ?? null;
+  // Suggested control totals not yet added up, across the chosen tables.
+  const pendingSuggestions = useMemo(
+    () => chosen.filter((t) => t.level !== 'structure').reduce((n, t) => n + openSuggestions(t).length, 0),
+    [chosen],
+  );
+  const totalsOn = useMemo(
+    () => chosen.reduce((n, t) => n + (t.controlTotalColumns?.length ?? 0), 0),
+    [chosen],
+  );
+  const leftOutColumns = useMemo(
+    () => chosen.reduce((n, t) => n + (columnCounts(t).total - columnCounts(t).compared), 0),
+    [chosen],
+  );
 
   return (
     <div className="space-y-6">
@@ -364,6 +406,9 @@ export function ChooseChecksScreen({
       {error && <ErrorCard title="Could not build check plan">{error}</ErrorCard>}
       {plan && (
         <>
+          <Panel>
+            <CheckChoicesFile engine={engine} plan={plan} onPlanChange={onPlanChange} />
+          </Panel>
           <Panel>
             <TableScopePicker tables={plan.tables} onChange={(tables) => onPlanChange({ ...plan, tables })} />
           </Panel>
@@ -414,12 +459,22 @@ export function ChooseChecksScreen({
                   <span><strong>{totals.structure}</strong> structure only</span>
                 </div>
               )}
+              <details className="rounded-lg border border-slate-200 dark:border-slate-700" data-testid="bulk-tools">
+              <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+                Change several tables at once
+                {selectedChosen.size > 0 && (
+                  <span className="ml-2 text-slate-600 dark:text-slate-300">({selectedChosen.size} selected)</span>
+                )}
+              </summary>
               <div
                 role="group"
                 aria-label="Select tables"
-                className="space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+                className="space-y-3 border-t border-slate-200 p-3 dark:border-slate-700"
               >
-                <p className="text-sm font-medium">Select several chosen tables, then change their level together</p>
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  Select tables by schema, name or size (or tick them in the list), then set their level
+                  together.
+                </p>
                 <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
                   <div className="flex items-end gap-2" data-testid="select-by-schema">
                     <Select
@@ -544,17 +599,57 @@ export function ChooseChecksScreen({
                   </p>
                 )}
               </div>
-              <p className="text-xs text-slate-600 dark:text-slate-400">
-                A control-total column you tick is added up in every table that has a column with that
-                name. Nothing is added up until you tick it.
-              </p>
+              </details>
+              <div
+                className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 p-3 text-sm dark:border-slate-700"
+                data-testid="totals-helper"
+              >
+                <p className="mr-auto text-slate-700 dark:text-slate-300">
+                  <strong>Control totals:</strong>{' '}
+                  {totalsOn === 0
+                    ? 'nothing is added up yet.'
+                    : `${totalsOn === 1 ? '1 column is' : `${totalsOn} columns are`} added up.`}{' '}
+                  {pendingSuggestions > 0 &&
+                    `Dmux suggests ${pendingSuggestions === 1 ? '1 more number column' : `${pendingSuggestions} more number columns`} (amounts, balances and so on).`}{' '}
+                  Each table's own columns are chosen with its Columns… button.
+                  {leftOutColumns > 0 && (
+                    <span className="block text-slate-600 dark:text-slate-400" data-testid="left-out-columns">
+                      {leftOutColumns === 1 ? '1 column is' : `${leftOutColumns} columns are`} left out of
+                      the comparison and will be listed in the results.
+                    </span>
+                  )}
+                </p>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={pendingSuggestions === 0}
+                  onClick={() => onPlanChange(addSuggestedTotals(plan, new Set(chosen.map((t) => t.tableId))))}
+                >
+                  Add up all suggested
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={totalsOn === 0}
+                  onClick={() => onPlanChange(clearTotals(plan, new Set(chosen.map((t) => t.tableId))))}
+                >
+                  Add up nothing
+                </Button>
+              </div>
+              {openTable && (
+                <ColumnChooser
+                  table={openTable}
+                  onChange={updateTable}
+                  onClose={() => setColumnsOf(null)}
+                />
+              )}
               <p className="-mb-2 text-[13px] font-medium text-slate-700 dark:text-slate-300">
                 Search the chosen tables
               </p>
               <DataTable
                 data={chosen}
                 columns={columns}
-                filterPlaceholder="Table, schema, level or control-total column"
+                filterPlaceholder="Table, schema, level or column"
                 filterFn={matchesCheck}
               />
             </Panel>

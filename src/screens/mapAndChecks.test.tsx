@@ -277,33 +277,79 @@ describe('ChooseChecksScreen selection', () => {
   });
 });
 
-describe('ChooseChecksScreen control totals', () => {
-  it('lists suggested columns unticked, and ticking one confirms it in the plan', async () => {
+describe('ChooseChecksScreen columns and control totals', () => {
+  async function setup() {
     const plans: CheckPlan[] = [];
     wrap(<ChecksHarness engine={createMockEngine()} onPlan={(p) => plans.push(p)} />);
     await chooseAllTables();
-    const first = plans[plans.length - 1].tables[0];
+    const last = () => plans[plans.length - 1];
+    const first = last().tables[0];
+    fireEvent.click(
+      screen.getByRole('button', { name: `Choose columns of ${first.schemaName}.${first.tableName}` }),
+    );
+    const chooser = within(screen.getByTestId('column-chooser'));
+    return { last, first, chooser };
+  }
+
+  it('starts with every column compared and nothing added up', async () => {
+    const { first, chooser } = await setup();
     expect(first.controlTotalSuggestions).toContain('amount');
     expect(first.controlTotalColumns).toBeUndefined();
-    const box = screen.getByRole('checkbox', {
-      name: `Use amount as a control total for ${first.schemaName}.${first.tableName}`,
-    }) as HTMLInputElement;
-    expect(box.checked).toBe(false);
-    fireEvent.click(box);
-    const confirmed = plans[plans.length - 1].tables[0].controlTotalColumns;
-    expect(confirmed).toEqual(['amount']);
-    expect(plans[plans.length - 1].tables.slice(1).every((t) => !t.controlTotalColumns)).toBe(true);
-    // The same checkbox stays on screen, so keyboard focus is not lost.
-    expect(document.body.contains(box)).toBe(true);
-    expect(box.checked).toBe(true);
-    fireEvent.click(box);
-    expect(plans[plans.length - 1].tables[0].controlTotalColumns).toBeUndefined();
+    expect(chooser.getByText(`Columns of ${first.schemaName}.${first.tableName}`)).toBeDefined();
+    expect(chooser.getByTestId('column-summary').textContent).toContain(
+      `All ${first.columns?.length} columns are compared. Nothing is added up.`,
+    );
+    const amount = chooser.getByRole('checkbox', { name: 'Add up amount as a control total' }) as HTMLInputElement;
+    expect(amount.checked).toBe(false);
   });
 
-  it('says a ticked column is added up in every table that has it', async () => {
-    wrap(<ChecksHarness engine={createMockEngine()} />);
-    await chooseAllTables();
-    expect(screen.getByText(/added up in every table that has a column with that name/)).toBeDefined();
+  it('adds a column up for this table only', async () => {
+    const { last, chooser } = await setup();
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Add up amount as a control total' }));
+    expect(last().tables[0].controlTotalColumns).toEqual(['amount']);
+    // Another table with an amount column is not touched.
+    const others = last().tables.slice(1).filter((t) => t.columns?.some((c) => c.name === 'amount'));
+    expect(others.length).toBeGreaterThan(0);
+    expect(others.every((t) => !t.controlTotalColumns)).toBe(true);
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Add up amount as a control total' }));
+    expect(last().tables[0].controlTotalColumns).toBeUndefined();
+  });
+
+  it('leaves a column out, and a key column can never be left out', async () => {
+    const { last, chooser } = await setup();
+    const id = chooser.getByRole('checkbox', { name: 'Compare id' }) as HTMLInputElement;
+    expect(id.checked).toBe(true);
+    expect(id.disabled).toBe(true);
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Compare note' }));
+    expect(last().tables[0].leftOutColumns).toEqual(['note']);
+    expect(screen.getByTestId('left-out-columns').textContent).toContain('1 column is left out');
+    fireEvent.click(chooser.getByRole('button', { name: 'Compare key columns only' }));
+    expect(last().tables[0].leftOutColumns).not.toContain('id');
+    expect(last().tables[0].leftOutColumns?.length).toBe((last().tables[0].columns?.length ?? 0) - 1);
+    fireEvent.click(chooser.getByRole('button', { name: 'Compare every column' }));
+    expect(last().tables[0].leftOutColumns).toBeUndefined();
+  });
+
+  it('leaving out an added-up column stops adding it up; adding up puts it back', async () => {
+    const { last, chooser } = await setup();
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Add up amount as a control total' }));
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Compare amount' }));
+    expect(last().tables[0].leftOutColumns).toEqual(['amount']);
+    expect(last().tables[0].controlTotalColumns).toBeUndefined();
+    fireEvent.click(chooser.getByRole('checkbox', { name: 'Add up amount as a control total' }));
+    expect(last().tables[0].leftOutColumns).toBeUndefined();
+    expect(last().tables[0].controlTotalColumns).toEqual(['amount']);
+  });
+
+  it('adds up every suggestion in one click, and clears them in one', async () => {
+    const { last } = await setup();
+    fireEvent.click(screen.getByRole('button', { name: 'Add up all suggested' }));
+    const chosen = last().tables.filter((t) => t.included !== false && t.level !== 'structure');
+    for (const t of chosen) {
+      expect(t.controlTotalColumns ?? []).toEqual([...(t.controlTotalSuggestions ?? [])].sort());
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Add up nothing' }));
+    expect(last().tables.every((t) => !t.controlTotalColumns)).toBe(true);
   });
 });
 
@@ -573,7 +619,7 @@ describe('Choose checks search', () => {
     await chooseAllTables();
     const before = screen.getAllByRole('combobox', { name: /^Check level for / }).length;
     expect(screen.getByText('Search the chosen tables')).toBeDefined();
-    fireEvent.change(screen.getByPlaceholderText('Table, schema, level or control-total column'), {
+    fireEvent.change(screen.getByPlaceholderText('Table, schema, level or column'), {
       target: { value: 'balance' },
     });
     const after = screen.getAllByRole('combobox', { name: /^Check level for / }).length;

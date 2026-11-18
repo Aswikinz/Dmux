@@ -212,12 +212,28 @@ export interface Mapping {
 
 export type CheckLevel = 'structure' | 'counts' | 'full-values';
 
+/** One column of a table in the check plan. */
+export interface PlanColumn {
+  name: string;
+  typeName: string;
+  /** Part of the primary key: rows are matched on it, so it is always compared. */
+  key: boolean;
+  /** A number column, which can be added up as a control total. */
+  number: boolean;
+}
+
 export interface TableCheck {
   tableId: string;
   schemaName: string;
   tableName: string;
   level: CheckLevel;
-  /** Control-total columns the user has confirmed.  Only these are checked. */
+  /** Every column of the old table, in name order (absent in older plans). */
+  columns?: PlanColumn[];
+  /** Columns the user left out of this table's comparison, by name.  A key
+   *  column is never left out: it is always compared. */
+  leftOutColumns?: string[];
+  /** Control-total columns the user has confirmed for this table only.  Only
+   *  these are added up. */
   controlTotalColumns?: string[];
   /** Number columns Dmux suggests (names like amount or balance).  Nothing is
    *  checked until the user ticks one. */
@@ -525,6 +541,36 @@ export const OUTSIDE_RUN_REASONS: readonly string[] = [
 ];
 
 export const isOutsideRun = (reason: string): boolean => OUTSIDE_RUN_REASONS.includes(reason);
+
+/** A whole table left out of the run (listed in its own report).  A column left
+ *  out of a checked table is not: it stays beside its table's verdict. */
+export const isTableOutsideRun = (item: { name: string; reason: string }): boolean =>
+  isOutsideRun(item.reason) && item.name.split('.').length === 2;
+
+/** One table's saved check choices, by its old `schema.table`. */
+export interface TableChoice {
+  table: string;
+  level: CheckLevel;
+  leftOutColumns: string[];
+  controlTotals: string[];
+}
+
+/** A saved set of check choices: which tables, at what level, which columns.
+ *  Names only: never a connection, login, password or value. */
+export interface CheckChoices {
+  runWindow?: string;
+  tables: TableChoice[];
+}
+
+export type SaveChoicesResult =
+  | { status: 'saved'; path: string }
+  | { status: 'cancelled' }
+  | { status: 'demo-only' };
+
+export type OpenChoicesResult =
+  | { status: 'opened'; path: string; choices: CheckChoices }
+  | { status: 'cancelled' }
+  | { status: 'demo-only' };
 
 export interface ReportRequest {
   /** The finished run to report on.  The backend renders from its own copy of

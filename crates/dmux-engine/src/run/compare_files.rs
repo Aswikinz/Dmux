@@ -697,7 +697,9 @@ async fn file_live_pair(
                 ));
             }
         }
-        if config.control_total_columns.contains(old_name) && !cap.control_columns.contains(cname) {
+        if crate::plan::is_control_total(&config.control_total_columns, &opt_path, old_name)
+            && !cap.control_columns.contains(cname)
+        {
             e.floors.push((
                 Verdict::NeedsReview,
                 format!("a control total on column {cname} was requested but the saved fingerprint does not carry it"),

@@ -12,7 +12,7 @@ import { IgnoredItems } from '../components/IgnoredItems';
 import { LEAVE_NOTHING_OUT, ReportContents } from '../components/ReportContents';
 import { FileCode2, FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
-import { isOutsideRun } from '../api/contract';
+import { isTableOutsideRun } from '../api/contract';
 import type { ReportFormat, ReportLeaveOut, Results } from '../api/contract';
 
 const FORMAT_LABEL: Record<ReportFormat, string> = {
@@ -47,7 +47,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
   }, [engine]);
   const [leaveOut, setLeaveOut] = useState<ReportLeaveOut>(LEAVE_NOTHING_OUT);
   // Tables a run of chosen tables left out: listed in their own report.
-  const notInRun = results.ignored.filter((i) => isOutsideRun(i.reason)).length;
+  const notInRun = results.ignored.filter(isTableOutsideRun).length;
   const [exporting, setExporting] = useState<ReportFormat | null>(null);
   const [resultMessage, setResultMessage] = useState<{ text: string; saved: boolean } | null>(
     null,

@@ -34,6 +34,9 @@ import type {
   TableRunState,
   Verdict,
   MappingSaveResult,
+  CheckChoices,
+  SaveChoicesResult,
+  OpenChoicesResult,
 } from './contract';
 
 const deterministicId = (prefix: string, index: number) =>
@@ -412,6 +415,14 @@ const makeCheckPlan = (tableCount: number): CheckPlan => {
       level,
       controlTotalSuggestions: controls.length ? controls : undefined,
       sizeBytes: (i + 1) * 3 * 1024 * 1024,
+      columns: [
+        { name: 'id', typeName: 'integer', key: true, number: true },
+        ...(hasAmount ? [{ name: 'amount', typeName: 'numeric(18,2)', key: false, number: true }] : []),
+        ...(hasBalance ? [{ name: 'balance', typeName: 'numeric(18,2)', key: false, number: true }] : []),
+        { name: 'created_at', typeName: 'timestamp with time zone', key: false, number: false },
+        { name: 'note', typeName: 'text', key: false, number: false },
+        { name: 'status', typeName: 'character varying(20)', key: false, number: false },
+      ].sort((a, b) => a.name.localeCompare(b.name)),
     });
   }
   return {
@@ -980,6 +991,16 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       }
       // The browser demo has no file system: say so instead of pretending.
       return { ok: false, demoOnly: true, hash: `mock-${Math.abs(hash).toString(16)}` };
+    },
+
+    // The browser demo has no file system: it says so instead of pretending.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- same signature as the real engine
+    async saveCheckChoices(_choices: CheckChoices): Promise<SaveChoicesResult> {
+      return { status: 'demo-only' };
+    },
+
+    async openCheckChoices(): Promise<OpenChoicesResult> {
+      return { status: 'demo-only' };
     },
 
     async buildCheckPlan(): Promise<CheckPlan> {

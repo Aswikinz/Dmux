@@ -32,7 +32,9 @@ use dmux_engine::mapping::Mapping;
 use dmux_engine::results::{CheckLevel, RunResults, Verdict};
 use dmux_engine::run::{run, Input, RunConfig};
 
-use crate::commands::gateway::{collect, drive, resolve, validate_mapping, SuperuserOverride};
+use crate::commands::gateway::{
+    collect, collect_primary_keys, drive, resolve, validate_mapping, SuperuserOverride,
+};
 use crate::error::{from_db_error, CommandError};
 use crate::run_manager::{DriveTicket, RunHandle, RunManager, RunPhase};
 use crate::state::AppState;
@@ -78,6 +80,11 @@ pub struct StartRunInput {
     /// and shows in the coverage line and on the first page of every report.
     #[serde(default)]
     pub skip_tables: Vec<String>,
+    /// Old-side `schema.table.column` paths the user left out of a table that
+    /// is in the run.  Recorded like `skip_tables` ("not selected for this
+    /// run").  A key column is never left out: the engine compares it anyway.
+    #[serde(default)]
+    pub skip_columns: Vec<String>,
 }
 
 /// The reason recorded for a table the user did not choose for a run.  Written
@@ -88,6 +95,33 @@ pub use dmux_engine::run::NOT_SELECTED_REASON;
 /// it.  A path must be a plain `schema.table`; one that names no table is
 /// refused later by the engine's unknown-path check, never skipped silently.
 /// A table the mapping already ignores keeps its own reason.
+/// Add the user's left-out columns to the mapping as ignored items (like
+/// [`with_skipped_tables`]).  A path must be `schema.table.column`.
+pub(crate) fn with_skipped_columns(
+    mut mapping: Mapping,
+    skip: &[String],
+) -> Result<Mapping, CommandError> {
+    if skip.is_empty() {
+        return Ok(mapping);
+    }
+    for path in skip {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            return Err(CommandError::InvalidInput {
+                message: "a column left out of the run must be named as schema.table.column"
+                    .to_string(),
+            });
+        }
+        if !mapping.ignored.iter().any(|i| &i.path == path) {
+            mapping.ignored.push(dmux_engine::mapping::IgnoredItem {
+                path: path.clone(),
+                reason: NOT_SELECTED_REASON.to_string(),
+            });
+        }
+    }
+    validate_mapping(&mapping.with_fresh_hash())
+}
+
 pub(crate) fn with_skipped_tables(
     mut mapping: Mapping,
     skip: &[String],
@@ -133,6 +167,21 @@ pub struct TableCheckDto {
     /// The table's size on the old database, in bytes (0 when unknown), so the
     /// UI can select tables by size.
     pub size_bytes: i64,
+    /// Every column of the old table, in name order, for choosing columns.
+    pub columns: Vec<PlanColumnDto>,
+}
+
+/// One column of a planned table.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PlanColumnDto {
+    pub name: String,
+    pub type_name: String,
+    /// Part of the primary key: rows are matched on it, so it is always
+    /// compared and cannot be left out.
+    pub key: bool,
+    /// A number column (can be added up as a control total).
+    pub number: bool,
 }
 
 /// The check plan, mirroring the contract's `CheckPlan`.
@@ -424,6 +473,7 @@ pub async fn build_check_plan(
         })
         .collect();
     let compared = compared_old_tables(&old_names, &new_tables, mapping.as_ref());
+    let keys = collect_primary_keys(&old, allow, &state).await?;
 
     // Old tables (partitions already folded), mapped to their new side.
     let mut plan_tables: Vec<TableCheckDto> = Vec::new();
@@ -460,6 +510,21 @@ pub async fn build_check_plan(
                 level: CheckLevel::FullValues,
                 control_total_columns: (!controls.is_empty()).then_some(controls),
                 size_bytes: table.size_bytes.max(0),
+                columns: {
+                    let table_keys = keys.get(&path);
+                    let mut cols: Vec<PlanColumnDto> = table
+                        .columns
+                        .iter()
+                        .map(|c| PlanColumnDto {
+                            name: c.name.clone(),
+                            type_name: c.type_name.clone(),
+                            key: table_keys.is_some_and(|k| k.contains(&c.name)),
+                            number: is_number_type(&c.type_name),
+                        })
+                        .collect();
+                    cols.sort_by(|a, b| a.name.cmp(&b.name));
+                    cols
+                },
             });
             estimate_inputs.push((schema.name.clone(), table.name.clone()));
         }
@@ -629,7 +694,10 @@ pub(crate) fn start_run_with(
         .map(str::to_string);
     // The webview-supplied mapping is untrusted input (audit L7): validate it
     // exactly like an imported mapping file before it drives the run.
-    let mapping = with_skipped_tables(validate_mapping(&input.mapping)?, &input.skip_tables)?;
+    let mapping = with_skipped_columns(
+        with_skipped_tables(validate_mapping(&input.mapping)?, &input.skip_tables)?,
+        &input.skip_columns,
+    )?;
     // A table left out of the run takes no level.
     let mut levels = input.levels.clone();
     levels.retain(|t, _| !input.skip_tables.contains(t));
@@ -1742,7 +1810,79 @@ mod tests {
             }),
             run_window: None,
             skip_tables: vec![],
+            skip_columns: vec![],
         }
+    }
+
+    #[test]
+    fn left_out_columns_are_named_schema_table_column() {
+        let m = with_skipped_columns(Mapping::new(), &["core.accounts.note".into()]).unwrap();
+        assert_eq!(m.ignored.len(), 1);
+        assert_eq!(m.ignored[0].reason, NOT_SELECTED_REASON);
+        for bad in ["core.accounts", "core..note", "a.b.c.d", ".t.c"] {
+            assert!(
+                matches!(
+                    with_skipped_columns(Mapping::new(), &[bad.to_string()]),
+                    Err(CommandError::InvalidInput { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_left_out_column_is_not_compared_but_a_key_column_always_is() {
+        let Some(old) = env_url("DMUX_TEST_DEMO_OLD_URL") else {
+            return;
+        };
+        let Some(new) = env_url("DMUX_TEST_DEMO_NEW_URL") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_password_store(
+            dir.path().to_path_buf(),
+            Box::new(crate::secrets::InMemoryPasswordStore::new()),
+        )
+        .unwrap();
+        let mut input = start_input(&old, &new, &[]);
+        input.default_level = CheckLevel::FullValues;
+        let tables = run_live(&old, &new).await.tables.into_keys();
+        input.skip_tables = tables.filter(|t| t != "demo_bank.account_types").collect();
+        input.skip_columns = vec![
+            "demo_bank.account_types.type_name".into(),
+            // The key column: rows are matched on it, so it stays compared.
+            "demo_bank.account_types.account_type_id".into(),
+        ];
+        let id = start_run_with(input, &state).unwrap().run_id;
+        assert!(
+            wait_until(std::time::Duration::from_secs(120), || {
+                let s = poll_run_with(id.clone(), &state).unwrap().overall_state;
+                async move { s != "running" }
+            })
+            .await
+        );
+        let r = state.runs.results(&id).expect("the run finished");
+        let covered = r.tables["demo_bank.account_types"]
+            .columns_covered
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            covered.contains(&"account_type_id".to_string()),
+            "{covered:?}"
+        );
+        assert!(!covered.contains(&"type_name".to_string()), "{covered:?}");
+        let ignored: Vec<(&str, &str)> = r
+            .ignored_items
+            .iter()
+            .map(|i| (i.path.as_str(), i.reason.as_str()))
+            .collect();
+        assert!(ignored.contains(&("demo_bank.account_types.type_name", NOT_SELECTED_REASON)));
+        assert!(
+            !ignored
+                .iter()
+                .any(|(p, _)| *p == "demo_bank.account_types.account_type_id"),
+            "a key column must never be listed as ignored: {ignored:?}"
+        );
     }
 
     #[test]

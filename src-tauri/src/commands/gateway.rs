@@ -319,6 +319,34 @@ pub(crate) async fn probe_connection_with(
 
 /// Collect one database's structural inventory (engine-native, no network glue
 /// beyond the read-only session).
+/// Every primary-key column of one database, keyed by `schema.table`, in one
+/// read-only catalogue query.
+pub(crate) async fn collect_primary_keys(
+    input: &ConnectInput,
+    allow: bool,
+    state: &AppState,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CommandError> {
+    let profile = resolve(input, state)?;
+    drive(move || async move {
+        let mut session = ReadOnlySession::open(&profile, allow)
+            .await
+            .map_err(from_db_error)?;
+        session
+            .with_read_only("30s", |txn| {
+                Box::pin(async move {
+                    dmux_engine::inventory::primary_key_columns(&*txn)
+                        .await
+                        .map_err(|e| dmux_engine::db::DbError::Postgres {
+                            message: e.to_string(),
+                        })
+                })
+            })
+            .await
+            .map_err(from_db_error)
+    })
+    .await
+}
+
 pub(crate) async fn collect(
     input: &ConnectInput,
     allow: bool,
@@ -1674,6 +1702,7 @@ mod tests {
                 export_keys: None,
                 allow_superuser: su(),
                 skip_tables: vec![],
+                skip_columns: vec![],
             },
             &state,
         )

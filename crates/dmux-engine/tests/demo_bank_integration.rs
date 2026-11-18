@@ -203,3 +203,60 @@ async fn demo_bank_reports_the_answer_key_structure() {
     // Different (FAIL), not a silent PASS.
     assert_eq!(diff.status, DiffStatus::Different);
 }
+
+/// The key columns Choose checks locks (one catalogue query for the whole
+/// database) are exactly the primary keys the run itself matches rows on
+/// (read per table at run time), for every demo_bank table.
+#[tokio::test]
+async fn primary_key_columns_match_the_keys_the_run_uses() {
+    let Some(old_url) = env_url("DMUX_TEST_DEMO_OLD_URL") else {
+        return;
+    };
+    let inv = collect(&old_url).await;
+    let profile = profile_from_url(&old_url);
+    let mut session = ReadOnlySession::open(&profile, true)
+        .await
+        .expect("session opens");
+    let tables: Vec<(String, String)> = inv
+        .schemas
+        .iter()
+        .flat_map(|s| {
+            s.tables
+                .iter()
+                .map(move |t| (s.name.clone(), t.name.clone()))
+        })
+        .collect();
+    assert!(tables.len() > 5);
+    let (keys, live) = session
+        .with_read_only("60s", |txn| {
+            let tables = tables.clone();
+            Box::pin(async move {
+                let keys = dmux_engine::inventory::primary_key_columns(&*txn)
+                    .await
+                    .map_err(|e| DbError::Postgres {
+                        message: e.to_string(),
+                    })?;
+                let mut live = Vec::new();
+                for (s, t) in &tables {
+                    let lt = dmux_engine::plan::read_live_table(txn, s, t)
+                        .await
+                        .map_err(|e| DbError::Postgres {
+                            message: e.to_string(),
+                        })?;
+                    live.push((format!("{s}.{t}"), lt.primary_key));
+                }
+                Ok((keys, live))
+            })
+        })
+        .await
+        .expect("keys read");
+    for (path, pk) in live {
+        let mut want: Vec<String> = pk;
+        want.sort();
+        let got: Vec<String> = keys
+            .get(&path)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(got, want, "{path}");
+    }
+}

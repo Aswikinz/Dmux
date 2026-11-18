@@ -665,6 +665,7 @@ describe('ChooseChecksScreen', () => {
     expect(screen.getByText(/about .*(seconds?|minutes?)/)).toBeDefined();
     expect(screen.getByText(/Corrected as each table finishes/)).toBeDefined();
     expect(screen.getByRole('button', { name: 'Control totals' })).toBeDefined();
+    expect(screen.getByTestId('totals-helper').textContent).toContain('nothing is added up yet');
   });
 
   it('updates a table level when a row select changes', async () => {

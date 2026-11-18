@@ -8,6 +8,7 @@ import {
   mapVerdict,
   RunFailedError,
   toEngineLevel,
+  planToLevels,
 } from './tauriEngine';
 import type { ConnectionProfile, Inventory, Mapping } from './contract';
 import { defaultOldProfile } from '../screens/ConnectScreen';
@@ -743,7 +744,8 @@ describe('data half is wired to the backend', () => {
       expect.objectContaining({
         input: expect.objectContaining({
           levels: { 'demo_bank.accounts': 'counts_and_totals' },
-          control_total_columns: ['balance'],
+          // Named with its table, so it is added up in that table only.
+          control_total_columns: ['demo_bank.accounts.balance'],
           default_level: 'full_values',
         }),
       }),
@@ -1389,9 +1391,75 @@ describe('mapping suggestions, edits and rules', () => {
     expect(invoke).toHaveBeenCalledWith(
       'start_run',
       expect.objectContaining({
-        input: expect.objectContaining({ control_total_columns: ['balance'] }),
+        input: expect.objectContaining({ control_total_columns: ['public.b.balance'] }),
       }),
     );
+  });
+
+  it('left-out columns are sent as schema.table.column, never a key column', () => {
+    const plan = {
+      tables: [
+        {
+          tableId: 'x',
+          schemaName: 'core',
+          tableName: 'accounts',
+          level: 'full-values' as const,
+          columns: [
+            { name: 'id', typeName: 'integer', key: true, number: true },
+            { name: 'note', typeName: 'text', key: false, number: false },
+          ],
+          leftOutColumns: ['id', 'note'],
+          controlTotalColumns: ['id'],
+        },
+        {
+          tableId: 'y',
+          schemaName: 'core',
+          tableName: 'loans',
+          level: 'counts' as const,
+          included: false,
+          leftOutColumns: ['rate'],
+        },
+      ],
+      presets: [],
+      estimateSecondsMin: 0,
+      estimateSecondsMax: 0,
+    };
+    const out = planToLevels(plan);
+    expect(out.skipColumns).toEqual(['core.accounts.note']);
+    expect(out.controlTotalColumns).toEqual(['core.accounts.id']);
+    expect(out.levels).toEqual({ 'core.accounts': 'full_values' });
+  });
+
+  it('check choices go to the backend in the file form and come back unchanged', async () => {
+    const engine = createTauriEngine();
+    const choices = {
+      runWindow: '22:00-05:00',
+      tables: [
+        { table: 'core.loans', level: 'counts' as const, leftOutColumns: ['note'], controlTotals: ['amount'] },
+      ],
+    };
+    let sent: unknown;
+    invoke.mockImplementation((cmd: string, args?: { choices?: unknown }) => {
+      if (cmd === 'save_check_choices') {
+        sent = args?.choices;
+        return Promise.resolve({ status: 'saved', path: '/home/x/checks.json' });
+      }
+      if (cmd === 'open_check_choices') {
+        return Promise.resolve({ status: 'opened', path: '/home/x/checks.json', choices: sent });
+      }
+      return Promise.reject(new Error(cmd));
+    });
+    expect(await engine.saveCheckChoices(choices)).toEqual({ status: 'saved', path: '/home/x/checks.json' });
+    expect(sent).toEqual({
+      format: 'dmux-check-choices',
+      version: 1,
+      run_window: '22:00-05:00',
+      tables: [{ table: 'core.loans', level: 'counts_and_totals', left_out_columns: ['note'], control_totals: ['amount'] }],
+    });
+    expect(await engine.openCheckChoices()).toEqual({ status: 'opened', path: '/home/x/checks.json', choices });
+    invoke.mockImplementation(() => Promise.resolve({ status: 'cancelled' }));
+    expect(await engine.saveCheckChoices(choices)).toEqual({ status: 'cancelled' });
+    expect(await engine.openCheckChoices()).toEqual({ status: 'cancelled' });
   });
 });
 

@@ -44,6 +44,8 @@ fn main() {
             commands::gateway::update_mapping,
             commands::gateway::export_mapping,
             commands::mapping_file::save_mapping,
+            commands::check_choices::save_check_choices,
+            commands::check_choices::open_check_choices,
             commands::gateway::import_mapping,
             commands::mapping_edit::edit_mapping,
             commands::mapping_edit::preview_rules,

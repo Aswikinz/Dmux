@@ -408,6 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn a_column_left_out_of_a_checked_table_stays_in_the_main_report() {
+        let mut r = mixed_results();
+        r.ignored_items = vec![IgnoredItem {
+            path: "core.accounts.nickname".into(),
+            reason: dmux_engine::run::NOT_SELECTED_REASON.into(),
+        }];
+        let v = verify::verify_results(&finalise(r)).unwrap();
+        let l = build_layout(&v, &ReportOptions::default());
+        assert_eq!(l.ignored_items.len(), 1);
+        assert!(l.not_in_run.is_empty());
+        let main = pdf_text(&pdf::render_bytes(&l, "x").unwrap());
+        assert!(main.contains("core.accounts.nickname"), "{main}");
+        assert!(main.contains("not selected for this run"));
+        let html = html::render(&l, "x");
+        assert!(html.contains("core.accounts.nickname"));
+    }
+
+    #[test]
     fn tables_left_out_of_a_run_go_in_their_own_report_not_on_page_one() {
         let mut r = mixed_results();
         r.ignored_items = vec![

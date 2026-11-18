@@ -644,7 +644,7 @@ pub fn build(
         ignored_items: results
             .ignored_items
             .iter()
-            .filter(|i| !dmux_engine::run::is_outside_run(&i.reason))
+            .filter(|i| !dmux_engine::run::is_table_outside_run(&i.path, &i.reason))
             .map(|i| Ignored {
                 path: sanitize(&i.path),
                 reason: sanitize(&i.reason),
@@ -653,7 +653,7 @@ pub fn build(
         not_in_run: results
             .ignored_items
             .iter()
-            .filter(|i| dmux_engine::run::is_outside_run(&i.reason))
+            .filter(|i| dmux_engine::run::is_table_outside_run(&i.path, &i.reason))
             .map(|i| Ignored {
                 path: sanitize(&i.path),
                 reason: sanitize(&i.reason),

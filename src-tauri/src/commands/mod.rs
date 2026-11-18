@@ -12,6 +12,7 @@
 //! - [`report`]: export the finished run's PDF or Excel report through a
 //!   native save dialog (PLAN.md 4.7).
 
+pub mod check_choices;
 pub mod data;
 pub mod gateway;
 pub mod history;

@@ -16,6 +16,35 @@ All notable changes to Dmux. Dates are release dates; versions follow
   listing thousands of them; **Export tables not in this run** on the Report screen (or
   `dmux report --not-in-run <file>`) writes that list as a separate PDF.
 
+### Column-level checks
+
+- **Columns…** on Choose checks opens a table's columns: leave columns out of the
+  comparison, and choose which number columns are added up as control totals. Key columns
+  are always compared (rows are matched on them), even if a saved file asks otherwise.
+- A left-out column is listed beside its table in the results and in every report with
+  the reason "not selected for this run". If it has a structure difference, the run warns
+  about it by name, so leaving a column out can never hide a difference silently.
+- Control totals now apply to the table you chose them on. Before, ticking `amount` on one
+  table added up `amount` in every table that had it. `dmux run --control-total amount`
+  and run definition files keep the old meaning (every table); `schema.table.column`
+  names one table.
+- Clearer Choose checks: the bulk level tools fold away under **Change several tables at
+  once**, and **Add up all suggested** / **Add up nothing** replace the row of tick boxes.
+
+### Saved check choices
+
+- **Save these choices…** writes the chosen tables, levels, left-out columns, control
+  totals and run window to a JSON file (`dmux-check-choices`, version 1); **Open saved
+  choices…** applies one to the next run. The file holds names only. Names the database
+  no longer has are listed on screen, never guessed; unknown fields, a wrong format or
+  version, and files over 32 MiB are refused.
+
+### Faster checks
+
+- Each table's old and new sides are now read at the same time (definitions, counts,
+  fingerprints, the spot check and the row drill-down), instead of one after the other.
+  Each side keeps its own parallelism limit; what is compared is unchanged.
+
 ### Tables that could not be paired
 
 - Choose checks offers only tables that will be compared. Tables with no partner in the

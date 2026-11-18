@@ -333,25 +333,49 @@ and see how long that will take before you start.
    **Custom**.
 3. Adjust individual tables if needed. Each table has one of three levels: **Structure**,
    **Counts and totals**, or **Full values**.
-4. To change many tables at once, tick them in the first column, or use the selection tools:
+4. To change many tables at once, open **Change several tables at once**, tick tables in
+   the first column, or use the selection tools:
    **Select schema**, **Select by name** (type a pattern; `*` stands for any text, upper
    and lower case do not matter, so `acct_*` finds every table that starts with `acct_`),
    or **Select by size** (larger or smaller than a number of megabytes). Selecting replaces
    the earlier selection. Then choose a level under **Set level for the selection** and
    press **Apply**. Tables with no size on record are skipped by the size selection, and
    the screen says how many.
-5. Confirm the control-total columns. Dmux suggests number columns whose names look like
-   amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
-   column is added up in every table that has a column with that name.
+5. Choose columns. Each table's **Columns** shows how many of its columns are compared
+   ("All 12", or "9 of 12"). Press **Columns…** on a row to open that table's columns:
+   - **Compare**: untick a column to leave it out of this run. Its values are not
+     compared, and it is listed in the results and on the report beside its table, with
+     the reason "not selected for this run", so a PASS never hides it. If the column's
+     structure differs between the databases (for example it was dropped), the run
+     warns about it by name instead of saying nothing. **Compare every column** and
+     **Compare key columns only** set the whole table at once.
+   - **Key columns** are always compared and their box cannot be unticked: Dmux matches
+     rows on them.
+   - **Add up (control total)**: tick a number column to add it up on both sides. The
+     sums must match. This applies to **this table only**. Columns Dmux suggests (names
+     like amount or balance) are marked "Suggested", unticked. Adding a column up also
+     compares it; leaving a column out stops adding it up.
+   Press **Done** to close it. Above the list, **Control totals** says how many columns
+   are added up, and **Add up all suggested** / **Add up nothing** change every chosen
+   table at once. Nothing is added up until you choose it.
 6. Read the estimate: a range per table and in total. It covers only the chosen tables.
    **Search the chosen tables**, above the list of levels, finds a table by name, by level
-   (for example "full values") or by a control-total column (for example "amount").
+   (for example "full values") or by a column name (for example "amount").
 7. If the databases are only quiet at certain hours, switch on **Only run during certain
    hours** and set the times, for example 22:00 until 05:00. It is off unless you turn it on.
    Outside those hours Dmux waits between tables, and carries on by itself when the hours
    start again. A window that crosses midnight works. The times are the clock of the
    computer running Dmux.
-8. Press **Run**. After a run you can come back here, choose other tables or levels and
+8. To use the same choices again next time, press **Save these choices…** under **Saved
+   choices**. Dmux writes a small JSON file with the chosen tables, their levels, the
+   left-out columns, the control totals and the run window: names only, never a login,
+   password or data. Next time, after Map, press **Open saved choices…** and pick the
+   file. Every table the file names is chosen with its level and columns; every other
+   table is not chosen. If the file names a table or column this database does not have,
+   or asks to leave out a key column, Dmux says so on screen and does not guess. A file
+   that is not a Dmux check choices file, or has been edited into something invalid, is
+   refused with a plain reason.
+9. Press **Run**. After a run you can come back here, choose other tables or levels and
    press **Run** again: it starts a new run with the new choices (the earlier run stays in
    History). If a run is still going, **Run** takes you back to it instead.
 
