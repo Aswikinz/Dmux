@@ -432,7 +432,12 @@ const runStateForFixture = (fixture: string): TableRunState => {
   }
 };
 
-const makeProgress = (runId: string, tableCount: number, fixture: string): RunProgress => {
+const makeProgress = (
+  runId: string,
+  tableCount: number,
+  fixture: string,
+  skipped?: Set<string>,
+): RunProgress => {
   const overallState = fixture === 'cancelled' ? 'cancelled' : 'done';
   const tables: TableProgress[] = [];
   for (let i = 0; i < tableCount; i += 1) {
@@ -453,6 +458,7 @@ const makeProgress = (runId: string, tableCount: number, fixture: string): RunPr
           ? 'done'
           : 'cancelled'
         : 'done';
+    if (skipped?.has(deterministicId('tbl', i))) continue;
     tables.push({
       tableId: deterministicId('tbl', i),
       schemaName: 'demo_bank',
@@ -717,7 +723,7 @@ const makeResults = (fixture: string): Results => {
     optionsRecorded: true,
     warnings: [],
     runFacts: {
-      toolVersion: '1.1.0 (mock)',
+      toolVersion: '1.2.0 (mock)',
       mappingHash: '3f2a9c1be0d84a7f6c55d2e1b9a0c4d87e6f1a2b3c4d5e6f708192a3b4c5d6e7',
       resultsSha256: '9b1de4c07a52f3e86d4b0a1c2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f7',
       oldConnection: mockConnection('9.6.24', 'LATIN1'),
@@ -818,6 +824,9 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     warning: 'A custom check runs with your full permissions. Only run scripts you trust.',
   };
   let currentRunId = 0;
+  // Tables left out of each run (plan ids, and schema.table names), per engine.
+  const skippedByRun = new Map<string, Set<string>>();
+  const skippedNames = new Map<string, string[]>();
   let lastInventory: Inventory | null = null;
   let superuserReason: string | null = null;
   // A mock keychain: the mock never touches a real OS keychain, but it models
@@ -965,12 +974,21 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
     async startRun(definition: RunDefinition): Promise<RunProgress> {
       currentRunId += 1;
       const fixture = options.forcedFixture ?? extractFixture(definition.oldProfile.database);
-      return makeProgress(`run-${fixture}-${currentRunId}`, 40, fixture);
+      const runId = `run-${fixture}-${currentRunId}`;
+      const left = definition.plan.tables.filter((t) => t.included === false);
+      if (left.length > 0) {
+        skippedByRun.set(runId, new Set(left.map((t) => t.tableId)));
+        skippedNames.set(
+          runId,
+          left.map((t) => `${t.schemaName}.${t.tableName}`),
+        );
+      }
+      return makeProgress(runId, 40, fixture, skippedByRun.get(runId));
     },
 
     async pollRun(runId: string): Promise<RunProgress> {
       const fixture = options.forcedFixture ?? extractFixture(runId);
-      return makeProgress(runId, 40, fixture);
+      return makeProgress(runId, 40, fixture, skippedByRun.get(runId));
     },
 
     async setRunPaused(runId: string, paused: boolean): Promise<RunProgress> {
@@ -993,7 +1011,22 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
 
     async getResults(runId: string): Promise<Results> {
       const fixture = options.forcedFixture ?? extractFixture(runId);
-      return fixtures[fixture] ?? fixtures.pass;
+      const base = fixtures[fixture] ?? fixtures.pass;
+      const left = skippedNames.get(runId);
+      if (!left) return base;
+      // Like the real engine: each left-out table is an ignored item with the
+      // app's reason, and counts as ignored in the coverage.
+      return {
+        ...base,
+        ignored: [
+          ...base.ignored,
+          ...left.map((name) => ({ id: `skip-${name}`, name, reason: 'not selected for this run' })),
+        ],
+        coverage: {
+          ...base.coverage,
+          ignoredTables: base.coverage.ignoredTables + left.length,
+        },
+      };
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the demo saves nothing

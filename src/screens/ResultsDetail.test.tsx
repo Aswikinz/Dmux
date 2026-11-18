@@ -157,7 +157,7 @@ describe('What was checked', () => {
     expect(screen.getAllByText(/Encrypted, and the server certificate was verified/)).toHaveLength(2);
     expect(screen.getAllByText(/The login is read-only/)).toHaveLength(2);
     expect(screen.getAllByText('Not a superuser login.')).toHaveLength(2);
-    expect(screen.getByText('1.1.0 (mock)')).toBeDefined();
+    expect(screen.getByText('1.2.0 (mock)')).toBeDefined();
     expect(screen.getByText(/^9b1de4c0/)).toBeDefined();
     expect(screen.getByTestId('coverage-explained').textContent).toContain('compared value by value');
   });

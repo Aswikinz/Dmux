@@ -1,7 +1,7 @@
 {
   "name": "dmux-verify",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Dmux — proves a PostgreSQL migration copied every row and value (Phase 0 skeleton)",
   "type": "module",
   "packageManager": "pnpm@12.21.0",

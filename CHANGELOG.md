@@ -3,6 +3,20 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 1.2.0 (2026-11-18)
+
+Choose exactly which tables a run reads.
+
+### Choose checks
+
+- A new **Tables to check** list, grouped by schema: tick a whole schema, single tables, the
+  tables matching a search, or **Select all**. Nothing is chosen at first, so a run during
+  busy hours reads only the tables you pick. **Run** waits until at least one table is
+  chosen.
+- Tables you leave out are never read. Each is recorded as "not selected for this run" in
+  the results, the coverage line and every report, so nothing is left out silently.
+- Levels, the bulk tools, the totals and the time estimate cover only the chosen tables.
+
 ## 1.1.0 (2026-11-18)
 
 Reports that are easier to read and record when the check ran.
