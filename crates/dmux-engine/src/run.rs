@@ -104,7 +104,28 @@ pub struct RunConfig {
     /// [`definition_hash`]: it only says when the run works, not what it
     /// compares, so a resumed run may use a different window.
     pub run_window: Option<crate::run_window::RunWindow>,
+    /// The user chose specific tables (decision 30): the verdict is about those
+    /// tables only.  Structure differences outside them, tables only in the new
+    /// database and old tables with no partner are reported (one warning, and
+    /// the unpaired ones as ignored items with the reason) but do not decide
+    /// the verdict.  `false` (a full check) compares the whole database.
+    pub only_chosen_tables: bool,
 }
+
+/// The reason the desktop app records for a table the user did not choose.
+pub const NOT_SELECTED_REASON: &str = "not selected for this run";
+
+/// Whether an ignored item was left out because the run checked only chosen
+/// tables (not selected, or not mapped outside the run), as opposed to an
+/// ignore a person decided with their own reason.
+pub fn is_outside_run(reason: &str) -> bool {
+    reason == NOT_SELECTED_REASON || reason == NOT_MAPPED_OUTSIDE_RUN
+}
+
+/// The reason recorded for an old table with no partner in a run that checks
+/// only the chosen tables.
+pub const NOT_MAPPED_OUTSIDE_RUN: &str =
+    "not mapped: no table in the new database; outside this run, which checked only the chosen tables";
 
 /// How often a run waiting for its window looks at the clock and the stop flag.
 const WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -138,6 +159,7 @@ impl RunConfig {
             stats_settle: DEFAULT_STATS_SETTLE,
             control: None,
             run_window: None,
+            only_chosen_tables: false,
         }
     }
 }
@@ -434,6 +456,13 @@ pub fn definition_hash(config: &RunConfig) -> String {
         "mapping_hash": config.mapping.mapping_hash,
         "export_keys": config.export_keys,
     });
+    // Whether the run checks only chosen tables changes what decides its
+    // verdict, so a resumed run cannot switch it.  Added only when set, so full
+    // checks keep their earlier hash.
+    let mut canonical = canonical;
+    if config.only_chosen_tables {
+        canonical["only_chosen_tables"] = serde_json::Value::Bool(true);
+    }
     hex::encode(sha2::Sha256::digest(canonical.to_string().as_bytes()))
 }
 
@@ -566,6 +595,47 @@ pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
         &config.old,
         &config.new,
     ))
+}
+
+/// In a run of chosen tables (decision 30), keep only the structure findings
+/// that belong to the compared tables, and say in one warning what was left
+/// outside: other structure differences, tables only in the new database, and
+/// old tables with no partner (those are also ignored items, with the reason).
+fn scope_to_chosen(results: &mut RunResults, pairs: &[Pair], new_only: usize, unmapped: usize) {
+    let chosen: BTreeSet<String> = pairs.iter().map(Pair::new_path).collect();
+    let belongs = |object: &str| {
+        chosen
+            .iter()
+            .any(|t| object == t || object.starts_with(&format!("{t}.")))
+    };
+    let before = results.structure_findings.len();
+    results.structure_findings.retain(|f| belongs(&f.object));
+    let outside = before - results.structure_findings.len();
+    let mut parts = Vec::new();
+    if outside > 0 {
+        parts.push(format!(
+            "{outside} structure difference{} in other tables and database objects (extensions, functions and so on)",
+            if outside == 1 { "" } else { "s" }
+        ));
+    }
+    if new_only > 0 {
+        parts.push(format!(
+            "{new_only} table{} only in the new database",
+            if new_only == 1 { "" } else { "s" }
+        ));
+    }
+    if unmapped > 0 {
+        parts.push(format!(
+            "{unmapped} old table{} with no partner (listed as ignored)",
+            if unmapped == 1 { "" } else { "s" }
+        ));
+    }
+    if !parts.is_empty() {
+        results.warnings.push(format!(
+            "this run checked only the chosen tables; not part of it: {}. Run a check of every table to review them",
+            parts.join(", ")
+        ));
+    }
 }
 
 /// A UTC instant as RFC 3339 with whole seconds ("2026-11-18T09:14:03Z").
@@ -1278,6 +1348,7 @@ async fn run_live(
     }
     let mut targets = BTreeSet::new();
     let mut pairs: Vec<Pair> = Vec::new();
+    let mut outside_unmapped = 0usize;
     let mut mapped: Vec<(String, String)> = Vec::new();
     for s in &old_inv.schemas {
         for t in &s.tables {
@@ -1292,6 +1363,10 @@ async fn run_live(
             mapped.push((path.clone(), new_path.clone()));
             let level = level_for(config, &path);
             match new_tables.get(&new_path) {
+                None if config.only_chosen_tables => {
+                    b.ignore_table(&path, NOT_MAPPED_OUTSIDE_RUN);
+                    outside_unmapped += 1;
+                }
                 None => b.record(Evidence::new(&path, level, Outcome::MissingOnNew)),
                 Some((_, new_t)) => pairs.push(Pair {
                     path,
@@ -1333,9 +1408,12 @@ async fn run_live(
         }
         pairs = kept;
     }
+    let mut outside_new_only = 0usize;
     for (new_path, _) in new_tables.iter().filter(|(p, _)| !targets.contains(*p)) {
         if let Some(reason) = table_ignores.get(new_path) {
             b.ignore_table(new_path, reason);
+        } else if config.only_chosen_tables {
+            outside_new_only += 1;
         } else {
             b.record(Evidence::new(
                 new_path,
@@ -1343,6 +1421,10 @@ async fn run_live(
                 Outcome::OnlyOnNew,
             ));
         }
+    }
+
+    if config.only_chosen_tables {
+        scope_to_chosen(&mut b.results, &pairs, outside_new_only, outside_unmapped);
     }
 
     checkpoint(config)?;
@@ -2101,6 +2183,65 @@ mod tests {
             password,
             crate::db::TlsMode::VerifyFull,
         ))
+    }
+
+    #[test]
+    fn a_run_of_chosen_tables_keeps_only_their_findings_and_says_what_was_outside() {
+        use crate::results::StructureFinding;
+        let finding = |object: &str, verdict: crate::results::Verdict| StructureFinding {
+            object: object.into(),
+            path: vec![],
+            verdict,
+            message: "differs".into(),
+        };
+        let mut r = RunResults {
+            structure_findings: vec![
+                finding("core.accounts.balance", crate::results::Verdict::Fail),
+                finding("core.accounts", crate::results::Verdict::Warning),
+                finding("core.accountsx.id", crate::results::Verdict::Fail),
+                finding("core.loans.idx", crate::results::Verdict::Fail),
+                finding(
+                    "public.hash_ltree(public.ltree)",
+                    crate::results::Verdict::Warning,
+                ),
+            ],
+            ..RunResults::default()
+        };
+        let pair = Pair {
+            path: "core.accounts".into(),
+            old: ("core".into(), "accounts".into()),
+            new: ("core".into(), "accounts".into()),
+            level: CheckLevel::FullValues,
+            keyed_hint: true,
+            old_size: 0,
+            new_size: 0,
+            old_rows: 0,
+            new_rows: 0,
+        };
+        scope_to_chosen(&mut r, &[pair], 4, 1);
+        let kept: Vec<&str> = r
+            .structure_findings
+            .iter()
+            .map(|f| f.object.as_str())
+            .collect();
+        // Only the chosen table and its columns; "accountsx" is another table.
+        assert_eq!(kept, vec!["core.accounts.balance", "core.accounts"]);
+        assert_eq!(r.warnings.len(), 1);
+        let w = &r.warnings[0];
+        assert!(w.contains("3 structure differences in other tables"), "{w}");
+        assert!(w.contains("4 tables only in the new database"), "{w}");
+        assert!(w.contains("1 old table with no partner"), "{w}");
+    }
+
+    #[test]
+    fn the_scope_is_part_of_the_definition_and_a_full_check_keeps_its_hash() {
+        let mut c = RunConfig::new(live("x"), live("x"));
+        let full = definition_hash(&c);
+        c.only_chosen_tables = true;
+        assert_ne!(definition_hash(&c), full);
+        assert!(is_outside_run(NOT_SELECTED_REASON));
+        assert!(is_outside_run(NOT_MAPPED_OUTSIDE_RUN));
+        assert!(!is_outside_run("archived before the migration"));
     }
 
     #[test]

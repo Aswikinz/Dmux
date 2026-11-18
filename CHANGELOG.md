@@ -3,6 +3,28 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Checks of chosen tables
+
+- When you choose only some tables, the verdict is about those tables. Before, a 2-table
+  run could FAIL on thousands of structure differences, warnings and missing tables
+  elsewhere in the database. Those are now summed up in one warning, tables with no
+  partner outside the run are listed as ignored with the reason, and the coverage line
+  still accounts for every table. A full check (nothing left out) is unchanged.
+- The main report of such a run says how many tables were not part of it, instead of
+  listing thousands of them; **Export tables not in this run** on the Report screen (or
+  `dmux report --not-in-run <file>`) writes that list as a separate PDF.
+
+### Tables that could not be paired
+
+- Choose checks offers only tables that will be compared. Tables with no partner in the
+  other database (and tables you ignored on Map) are no longer listed there.
+- Results and every report show unpaired tables in their own **Not mapped** section,
+  saying whether each is missing from the new database or only in the new one. A table
+  missing from the new database still fails a full check, and the Not mapped section can
+  never be left out of a report.
+
 ## 1.3.1 (2026-11-18)
 
 Data differences first, everywhere, and less noise.

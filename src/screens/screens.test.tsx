@@ -1042,6 +1042,48 @@ describe('ResultsScreen', () => {
     expect(screen.queryByText('archived_balances')).toBeNull();
   });
 
+  it('lists tables that could not be paired in their own panel, not among the failures', async () => {
+    const base = await createMockEngine({ forcedFixture: 'pass' }).getResults('run-pass');
+    const results = {
+      ...base,
+      verdict: 'FAIL' as const,
+      tableResults: [
+        ...base.tableResults,
+        {
+          tableId: 'core.client_notes',
+          schemaName: 'core',
+          tableName: 'client_notes',
+          verdict: 'FAIL' as const,
+          kind: 'not_mapped' as const,
+          level: 'full-values' as const,
+          checked: false,
+          reasons: ['table missing in the new database'],
+        },
+      ],
+      failures: [
+        ...base.failures,
+        {
+          id: 'fail-core.client_notes',
+          tableId: 'core.client_notes',
+          schemaName: 'core',
+          tableName: 'client_notes',
+          level: 'full-values' as const,
+          verdict: 'FAIL' as const,
+          summary: 'table missing in the new database',
+          detail: '',
+          kind: 'not_mapped' as const,
+        },
+      ],
+    };
+    const engine: Engine = { ...createMockEngine(), getResults: async () => results };
+    wrap(<ResultsHarness engine={engine} runId="run-x" />);
+    const panel = await screen.findByTestId('not-mapped');
+    expect(within(panel).getByText('core.client_notes')).toBeDefined();
+    expect(within(panel).getByText('table missing in the new database')).toBeDefined();
+    // Not repeated as a failure card.
+    expect(screen.queryByRole('heading', { name: 'Failures' })).toBeNull();
+  });
+
   it('filters the lists by verdict, says how many are hidden, and never hides the verdict', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'fail' })} runId="run-fail" />);
     await screen.findByText('Failures');

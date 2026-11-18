@@ -272,6 +272,11 @@ fn toolbar(h: &mut String, layout: &Layout) {
             IssueKind::Structure.label(),
             n_kind("structure") + layout.structure_findings.len(),
         ),
+        (
+            "not_mapped",
+            IssueKind::NotMapped.label(),
+            layout.not_mapped.len(),
+        ),
         ("other", IssueKind::Other.label(), n_kind("other")),
         ("warning", "Warnings", warnings),
         ("pass", "Passed tables", n_kind("pass")),
@@ -356,6 +361,8 @@ fn failures(h: &mut String, layout: &Layout) {
     }
     h.push_str("</section>\n");
 
+    not_mapped_section(h, layout);
+
     let structure = of(IssueKind::Structure);
     let other = of(IssueKind::Other);
     h.push_str("<section><h2>Other failures</h2>");
@@ -380,12 +387,37 @@ fn failures(h: &mut String, layout: &Layout) {
     h.push_str("</section>\n");
 }
 
+/// Tables that could not be paired, apart from everything that was compared.
+/// Always in the report: a table missing from the new database is data that
+/// did not arrive.
+fn not_mapped_section(h: &mut String, layout: &Layout) {
+    h.push_str(r#"<section id="not-mapped"><h2>Not mapped</h2>"#);
+    if layout.not_mapped.is_empty() {
+        h.push_str(r#"<p class="muted">None. Every table was paired with a table in the other database.</p>"#);
+    } else {
+        h.push_str(r#"<p class="muted">Tables with no partner in the other database, so nothing could be compared. A table missing from the new database fails the check.</p><ul class="cards">"#);
+        for (table, why) in &layout.not_mapped {
+            let _ = write!(
+                h,
+                r#"<li class="f" data-kind="not_mapped" data-verdict="" data-search="{}"><div class="card-head"><strong>{}</strong><span class="muted">{}</span></div></li>"#,
+                esc(&format!("{table} {why}").to_lowercase()),
+                esc(table),
+                esc(why)
+            );
+        }
+        h.push_str("</ul>");
+        h.push_str(EMPTY_NOTE);
+    }
+    h.push_str("</section>\n");
+}
+
 /// The kind of a table for the filter: data, structure, other, or pass.
 fn kind_key(t: &TableSummary) -> &'static str {
     match t.kind {
         Some(IssueKind::Data) => "data",
         Some(IssueKind::Structure) => "structure",
         Some(IssueKind::Other) => "other",
+        Some(IssueKind::NotMapped) => "not_mapped",
         None => "pass",
     }
 }
@@ -420,8 +452,14 @@ fn options(h: &mut String, layout: &Layout) {
 }
 
 fn tables(h: &mut String, layout: &Layout) {
+    // Tables that were compared; the not-mapped ones have their own section.
+    let listed: Vec<&TableSummary> = layout
+        .tables
+        .iter()
+        .filter(|t| t.kind != Some(IssueKind::NotMapped))
+        .collect();
     h.push_str(r#"<section id="tables"><h2>Per-table results</h2>"#);
-    if layout.tables.is_empty() {
+    if listed.is_empty() {
         h.push_str(r#"<p class="muted">No tables were compared.</p></section>"#);
         return;
     }
@@ -429,7 +467,7 @@ fn tables(h: &mut String, layout: &Layout) {
     // Filters: the verdicts and levels actually present, in a stable order.
     let mut verdicts: Vec<(String, usize)> = Vec::new();
     let mut levels: Vec<String> = Vec::new();
-    for t in &layout.tables {
+    for t in &listed {
         match verdicts.iter_mut().find(|(w, _)| *w == t.verdict_word) {
             Some((_, n)) => *n += 1,
             None => verdicts.push((t.verdict_word.clone(), 1)),
@@ -451,7 +489,7 @@ fn tables(h: &mut String, layout: &Layout) {
         ("other", IssueKind::Other.label()),
         ("pass", "Passed"),
     ] {
-        let n = layout.tables.iter().filter(|t| kind_key(t) == key).count();
+        let n = listed.iter().filter(|t| kind_key(t) == key).count();
         if n > 0 {
             kinds.push((key, label, n));
         }
@@ -488,7 +526,7 @@ fn tables(h: &mut String, layout: &Layout) {
     let _ = write!(
         h,
         r#"<p class="count js-only" id="tcount" aria-live="polite">Showing {n} of {n} tables</p>"#,
-        n = layout.tables.len()
+        n = listed.len()
     );
 
     h.push_str(r#"<div class="scroll"><table class="data" id="tt"><thead><tr>"#);
@@ -511,7 +549,7 @@ fn tables(h: &mut String, layout: &Layout) {
     }
     h.push_str("</tr></thead>\n");
 
-    for t in &layout.tables {
+    for t in &listed {
         let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
         let old_rows = dash(&t.old_rows);
         let new_rows = dash(&t.new_rows);
@@ -682,8 +720,13 @@ fn structure(h: &mut String, layout: &Layout) {
 
 fn lists(h: &mut String, layout: &Layout) {
     h.push_str("<section><h2>Ignored items</h2>");
+    if !layout.not_in_run.is_empty() {
+        let _ = write!(h, "<p>{}</p>", esc(&layout::not_in_run_line(layout)));
+    }
     if layout.ignored_items.is_empty() {
-        h.push_str(r#"<p class="muted">None. Nothing in scope was skipped.</p>"#);
+        if layout.not_in_run.is_empty() {
+            h.push_str(r#"<p class="muted">None. Nothing in scope was skipped.</p>"#);
+        }
     } else {
         h.push_str(r#"<div class="scroll"><table class="data"><thead><tr><th scope="col">Item</th><th scope="col">Reason</th></tr></thead><tbody>"#);
         for i in &layout.ignored_items {

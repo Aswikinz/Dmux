@@ -12,12 +12,14 @@ import { IgnoredItems } from '../components/IgnoredItems';
 import { LEAVE_NOTHING_OUT, ReportContents } from '../components/ReportContents';
 import { FileCode2, FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
+import { isOutsideRun } from '../api/contract';
 import type { ReportFormat, ReportLeaveOut, Results } from '../api/contract';
 
 const FORMAT_LABEL: Record<ReportFormat, string> = {
   pdf: 'PDF',
   excel: 'Excel',
   html: 'HTML',
+  not_in_run: 'Tables not in this run',
 };
 
 interface ReportScreenProps {
@@ -44,6 +46,8 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
     };
   }, [engine]);
   const [leaveOut, setLeaveOut] = useState<ReportLeaveOut>(LEAVE_NOTHING_OUT);
+  // Tables a run of chosen tables left out: listed in their own report.
+  const notInRun = results.ignored.filter((i) => isOutsideRun(i.reason)).length;
   const [exporting, setExporting] = useState<ReportFormat | null>(null);
   const [resultMessage, setResultMessage] = useState<{ text: string; saved: boolean } | null>(
     null,
@@ -135,6 +139,16 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
             <FileCode2 className="h-4 w-4" />
             Export HTML
           </Button>
+          {notInRun > 0 && (
+            <Button
+              onClick={() => exportReport('not_in_run')}
+              disabled={exporting !== null}
+              variant="secondary"
+            >
+              <FileText className="h-4 w-4" />
+              Export tables not in this run ({notInRun})
+            </Button>
+          )}
         </div>
         <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
           Every report shows when the check ran, when the report was made and which databases were

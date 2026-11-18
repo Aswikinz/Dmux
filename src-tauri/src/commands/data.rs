@@ -82,7 +82,7 @@ pub struct StartRunInput {
 
 /// The reason recorded for a table the user did not choose for a run.  Written
 /// by the app, never by the webview, so a report reader can trust it.
-pub const NOT_SELECTED_REASON: &str = "not selected for this run";
+pub use dmux_engine::run::NOT_SELECTED_REASON;
 
 /// Add the user's left-out tables to the mapping as ignored items and re-hash
 /// it.  A path must be a plain `schema.table`; one that names no table is
@@ -335,6 +335,39 @@ fn is_number_type(type_name: &str) -> bool {
     .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))
 }
 
+/// The old tables a run will compare, as `schema.table`: paired with a table in
+/// the new database (through the mapping, exactly as the run pairs them) and not
+/// ignored.  Only these are offered on Choose checks; the run still records the
+/// others (not mapped, or ignored with their reason).
+pub(crate) fn compared_old_tables(
+    old: &[(String, String)],
+    new_tables: &BTreeSet<String>,
+    mapping: Option<&Mapping>,
+) -> BTreeSet<String> {
+    let ignored: BTreeSet<&str> = mapping
+        .map(|m| {
+            m.ignored
+                .iter()
+                .filter(|i| i.path.matches('.').count() == 1)
+                .map(|i| i.path.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    old.iter()
+        .filter_map(|(schema, table)| {
+            let path = format!("{schema}.{table}");
+            if ignored.contains(path.as_str()) {
+                return None;
+            }
+            let (ns, nt) = match mapping {
+                Some(m) => dmux_engine::run::map_table(m, schema, table),
+                None => (schema.clone(), table.clone()),
+            };
+            new_tables.contains(&format!("{ns}.{nt}")).then_some(path)
+        })
+        .collect()
+}
+
 /// Build a check plan from two live databases (PLAN 4.4-4.5).  Every level and
 /// estimate comes from the engine's catalogue and estimate module; nothing is
 /// guessed.
@@ -351,10 +384,13 @@ pub async fn build_check_plan(
     let allow = allow_superuser
         .as_ref()
         .is_some_and(SuperuserOverride::allows);
-    // The mapping is accepted (and treated as untrusted) but the plan's table
-    // list and levels come from the live catalogue, never from the mapping file
-    // (PLAN 4.4 / the "column types from the live catalogue" rule).
-    let _ = mapping;
+    // The mapping is untrusted: validated like an imported file, and used only
+    // to pair tables exactly as the run does.  Levels and column types still
+    // come from the live catalogue (PLAN 4.4).
+    let mapping = match mapping {
+        Some(m) => Some(validate_mapping(&m)?),
+        None => None,
+    };
     let control_totals: BTreeSet<String> = control_total_columns
         .unwrap_or_default()
         .into_iter()
@@ -364,7 +400,30 @@ pub async fn build_check_plan(
     // The new inventory is collected too: the pairs themselves are what the run
     // re-derives from the live catalogue, but a missing new table must still be
     // listed (the run records it as MissingOnNew, never silently dropped).
-    let _new_inv = collect(&new, allow, &state).await?;
+    let new_inv = collect(&new, allow, &state).await?;
+    // Only tables the run will compare are offered.  An old table with no new
+    // partner, or one the mapping ignores, has nothing to choose: the run still
+    // records it (as not mapped, or ignored with its reason), so nothing is
+    // dropped from the results by leaving it off this list.
+    let new_tables: BTreeSet<String> = new_inv
+        .schemas
+        .iter()
+        .flat_map(|s| {
+            s.tables
+                .iter()
+                .map(move |t| format!("{}.{}", s.name, t.name))
+        })
+        .collect();
+    let old_names: Vec<(String, String)> = old_inv
+        .schemas
+        .iter()
+        .flat_map(|s| {
+            s.tables
+                .iter()
+                .map(move |t| (s.name.clone(), t.name.clone()))
+        })
+        .collect();
+    let compared = compared_old_tables(&old_names, &new_tables, mapping.as_ref());
 
     // Old tables (partitions already folded), mapped to their new side.
     let mut plan_tables: Vec<TableCheckDto> = Vec::new();
@@ -372,6 +431,9 @@ pub async fn build_check_plan(
     for schema in &old_inv.schemas {
         for table in &schema.tables {
             let path = format!("{}.{}", schema.name, table.name);
+            if !compared.contains(&path) {
+                continue;
+            }
 
             // Suggested control totals: the confirmed names this table has, or
             // the name heuristic when none are confirmed yet (PLAN 4.4).
@@ -610,6 +672,8 @@ pub(crate) fn start_run_with(
         export_keys,
         resume_store: Some(resume_store.clone()),
         run_window,
+        // Tables were left out: the verdict is about the chosen ones (decision 30).
+        only_chosen_tables: !input.skip_tables.is_empty(),
         ..RunConfig::new(Input::Live(old_profile), Input::Live(new_profile))
     };
 
@@ -1669,6 +1733,57 @@ mod tests {
     }
 
     #[test]
+    fn choose_checks_offers_only_tables_the_run_will_compare() {
+        let old = vec![
+            ("core".to_string(), "accounts".to_string()),
+            ("core".to_string(), "client_notes".to_string()),
+            ("core".to_string(), "archive".to_string()),
+            ("core".to_string(), "old_ledger".to_string()),
+        ];
+        let new: BTreeSet<String> = [
+            "core.accounts",
+            "core.archive",
+            "core.ledger",
+            "core.customer_notes",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // Without a mapping: only same-named pairs.
+        let plain = compared_old_tables(&old, &new, None);
+        assert_eq!(
+            plain.into_iter().collect::<Vec<_>>(),
+            vec!["core.accounts", "core.archive"]
+        );
+        // With a mapping: a rename pairs old_ledger, an ignore drops archive,
+        // and client_notes (no partner) is still not offered.
+        let mut m = Mapping::new();
+        m.ignored.push(dmux_engine::mapping::IgnoredItem {
+            path: "core.archive".into(),
+            reason: "archived before the migration".into(),
+        });
+        m.schema_mappings.insert(
+            "core".into(),
+            dmux_engine::mapping::SchemaMapping {
+                target_schema: "core".into(),
+                table_mappings: BTreeMap::from([(
+                    "old_ledger".to_string(),
+                    dmux_engine::mapping::TableMapping {
+                        target_table: "ledger".into(),
+                        status: dmux_engine::mapping::MappingStatus::Confirmed,
+                        column_mappings: BTreeMap::new(),
+                    },
+                )]),
+            },
+        );
+        let mapped = compared_old_tables(&old, &new, Some(&m));
+        assert_eq!(
+            mapped.into_iter().collect::<Vec<_>>(),
+            vec!["core.accounts", "core.old_ledger"]
+        );
+    }
+
+    #[test]
     fn left_out_tables_become_ignored_items_with_the_apps_reason() {
         let base = Mapping::new();
         let m = with_skipped_tables(
@@ -1761,6 +1876,22 @@ mod tests {
             );
         }
         assert_eq!(r.ignored, input.skip_tables.len());
+        // The verdict is about the chosen table: every structure finding left
+        // belongs to it, and nothing outside it can fail the run.
+        assert!(
+            r.structure_findings
+                .iter()
+                .all(|f| f.object == "demo_bank.account_types"
+                    || f.object.starts_with("demo_bank.account_types.")),
+            "{:?}",
+            r.structure_findings
+        );
+        assert!(r.unmapped.is_empty(), "{:?}", r.unmapped);
+        assert_eq!(
+            r.verdict, r.tables["demo_bank.account_types"].verdict,
+            "warnings: {:?}",
+            r.warnings
+        );
     }
 
     /// How many of Dmux's sessions on `url`'s database are running a

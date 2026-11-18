@@ -464,6 +464,19 @@ impl Builder {
         let mut not_checked: BTreeSet<String> = BTreeSet::new();
         let mut decided: Vec<(TableResult, bool)> = std::mem::take(&mut self.fixed);
         for e in &self.pending {
+            match e.outcome {
+                Outcome::MissingOnNew => {
+                    self.results
+                        .unmapped
+                        .insert(e.table.clone(), crate::results::Unmapped::MissingInNew);
+                }
+                Outcome::OnlyOnNew => {
+                    self.results
+                        .unmapped
+                        .insert(e.table.clone(), crate::results::Unmapped::OnlyInNew);
+                }
+                _ => {}
+            }
             decided.push(decide(e));
             if let Some(f) = facts_of(e) {
                 self.results.table_facts.insert(e.table.clone(), f);
@@ -793,6 +806,31 @@ mod tests {
             .iter()
             .any(|w| w == "structure not compared"));
         assert_eq!(out.exit_code, 2);
+    }
+
+    #[test]
+    fn unpaired_tables_are_recorded_as_not_mapped_and_still_count() {
+        let out = finish(vec![
+            ev(full(true)),
+            Evidence::new("s.gone", CheckLevel::FullValues, Outcome::MissingOnNew),
+            Evidence::new("s.extra", CheckLevel::FullValues, Outcome::OnlyOnNew),
+        ]);
+        let r = &out.results;
+        assert_eq!(
+            r.unmapped.get("s.gone"),
+            Some(&crate::results::Unmapped::MissingInNew)
+        );
+        assert_eq!(
+            r.unmapped.get("s.extra"),
+            Some(&crate::results::Unmapped::OnlyInNew)
+        );
+        // A missing table still fails the run: it is listed apart, never dropped.
+        assert_eq!(r.tables["s.gone"].verdict, Verdict::Fail);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(
+            crate::results::table_issue_kind("s.gone", &r.tables["s.gone"], r),
+            Some(crate::results::IssueKind::NotMapped)
+        );
     }
 
     #[test]

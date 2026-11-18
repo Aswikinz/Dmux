@@ -291,12 +291,13 @@ export type Verdict =
 /** What kind of problem a failure is: the comparison found the data differs,
  *  the structure differs, or something else (a fault, data changing during the
  *  check, an item to review).  Groups what is shown; changes no verdict. */
-export type IssueKind = 'data' | 'structure' | 'other';
+export type IssueKind = 'data' | 'structure' | 'other' | 'not_mapped';
 
 export const ISSUE_KIND_LABELS: Record<IssueKind, string> = {
   data: 'Data differences',
   structure: 'Structure differences',
   other: 'Other reasons',
+  not_mapped: 'Not mapped',
 };
 
 export interface FailureCard {
@@ -515,7 +516,15 @@ export interface AppSettingsUpdate {
 
 /** pdf: the summary to sign; excel: the detail workbook; html: one offline
  *  page with search, filters and sorting. */
-export type ReportFormat = 'pdf' | 'excel' | 'html';
+export type ReportFormat = 'pdf' | 'excel' | 'html' | 'not_in_run';
+
+/** Reasons the app records for tables a run of chosen tables left out. */
+export const OUTSIDE_RUN_REASONS: readonly string[] = [
+  'not selected for this run',
+  'not mapped: no table in the new database; outside this run, which checked only the chosen tables',
+];
+
+export const isOutsideRun = (reason: string): boolean => OUTSIDE_RUN_REASONS.includes(reason);
 
 export interface ReportRequest {
   /** The finished run to report on.  The backend renders from its own copy of

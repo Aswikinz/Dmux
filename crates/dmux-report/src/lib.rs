@@ -396,6 +396,60 @@ mod tests {
         assert!(!text.contains("run warning one"));
     }
 
+    fn pdf_text(bytes: &[u8]) -> String {
+        let mut warnings = Vec::new();
+        printpdf::PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)
+            .unwrap()
+            .extract_text()
+            .into_iter()
+            .map(|p| p.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tables_left_out_of_a_run_go_in_their_own_report_not_on_page_one() {
+        let mut r = mixed_results();
+        r.ignored_items = vec![
+            IgnoredItem {
+                path: "core.archive".into(),
+                reason: "archived before the migration".into(),
+            },
+            IgnoredItem {
+                path: "core.left_out_one".into(),
+                reason: dmux_engine::run::NOT_SELECTED_REASON.into(),
+            },
+            IgnoredItem {
+                path: "core.left_out_two".into(),
+                reason: dmux_engine::run::NOT_MAPPED_OUTSIDE_RUN.into(),
+            },
+        ];
+        let v = verify::verify_results(&finalise(r)).unwrap();
+        let l = build_layout(&v, &ReportOptions::default());
+        assert_eq!(l.ignored_items.len(), 1);
+        assert_eq!(l.not_in_run.len(), 2);
+
+        let main = pdf_text(&pdf::render_bytes(&l, "x").unwrap());
+        assert!(
+            main.contains("core.archive"),
+            "a person's ignore stays on page 1"
+        );
+        assert!(
+            main.contains("2 tables were not part of this run"),
+            "{main}"
+        );
+        assert!(!main.contains("core.left_out_one"));
+        let html = html::render(&l, "x");
+        assert!(html.contains("2 tables were not part of this run"));
+        assert!(!html.contains("core.left_out_one"));
+
+        let separate = pdf_text(&pdf::render_not_in_run_bytes(&l, "x").unwrap());
+        assert!(separate.contains("Tables not in this run"));
+        assert!(separate.contains("core.left_out_one"));
+        assert!(separate.contains("core.left_out_two"));
+        assert!(!separate.contains("core.archive"));
+    }
+
     #[test]
     fn golden_pipeline_writes_all_three_artefacts() {
         let results = golden_results();

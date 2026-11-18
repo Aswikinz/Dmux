@@ -45,8 +45,10 @@ test('nothing is chosen at first; a few tables can be chosen and run on their ow
 
   // Results name every left-out table with the app's reason.
   await cta(page, 'See results').click();
-  await page.getByRole('button', { name: 'Show ignored items' }).click();
-  await expect(page.getByText(/not selected for this run/).first()).toBeVisible();
+  await expect(page.getByTestId('not-in-run')).toContainText('38 tables were not part of this run');
+  // The Report step offers the separate list of those tables.
+  await page.getByRole('main').getByRole('button', { name: 'Report', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Export tables not in this run (38)' })).toBeVisible();
 });
 
 for (const colorScheme of ['light', 'dark'] as const) {

@@ -393,9 +393,12 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
     {
         let ignored = workbook.add_worksheet();
         ignored.set_name("Ignored")?;
+        // The workbook is the full detail: every ignored item, including the
+        // tables that were not part of this run.
         let ignored_rows: Vec<Vec<String>> = layout
             .ignored_items
             .iter()
+            .chain(layout.not_in_run.iter())
             .map(|i| vec![i.path.clone(), i.reason.clone()])
             .collect();
         write_sheet(

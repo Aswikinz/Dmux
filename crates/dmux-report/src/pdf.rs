@@ -159,11 +159,83 @@ impl Face {
 
 /// Build the printpdf document from a layout.
 pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<PdfDocument, PdfError> {
+    build_with(
+        layout,
+        "Dmux migration verification report",
+        |c: &mut Canvas| compose(c, layout, results_sha256),
+    )
+}
+
+/// Write the separate "Tables not in this run" report (decision 30).
+pub fn write_not_in_run_layout(
+    layout: &Layout,
+    results_sha256: &str,
+    path: &Path,
+) -> Result<(), PdfError> {
+    let doc = build_with(layout, "Dmux: tables not in this run", |c: &mut Canvas| {
+        compose_not_in_run(c, layout, results_sha256)
+    })?;
+    crate::write_private(path, &neutralise_volatile(save_bytes(doc)?))?;
+    Ok(())
+}
+
+/// The bytes of the "Tables not in this run" report (the test entry point).
+pub fn render_not_in_run_bytes(layout: &Layout, results_sha256: &str) -> Result<Vec<u8>, PdfError> {
+    let doc = build_with(layout, "Dmux: tables not in this run", |c: &mut Canvas| {
+        compose_not_in_run(c, layout, results_sha256)
+    })?;
+    Ok(neutralise_volatile(save_bytes(doc)?))
+}
+
+/// Every table a run of chosen tables left out, with its reason, tied to the
+/// main report by the run ID and the results SHA-256.
+fn compose_not_in_run(c: &mut Canvas, layout: &Layout, results_sha256: &str) {
+    c.text(
+        MARGIN_X,
+        c.y + 20.0,
+        "Tables not in this run",
+        true,
+        21.0,
+        INK,
+    );
+    c.y += 32.0;
+    c.para(&format!(
+        "This run checked only the chosen tables. The {} below were not part of it, so the run's verdict ({}) says nothing about them. This list belongs with the main report of the same run.",
+        if layout.not_in_run.len() == 1 { "table".to_string() } else { format!("{} tables", layout.not_in_run.len()) },
+        layout::verdict_display(&layout.verdict_word, layout.options_applied, layout.options_recorded),
+    ));
+    c.heading("Run", 60.0);
+    let mut rows = layout::record_rows(layout);
+    rows.push(("Results SHA-256", results_sha256.to_string()));
+    c.key_values(&rows, 120.0, BODY);
+    c.heading("Tables not in this run", 40.0);
+    if layout.not_in_run.is_empty() {
+        c.muted("None. Every table in scope was part of this run.");
+        return;
+    }
+    let rows: Vec<Vec<String>> = layout
+        .not_in_run
+        .iter()
+        .map(|i| vec![i.path.clone(), i.reason.clone()])
+        .collect();
+    c.table(
+        &[col("Table", 2.0, false), col("Reason", 3.0, false)],
+        &rows,
+        None,
+    );
+}
+
+/// A document with the fonts and logo registered, laid out by `compose`.
+fn build_with(
+    layout: &Layout,
+    title: &str,
+    compose: impl FnOnce(&mut Canvas),
+) -> Result<PdfDocument, PdfError> {
     let mut warnings_w = Vec::<PdfFontParseWarning>::new();
     let regular = ParsedFont::from_bytes(FONT_REGULAR, 0, &mut warnings_w).ok_or(PdfError::Font)?;
     let bold = ParsedFont::from_bytes(FONT_BOLD, 0, &mut warnings_w).ok_or(PdfError::Font)?;
 
-    let mut doc = PdfDocument::new("Dmux migration verification report");
+    let mut doc = PdfDocument::new(title);
     // Register fonts and the logo under deterministic IDs (the `new()`
     // constructors are random, which would leak into every content stream and
     // defeat the byte-determinism the golden/hash tests rely on).
@@ -196,7 +268,7 @@ pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<PdfDocume
     );
 
     let mut c = Canvas::new(&reg, &bld, logo);
-    compose(&mut c, layout, results_sha256);
+    compose(&mut c);
     let pages = c.finish(&layout.run_id, layout.generated_at.as_deref());
     doc.with_pages(pages);
     Ok(doc)
@@ -804,6 +876,28 @@ fn failure_card(c: &mut Canvas, t: &TableSummary) {
     c.y += 6.0;
 }
 
+/// Tables that could not be paired, apart from everything that was compared.
+/// Always in the report: a table missing from the new database is data that
+/// did not arrive.
+fn not_mapped_section(c: &mut Canvas, layout: &Layout) {
+    c.heading("Not mapped", 40.0);
+    if layout.not_mapped.is_empty() {
+        c.muted("None. Every table was paired with a table in the other database.");
+        return;
+    }
+    c.muted("Tables with no partner in the other database, so nothing could be compared. A table missing from the new database fails the check.");
+    let rows: Vec<Vec<String>> = layout
+        .not_mapped
+        .iter()
+        .map(|(t, why)| vec![t.clone(), why.clone()])
+        .collect();
+    c.table(
+        &[col("Table", 2.0, false), col("Why", 2.0, false)],
+        &rows,
+        None,
+    );
+}
+
 /// Data differences first (always in the report), then every other failure,
 /// grouped by kind.
 fn needs_attention(c: &mut Canvas, layout: &Layout) {
@@ -820,6 +914,8 @@ fn needs_attention(c: &mut Canvas, layout: &Layout) {
             failure_card(c, t);
         }
     }
+
+    not_mapped_section(c, layout);
 
     let structure = of(IssueKind::Structure);
     let other = of(IssueKind::Other);
@@ -858,8 +954,13 @@ fn page_one_lists(c: &mut Canvas, layout: &Layout) {
     }
 
     c.heading("Ignored items", 30.0);
+    if !layout.not_in_run.is_empty() {
+        c.para(&layout::not_in_run_line(layout));
+    }
     if layout.ignored_items.is_empty() {
-        c.muted("None. Nothing in scope was skipped.");
+        if layout.not_in_run.is_empty() {
+            c.muted("None. Nothing in scope was skipped.");
+        }
     } else {
         let rows: Vec<Vec<String>> = layout
             .ignored_items
@@ -923,13 +1024,18 @@ fn page_one_lists(c: &mut Canvas, layout: &Layout) {
 
 fn all_tables(c: &mut Canvas, layout: &Layout) {
     c.heading("Per-table results", 50.0);
-    if layout.tables.is_empty() {
+    // Tables that were compared; the not-mapped ones have their own section.
+    let listed: Vec<&TableSummary> = layout
+        .tables
+        .iter()
+        .filter(|t| t.kind != Some(IssueKind::NotMapped))
+        .collect();
+    if listed.is_empty() {
         c.muted("No tables were compared.");
         return;
     }
     let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
-    let rows: Vec<Vec<String>> = layout
-        .tables
+    let rows: Vec<Vec<String>> = listed
         .iter()
         .map(|t| {
             vec![
@@ -966,6 +1072,7 @@ fn table_details(c: &mut Canvas, layout: &Layout) {
     let detailed: Vec<&TableSummary> = layout
         .tables
         .iter()
+        .filter(|t| t.kind != Some(IssueKind::NotMapped))
         .filter(|t| {
             t.verdict_word != "PASS"
                 || !t.changed_columns.is_empty()

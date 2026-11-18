@@ -106,7 +106,9 @@ impl LeaveOut {
     /// Whether a table (by its kind and verdict word) stays in the report.
     fn keeps_table(&self, kind: Option<IssueKind>, verdict_word: &str) -> bool {
         match kind {
-            Some(IssueKind::Data) => true,
+            // A table missing from the new database is data that did not
+            // arrive: like data differences, never left out.
+            Some(IssueKind::Data | IssueKind::NotMapped) => true,
             None => !self.passing,
             Some(k) => {
                 let by_kind = match k {
@@ -439,7 +441,13 @@ pub struct Layout {
     /// Tables in scope that were neither checked at any level nor ignored
     /// (missing on one side, only in the new database, unreadable).
     pub not_checked: usize,
+    /// Items a person decided to ignore, each with its reason.
     pub ignored_items: Vec<Ignored>,
+    /// Tables left out because the run checked only chosen tables (not
+    /// selected, or not mapped outside the run).  Listed in their own report
+    /// ("Tables not in this run"), not on the main report's first page, which
+    /// names how many there are (decision 30).
+    pub not_in_run: Vec<Ignored>,
     pub warnings: Vec<String>,
     pub changed_during_check: Vec<String>,
     pub wal_start_lsn: Option<String>,
@@ -482,6 +490,9 @@ pub struct Layout {
     /// What was left out of this report at the user's choice, in plain words
     /// ("23 structure findings").  Empty when nothing was left out.
     pub omitted: Vec<String>,
+    /// Tables that could not be paired, with why, for their own section:
+    /// ("core.client_notes", "missing from the new database").
+    pub not_mapped: Vec<(String, String)>,
     /// Tables with data differences, and tables that failed for any other
     /// reason, counted before anything was left out.
     pub data_issue_tables: usize,
@@ -511,9 +522,10 @@ pub fn build(
     let kind_of = |name: &String| table_issue_kind(name, &results.tables[name], results);
     let rank = |k: Option<IssueKind>| match k {
         Some(IssueKind::Data) => 0,
-        Some(IssueKind::Structure) => 1,
-        Some(IssueKind::Other) => 2,
-        None => 3,
+        Some(IssueKind::NotMapped) => 1,
+        Some(IssueKind::Structure) => 2,
+        Some(IssueKind::Other) => 3,
+        None => 4,
     };
     let mut names: Vec<&String> = results.tables.keys().collect();
     names.sort_by(|a, b| {
@@ -632,6 +644,16 @@ pub fn build(
         ignored_items: results
             .ignored_items
             .iter()
+            .filter(|i| !dmux_engine::run::is_outside_run(&i.reason))
+            .map(|i| Ignored {
+                path: sanitize(&i.path),
+                reason: sanitize(&i.reason),
+            })
+            .collect(),
+        not_in_run: results
+            .ignored_items
+            .iter()
+            .filter(|i| dmux_engine::run::is_outside_run(&i.reason))
             .map(|i| Ignored {
                 path: sanitize(&i.path),
                 reason: sanitize(&i.reason),
@@ -734,8 +756,24 @@ pub fn build(
         // Last, so it holds what the fields above left out.
         omitted,
         data_issue_tables,
+        not_mapped: results
+            .unmapped
+            .iter()
+            .map(|(table, why)| (sanitize(table), why.label().to_string()))
+            .collect(),
         other_issue_tables,
     }
+}
+
+/// The main report's one line about the tables left out of a run of chosen
+/// tables; they are listed in their own report.
+pub fn not_in_run_line(layout: &Layout) -> String {
+    let n = layout.not_in_run.len();
+    format!(
+        "{} not part of this run, which checked only the chosen tables. {} listed, each with its reason, in the separate report \"Tables not in this run\" and in the Excel workbook.",
+        if n == 1 { "1 table was".to_string() } else { format!("{n} tables were") },
+        if n == 1 { "It is" } else { "They are" }
+    )
 }
 
 /// The compliance record as (label, value) rows, in reading order.  Every

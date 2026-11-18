@@ -405,6 +405,32 @@ pub struct RunResults {
     pub old_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_source: Option<String>,
+    /// Tables that could not be paired, keyed like `tables`: missing from the
+    /// new database, or found only in the new one.  They stay in `tables` with
+    /// their verdict (a missing table is a FAIL); this only says why, so they
+    /// can be listed apart.  Not serialised when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unmapped: BTreeMap<String, Unmapped>,
+}
+
+/// Why a table could not be paired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unmapped {
+    /// An old table with no table in the new database: its rows did not arrive.
+    MissingInNew,
+    /// A table only the new database has: there are no old rows to check.
+    OnlyInNew,
+}
+
+impl Unmapped {
+    /// The reason in plain words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Unmapped::MissingInNew => "missing from the new database",
+            Unmapped::OnlyInNew => "only in the new database",
+        }
+    }
 }
 
 impl Default for RunResults {
@@ -445,6 +471,7 @@ impl Default for RunResults {
             finished_at: None,
             old_source: None,
             new_source: None,
+            unmapped: BTreeMap::new(),
         }
     }
 }
@@ -480,6 +507,9 @@ pub enum IssueKind {
     /// Anything else: a tool fault, data changing during the check, or an item
     /// that needs a person's review.
     Other,
+    /// The table could not be paired: missing from the new database, or only in
+    /// the new one (see [`RunResults::unmapped`]).
+    NotMapped,
 }
 
 impl IssueKind {
@@ -489,6 +519,7 @@ impl IssueKind {
             IssueKind::Data => "Data differences",
             IssueKind::Structure => "Structure differences",
             IssueKind::Other => "Other reasons",
+            IssueKind::NotMapped => "Not mapped",
         }
     }
 }
@@ -502,6 +533,9 @@ impl IssueKind {
 pub fn table_issue_kind(path: &str, t: &TableResult, results: &RunResults) -> Option<IssueKind> {
     if t.verdict == Verdict::Pass {
         return None;
+    }
+    if results.unmapped.contains_key(path) {
+        return Some(IssueKind::NotMapped);
     }
     if matches!(t.verdict, Verdict::ToolFault | Verdict::ChangedDuringCheck) {
         return Some(IssueKind::Other);

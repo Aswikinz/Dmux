@@ -1157,7 +1157,9 @@ function translateConnection(c: RawConnectionInfo): ConnectionFact {
 
 /** The engine's issue kind, or undefined when it did not say. */
 export function mapIssueKind(kind: string | null | undefined): IssueKind | undefined {
-  return kind === 'data' || kind === 'structure' || kind === 'other' ? kind : undefined;
+  return kind === 'data' || kind === 'structure' || kind === 'other' || kind === 'not_mapped'
+    ? kind
+    : undefined;
 }
 
 function translateResults(raw: RawResults): Results {

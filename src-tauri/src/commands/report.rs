@@ -31,6 +31,8 @@ pub enum ReportFormat {
     Excel,
     /// The interactive HTML report: one offline file with filters and sorting.
     Html,
+    /// The separate PDF of tables a run of chosen tables left out.
+    NotInRun,
 }
 
 impl ReportFormat {
@@ -39,6 +41,7 @@ impl ReportFormat {
             ReportFormat::Pdf => "pdf",
             ReportFormat::Excel => "xlsx",
             ReportFormat::Html => "html",
+            ReportFormat::NotInRun => "pdf",
         }
     }
 
@@ -47,6 +50,7 @@ impl ReportFormat {
             ReportFormat::Pdf => "PDF report",
             ReportFormat::Excel => "Excel workbook",
             ReportFormat::Html => "HTML report",
+            ReportFormat::NotInRun => "PDF list of tables not in this run",
         }
     }
 }
@@ -206,6 +210,8 @@ pub(crate) fn render_report(
             .map_err(|e| failed(e.to_string())),
         ReportFormat::Html => dmux_report::html::write_html_layout(&layout, &sha256, path)
             .map_err(|e| failed(e.to_string())),
+        ReportFormat::NotInRun => dmux_report::pdf::write_not_in_run_layout(&layout, &sha256, path)
+            .map_err(|e| failed(e.to_string())),
     }
 }
 
@@ -217,7 +223,12 @@ fn suggested_name(run_id: &str, format: ReportFormat) -> String {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
     let stem = if safe { run_id } else { "report" };
-    format!("dmux-{stem}.{}", format.extension())
+    let suffix = if format == ReportFormat::NotInRun {
+        "-not-in-run"
+    } else {
+        ""
+    };
+    format!("dmux-{stem}{suffix}.{}", format.extension())
 }
 
 /// Export the current run's report as PDF, Excel or HTML through a native save
@@ -359,7 +370,12 @@ mod tests {
         let s = state();
         let id = finished(&s, Ok(results(Verdict::Pass)));
         assert_eq!(s.runs.phase(&id), Some(RunPhase::Done));
-        for format in [ReportFormat::Pdf, ReportFormat::Excel, ReportFormat::Html] {
+        for format in [
+            ReportFormat::Pdf,
+            ReportFormat::Excel,
+            ReportFormat::Html,
+            ReportFormat::NotInRun,
+        ] {
             let path = tmp(&format!("r.{}", format.extension()));
             render_report(&id, format, false, &s, &path).expect("render");
             let bytes = std::fs::read(&path).unwrap();
@@ -367,6 +383,7 @@ mod tests {
                 ReportFormat::Pdf => assert!(bytes.starts_with(b"%PDF")),
                 ReportFormat::Excel => assert!(bytes.starts_with(b"PK")),
                 ReportFormat::Html => assert!(bytes.starts_with(b"<!doctype html>")),
+                ReportFormat::NotInRun => assert!(bytes.starts_with(b"%PDF")),
             }
         }
         // The layout comes from the engine-held results.
@@ -381,7 +398,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let s = state();
         let id = finished(&s, Ok(results(Verdict::Fail)));
-        for format in [ReportFormat::Pdf, ReportFormat::Excel, ReportFormat::Html] {
+        for format in [
+            ReportFormat::Pdf,
+            ReportFormat::Excel,
+            ReportFormat::Html,
+            ReportFormat::NotInRun,
+        ] {
             let path = tmp(&format!("m.{}", format.extension()));
             render_report(&id, format, false, &s, &path).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

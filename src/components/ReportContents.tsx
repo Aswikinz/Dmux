@@ -19,6 +19,7 @@ export function reportPartCounts(results: Results) {
     other: kinds.other ?? 0,
     warnings: items.filter((i) => i.verdict === 'WARNING').length + results.warnings.length,
     passing: results.tableResults.filter((t) => t.verdict === 'PASS').length,
+    notMapped: results.tableResults.filter((t) => t.kind === 'not_mapped').length,
   };
 }
 
@@ -56,6 +57,15 @@ export function ReportContents({ results, leaveOut, onChange }: ReportContentsPr
             Data differences ({n.data})
             <span className="font-normal text-slate-500 dark:text-slate-400">
               — always included, first
+            </span>
+          </label>
+        </li>
+        <li>
+          <label className="flex items-center gap-2 font-medium text-slate-800 dark:text-slate-100">
+            <input type="checkbox" className="h-4 w-4 accent-accent-600" checked disabled />
+            Not mapped ({n.notMapped})
+            <span className="font-normal text-slate-500 dark:text-slate-400">
+              — always included: a table missing from the new database is data that did not arrive
             </span>
           </label>
         </li>

@@ -233,10 +233,16 @@ interface ResultItem {
 
 export function resultItems(results: Results): ResultItem[] {
   const byKey = new Map<string, ResultItem>();
+  // Tables that could not be paired are listed in their own panel.
+  const unmapped = new Set(
+    results.tableResults.filter((t) => t.kind === 'not_mapped').map((t) => t.tableId),
+  );
   for (const t of results.tableResults) {
+    if (unmapped.has(t.tableId)) continue;
     byKey.set(`t:${t.tableId}`, { verdict: t.verdict, kind: t.kind });
   }
   for (const c of results.failures) {
+    if (c.kind === 'not_mapped' || unmapped.has(c.tableId)) continue;
     const row = byKey.get(`t:${c.tableId}`);
     if (row && row.verdict === c.verdict) {
       row.kind ??= c.kind;
@@ -270,7 +276,36 @@ const isHidden = (
   kinds: Set<IssueKind>,
 ) => verdicts.has(item.verdict) || (item.kind !== undefined && kinds.has(item.kind));
 
-const KIND_RANK: Record<IssueKind, number> = { data: 0, structure: 1, other: 2 };
+const KIND_RANK: Record<IssueKind, number> = { data: 0, not_mapped: 1, structure: 2, other: 3 };
+
+/** Tables that could not be paired, listed apart from everything compared.
+ *  A table missing from the new database fails the check. */
+function NotMappedPanel({ results }: { results: Results }) {
+  const rows = results.tableResults.filter((t) => t.kind === 'not_mapped');
+  if (rows.length === 0) return null;
+  return (
+    <Panel>
+      <h3 className="mb-1 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">
+        Not mapped
+      </h3>
+      <p className="mb-3 text-sm text-slate-600 dark:text-slate-300">
+        These tables have no partner in the other database, so nothing could be compared. A table
+        missing from the new database fails the check.
+      </p>
+      <ul className="divide-y divide-black/[0.06] rounded-xl border border-black/[0.08] dark:divide-white/[0.06] dark:border-white/10" data-testid="not-mapped">
+        {rows.map((t) => (
+          <li key={t.tableId} className="flex flex-wrap items-center gap-3 px-4 py-2.5 text-sm">
+            <span className="font-semibold text-ink dark:text-slate-100">
+              {t.schemaName}.{t.tableName}
+            </span>
+            <span className="text-slate-600 dark:text-slate-300">{t.reasons?.[0] ?? ''}</span>
+            <StatusBadge status={t.verdict} className="ml-auto" />
+          </li>
+        ))}
+      </ul>
+    </Panel>
+  );
+}
 
 export function ResultsScreen({
   engine,
@@ -386,6 +421,10 @@ export function ResultsScreen({
     );
   }
 
+  // Failures among the tables that were compared; not-mapped tables have
+  // their own panel.
+  const comparedFailures = results.failures.filter((c) => c.kind !== 'not_mapped');
+
   return (
     <div className="space-y-6">
       <ScreenHeader title="Results" subtitle="The verdict comes first, then anything that needs your attention." />
@@ -403,6 +442,8 @@ export function ResultsScreen({
           recorded reason, and no table changed during the check.
         </p>
       </Panel>
+
+      <NotMappedPanel results={results} />
 
       {results.customChecks && <CustomChecksPanel checks={results.customChecks} />}
 
@@ -427,19 +468,20 @@ export function ResultsScreen({
         ) : null;
       })()}
 
-      {results.failures.length > 0 && (
+      {comparedFailures.length > 0 && (
         <Panel>
           <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">Failures</h3>
-          {results.failures.every((card) =>
+          {comparedFailures.every((card) =>
             isHidden({ ...card, kind: card.kind ?? 'other' }, hiddenVerdicts, hiddenKinds),
           ) && (
             <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="failures-all-hidden">
-              All {results.failures.length === 1 ? 'of them is' : `${results.failures.length} of them are`}{' '}
+              All {comparedFailures.length === 1 ? 'of them is' : `${comparedFailures.length} of them are`}{' '}
               hidden by the filter above.
             </p>
           )}
           <div className="space-y-4">
             {results.failures
+              .filter((card) => card.kind !== 'not_mapped')
               .filter(
                 (card) => !isHidden({ ...card, kind: card.kind ?? 'other' }, hiddenVerdicts, hiddenKinds),
               )
@@ -514,7 +556,9 @@ export function ResultsScreen({
       <Panel>
         <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">All tables</h3>
         <DataTable
-          data={results.tableResults.filter((t) => !isHidden(t, hiddenVerdicts, hiddenKinds))}
+          data={results.tableResults.filter(
+            (t) => t.kind !== 'not_mapped' && !isHidden(t, hiddenVerdicts, hiddenKinds),
+          )}
           columns={tableColumns}
           filterPlaceholder="Filter by table name"
         />

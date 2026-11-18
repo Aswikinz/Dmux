@@ -118,8 +118,9 @@ describe('App full flow', () => {
       expect(rows).toBe(4);
       // Its results name the 36 tables left out, with the app's reason.
       fireEvent.click(cta('See results'));
-      fireEvent.click(await screen.findByRole('button', { name: 'Show ignored items' }));
-      expect(screen.getAllByText(/not selected for this run/).length).toBe(36);
+      expect((await screen.findByTestId('not-in-run')).textContent).toMatch(
+        /36 tables were not part of this run/,
+      );
     } finally {
       cleanup();
     }

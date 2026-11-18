@@ -284,6 +284,9 @@ struct ReportArgs {
     /// Write the interactive HTML report (search, filters, sorting) to this path.
     #[arg(long, value_name = "FILE")]
     html: Option<PathBuf>,
+    /// Write the separate PDF listing the tables a run of chosen tables left out.
+    #[arg(long, value_name = "FILE")]
+    not_in_run: Option<PathBuf>,
     /// Include key / covered-column names in the detail (default: off).
     #[arg(long)]
     include_keys: bool,
@@ -649,8 +652,22 @@ fn run_report(args: ReportArgs) -> ExitCode {
         }
     }
 
-    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() && args.html.is_none() {
-        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx, --html and/or --log)");
+    if let Some(p) = args.not_in_run.as_deref() {
+        if let Err(e) = dmux_report::pdf::write_not_in_run_layout(&layout, &sha256, p) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+
+    if args.pdf.is_none()
+        && args.xlsx.is_none()
+        && args.log.is_none()
+        && args.html.is_none()
+        && args.not_in_run.is_none()
+    {
+        eprintln!(
+            "dmux report: nothing to do (pass --pdf, --xlsx, --html, --not-in-run and/or --log)"
+        );
         return ExitCode::from(EXIT_FAIL);
     }
 
@@ -1235,6 +1252,8 @@ fn load_definition(path: &str) -> Result<RunConfig, String> {
         stats_settle,
         control: None,
         run_window,
+        // A definition file has no table selection: always a full check.
+        only_chosen_tables: false,
     })
 }
 

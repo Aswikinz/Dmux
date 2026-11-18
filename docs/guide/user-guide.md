@@ -311,7 +311,10 @@ and see how long that will take before you start.
 
 **Steps.**
 
-1. Under **Tables to check**, choose the tables this run reads. Nothing is chosen at first.
+1. Under **Tables to check**, choose the tables this run reads. Only tables that can be
+   compared are listed: a table with no partner in the other database, or one you ignored
+   on Map, is not offered (Results shows unpaired tables under **Not mapped**). Nothing is
+   chosen at first.
    Tick a schema's box to choose all of its tables, open a schema with the arrow to tick
    single tables, type in **Find a schema or table** and press **Select N matching**, or
    press **Select all**. **Clear all** starts again. Use **Search schemas and tables** to
@@ -319,7 +322,11 @@ and see how long that will take before you start.
    shows a dash in its box. During busy hours, choose only the few tables you need: Dmux
    never reads a table you leave out. Each left-out table is listed in the results and on
    the first page of every report as "not selected for this run", and it counts as ignored
-   in the coverage line, so a reader always sees what this run did not check. **Run** stays
+   in the coverage line, so a reader always sees what this run did not check.
+   When you leave tables out, the run is about the tables you chose: its verdict is decided
+   by them alone. Structure differences in other tables and database objects, and tables
+   with no partner, are summed up in one warning instead of failing the run. Choose
+   **Select all** for a full check of the whole database. **Run** stays
    unavailable until at least one table is chosen.
 2. Pick a preset: full values for everything; counts for everything with full values for
    selected tables; or structure only. Changing a table by hand switches the preset to
@@ -421,6 +428,9 @@ table being written to by someone else shows "changed during check", never a tic
 1. Read the verdict and the coverage line at the top. The ignored items are counted there;
    press **Show ignored items** to list each one with its reason.
 2. Read the failure cards: each says what is wrong, how big the gap is and what to do next.
+   Tables with no partner in the other database are listed apart, under **Not mapped**,
+   with whether each is missing from the new database or only in the new one. A table
+   missing from the new database fails a full check.
    Each card also says what kind of problem it is, and **data differences come first**:
    - *Data differences*: rows or values differ (missing, extra or changed rows, different
      row counts or control totals).
@@ -522,6 +532,9 @@ value printed on the signed PDF report.
    `dmux report --leave-out structure,other,warnings,passing` (any of them).
 4. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or
    **Export HTML** for a web page you can search and filter. Export as many as you need.
+   After a run of chosen tables, the main report says how many tables were not part of it;
+   **Export tables not in this run** saves the list of them, each with its reason, as a
+   separate PDF.
 5. A save dialog from your operating system opens. Choose where to save and confirm.
 6. The screen then shows the path the file was saved to. If you close the dialog, it says
    the export was cancelled and nothing was saved. If something fails, it says so in plain
