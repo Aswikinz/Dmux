@@ -314,8 +314,12 @@ describe('Settings: run defaults, reports and about', () => {
   it('refuses a scan limit below 1 without calling the backend', async () => {
     const engine = createMockEngine();
     const update = vi.spyOn(engine, 'updateSettings');
+    const loaded = await engine.getSettings();
     wrap(<SettingsScreen engine={engine} />);
-    const field = await screen.findByLabelText(/new database/);
+    const field = (await screen.findByLabelText(/new database/)) as HTMLInputElement;
+    // Type only once the saved settings are on screen: loading them later
+    // would put the saved value back over what was typed.
+    await waitFor(() => expect(field.value).toBe(String(loaded.newParallelism)));
     fireEvent.change(field, { target: { value: '0' } });
     fireEvent.blur(field);
     expect(update).not.toHaveBeenCalled();
