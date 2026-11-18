@@ -53,10 +53,12 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// bloating the report).
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 
-/// Upper bound on the results payload we are willing to hand a hook.  A run's
-/// results are small (counts, hashes, names), so anything at or over this size
-/// is suspicious; we refuse to run the hook rather than send truncated JSON.
-pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// Upper bound on the results payload we are willing to hand a hook.  The
+/// payload is the run's results (counts, hashes, names, per-table facts), which
+/// for a very large database runs to hundreds of megabytes, so the bound was
+/// raised from 1 MiB (decision 29).  Over it, the hook is not run and the run
+/// says so; truncated JSON is never sent.
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// One finding returned by a hook — the exact schema PLAN.md 4.9 spells out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +121,9 @@ pub struct HookSpec {
     pub interpreter: Option<PathBuf>,
     /// Time limit (default [`DEFAULT_TIMEOUT`]).
     pub timeout: Duration,
+    /// The largest results payload this hook is given (default
+    /// [`MAX_INPUT_BYTES`]); over it the hook is not run.
+    pub max_input_bytes: usize,
 }
 
 impl Default for HookSpec {
@@ -127,6 +132,7 @@ impl Default for HookSpec {
             script: PathBuf::new(),
             interpreter: None,
             timeout: DEFAULT_TIMEOUT,
+            max_input_bytes: MAX_INPUT_BYTES,
         }
     }
 }
@@ -458,12 +464,12 @@ pub fn run_hook(spec: &HookSpec, results: &serde_json::Value) -> Result<HookResu
 
     // Refuse a payload at or over the input cap before spawning anything: we
     // never send truncated JSON to a script.
-    if payload.len() >= MAX_INPUT_BYTES {
+    if payload.len() >= spec.max_input_bytes {
         warnings.push(format!(
             "hook {} not run: results payload ({} bytes) exceeds the {}-byte input limit",
             spec.script.display(),
             payload.len(),
-            MAX_INPUT_BYTES
+            spec.max_input_bytes
         ));
         return Ok(HookResult {
             script_hash,

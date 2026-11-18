@@ -26,7 +26,10 @@ const EXIT_FAIL: u8 = 1;
 const EXIT_WARN: u8 = 2;
 
 /// Upper bound on an inventory JSON file `dmux diff` will read (audit L2).
-const MAX_INVENTORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Raised from 64 MiB for very large databases (decision 29): an inventory of
+/// tens of thousands of tables, each with its columns, indexes and
+/// constraints, runs to hundreds of megabytes.
+const MAX_INVENTORY_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The honest hook warning (decision 23: hooks are not sandboxed in v1.0).
 const HOOK_WARNING: &str =
@@ -779,6 +782,7 @@ fn discover_hook_specs(
             script: f,
             interpreter: interpreter.map(PathBuf::from),
             timeout: std::time::Duration::from_secs(timeout_secs),
+            ..HookSpec::default()
         });
     }
     Ok(specs)

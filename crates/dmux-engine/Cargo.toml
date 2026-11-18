@@ -21,7 +21,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 webpki-roots = "0.26"
 thiserror = "2.0.21"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+# raw_value: a large capture is read table by table (fingerprint_file.rs).
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 sha2 = "0.11.1"
 hex = "0.4.3"
 # App-side hashing when a server cannot run md5() (FIPS mode, PLAN 2.2): the same

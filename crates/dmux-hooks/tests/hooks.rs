@@ -246,13 +246,18 @@ fn oversized_input_is_refused_not_truncated() {
         return;
     }
     let script = fixtures().join("valid_hook.py");
-    let spec = HookSpec::new(&script);
+    // Checked against a small limit so the test stays fast; the real limit is
+    // pinned below.
+    let spec = HookSpec {
+        max_input_bytes: 64 * 1024,
+        ..HookSpec::new(&script)
+    };
 
-    // A payload over the 1 MiB input cap: the runner must refuse to run the
-    // hook and record a warning, never send truncated JSON.
+    // A payload over the input cap: the runner must refuse to run the hook and
+    // record a warning, never send truncated JSON.
     let huge = serde_json::json!({
         "run_id": "run",
-        "pad": "x".repeat(dmux_hooks::MAX_INPUT_BYTES + 1),
+        "pad": "x".repeat(64 * 1024 + 1),
     });
 
     let result = run_hook(&spec, &huge).expect("run_hook returns");
@@ -260,6 +265,39 @@ fn oversized_input_is_refused_not_truncated() {
     assert!(
         result.warnings.iter().any(|w| w.contains("input limit")),
         "oversized input should be refused with a warning, got {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn a_large_databases_results_reach_the_hook() {
+    // Raised from 1 MiB for very large databases (decision 29).
+    assert_eq!(dmux_hooks::MAX_INPUT_BYTES, 1024 * 1024 * 1024);
+    assert_eq!(
+        HookSpec::default().max_input_bytes,
+        dmux_hooks::MAX_INPUT_BYTES
+    );
+    if !python_available() {
+        require_python();
+        return;
+    }
+    // 2 MiB of results: refused under the old limit, run now.
+    let spec = HookSpec::new(fixtures().join("valid_hook.py"));
+    let big = serde_json::json!({
+        "run_id": "run",
+        "pad": "x".repeat(2 * 1024 * 1024),
+        "tables": {}
+    });
+    let result = run_hook(&spec, &big).expect("run_hook returns");
+    assert!(
+        !result.warnings.iter().any(|w| w.contains("input limit")),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.findings.len(),
+        2,
+        "the hook ran: {:?}",
         result.warnings
     );
 }

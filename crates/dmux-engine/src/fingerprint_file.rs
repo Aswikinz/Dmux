@@ -42,10 +42,16 @@ use crate::results::CheckLevel;
 /// `options` and `control_columns` to every table.
 pub const FINGERPRINT_VERSION: u32 = 3;
 
-/// Maximum accepted fingerprint file size (uncompressed), in bytes (audit L2).
-/// A capture holds only bucket summaries and the inventory, so even thousands
-/// of large tables stay well below this.
-pub const MAX_FINGERPRINT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum accepted fingerprint file size (uncompressed), in bytes.
+///
+/// A table of more than about 40,000 rows holds 4,096 bucket summaries (about
+/// 370 KB of JSON), and the largest tables hold up to 16 times more per extra
+/// bucket digit, so a capture of a large core banking database runs to
+/// gigabytes.  The owner raised the limit from 64 MiB (audit L2) to 8 GiB for
+/// very large databases (decision 29).  Reading is built for that size: the
+/// text is held once, each table is checked on its own, and the hash is
+/// streamed, so peak memory is about twice the file (see [`FingerprintFile::from_bytes`]).
+pub const MAX_FINGERPRINT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// One 32-bit slice of an md5, the most a single row adds to a bucket sum.
 const SLICE_MAX: u128 = 0xffff_ffff;
@@ -345,10 +351,44 @@ impl<'a> From<&'a FingerprintFile> for Hashable<'a> {
 }
 
 /// Canonical JSON (compact, struct field order) of every field except `sha256`,
-/// then SHA-256 of that byte string.
+/// then SHA-256 of that byte string.  The JSON is streamed into the hasher, so
+/// a large capture is never held a second time as text; the bytes hashed are
+/// exactly those `serde_json::to_string` would produce.
 fn compute_sha256(f: &FingerprintFile) -> String {
-    let canonical = serde_json::to_string(&Hashable::from(f)).unwrap_or_default();
-    hex::encode(Sha256::digest(canonical.as_bytes()))
+    let mut hasher = HashWriter(Sha256::new());
+    if serde_json::to_writer(&mut hasher, &Hashable::from(f)).is_err() {
+        return String::new();
+    }
+    hex::encode(hasher.0.finalize())
+}
+
+/// An `io::Write` that feeds a SHA-256.
+struct HashWriter(Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The stored file, borrowed: the same fields in the same order as
+/// [`FingerprintFile`]'s own serialisation, so a capture can be written
+/// without cloning it.
+#[derive(Serialize)]
+struct Stored<'a> {
+    format_version: u32,
+    tool_version: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalise_rules_version: Option<u32>,
+    mapping_hash: &'a str,
+    server: &'a CapturedServer,
+    tables: &'a [CapturedTable],
+    inventory: &'a Option<Box<DatabaseInventory>>,
+    sha256: &'a str,
 }
 
 impl FingerprintFile {
@@ -434,49 +474,86 @@ impl FingerprintFile {
 
     /// Write to `path` with a fresh hash, gzip-compressing when the name ends
     /// in `.gz`.
+    ///
+    /// Streamed: the capture is neither cloned nor built as one string first,
+    /// so writing a capture of a very large database needs no extra memory.
+    /// The bytes are exactly those of [`Self::to_json`].
     pub fn write_to(&self, path: &std::path::Path) -> Result<(), FingerprintFileError> {
-        let bytes = self.clone().to_json()?;
+        use std::io::Write;
         let io = |e: std::io::Error| FingerprintFileError::Io(e.to_string());
+        let sha256 = compute_sha256(self);
+        let stored = Stored {
+            format_version: self.format_version,
+            tool_version: &self.tool_version,
+            normalise_rules_version: self.normalise_rules_version,
+            mapping_hash: &self.mapping_hash,
+            server: &self.server,
+            tables: &self.tables,
+            inventory: &self.inventory,
+            sha256: &sha256,
+        };
+        let json = |e: serde_json::Error| FingerprintFileError::Json(e.to_string());
+        let file = std::io::BufWriter::new(std::fs::File::create(path).map_err(io)?);
         if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            std::io::Write::write_all(&mut enc, &bytes).map_err(io)?;
-            std::fs::write(path, enc.finish().map_err(io)?).map_err(io)
+            let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            serde_json::to_writer(&mut enc, &stored).map_err(json)?;
+            enc.finish().map_err(io)?.flush().map_err(io)
         } else {
-            std::fs::write(path, &bytes).map_err(io)
+            let mut file = file;
+            serde_json::to_writer(&mut file, &stored).map_err(json)?;
+            file.flush().map_err(io)
         }
     }
 
     /// Load from raw bytes, rejecting untrusted input (see the module docs).
     /// Gzip is detected by its magic bytes, not the extension.
     ///
-    /// The JSON text is parsed once, into a `serde_json::Value`; the typed
-    /// file is built from that value, and the unknown-field check compares it
-    /// piece by piece (header, each table, inventory) with the typed value's
-    /// canonical form, so no second full copy of the file is held (audit L2).
+    /// Built for captures of very large databases.  The top level is read as
+    /// borrowed slices of the input (nothing copied); each table is then parsed
+    /// on its own into a `serde_json::Value`, turned into its typed form and
+    /// compared key by key with that form's canonical value (the unknown-field
+    /// check), and the `Value` is dropped before the next table.  Peak memory is
+    /// the text plus the typed file plus one table, about twice the file.
     pub fn from_bytes(bytes: &[u8]) -> Result<FingerprintFile, FingerprintFileError> {
-        use serde_json::Value;
-        if bytes.len() > MAX_FINGERPRINT_BYTES {
+        Self::from_bytes_within(bytes, MAX_FINGERPRINT_BYTES)
+    }
+
+    /// [`Self::from_bytes`] with an explicit size limit (tests use a small one).
+    fn from_bytes_within(
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<FingerprintFile, FingerprintFileError> {
+        if bytes.len() > limit {
             return Err(FingerprintFileError::TooLarge(bytes.len()));
         }
-        let raw: Value = if bytes.starts_with(&[0x1f, 0x8b]) {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
             let mut out = Vec::new();
             // Bound the inflated size too: never inflate beyond the limit.
             flate2::read::GzDecoder::new(bytes)
-                .take((MAX_FINGERPRINT_BYTES as u64) + 1)
+                .take((limit as u64) + 1)
                 .read_to_end(&mut out)
                 .map_err(|e| FingerprintFileError::Io(e.to_string()))?;
-            if out.len() > MAX_FINGERPRINT_BYTES {
+            if out.len() > limit {
                 return Err(FingerprintFileError::TooLarge(out.len()));
             }
-            serde_json::from_slice(&out)
+            Self::from_json_text(&out)
         } else {
-            serde_json::from_slice(bytes)
+            Self::from_json_text(bytes)
         }
-        .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
+    }
 
-        let version = raw
+    /// [`Self::from_bytes`] on uncompressed JSON text.
+    fn from_json_text(text: &[u8]) -> Result<FingerprintFile, FingerprintFileError> {
+        use serde_json::value::RawValue;
+        use serde_json::{Map, Value};
+        let json = |e: serde_json::Error| FingerprintFileError::Json(e.to_string());
+
+        let mut top: std::collections::BTreeMap<String, &RawValue> =
+            serde_json::from_slice(text).map_err(json)?;
+
+        let version = top
             .get("format_version")
-            .and_then(Value::as_u64)
+            .and_then(|r| serde_json::from_str::<u64>(r.get()).ok())
             .ok_or_else(|| FingerprintFileError::Json("missing format_version".into()))?;
         if version != u64::from(FINGERPRINT_VERSION) {
             return Err(FingerprintFileError::UnsupportedVersion(
@@ -484,40 +561,53 @@ impl FingerprintFile {
             ));
         }
 
-        let file = FingerprintFile::deserialize(&raw)
-            .map_err(|e| FingerprintFileError::Json(e.to_string()))?;
+        let raw_tables = top
+            .remove("tables")
+            .ok_or_else(|| FingerprintFileError::Json("missing field `tables`".into()))?;
+        let raw_inventory = top.remove("inventory");
+
+        // The header: every small top-level field, typed through the whole
+        // file's own (deny_unknown_fields) struct with the large parts empty.
+        let mut header = Map::new();
+        for (k, v) in &top {
+            header.insert(
+                k.clone(),
+                serde_json::from_str::<Value>(v.get()).map_err(json)?,
+            );
+        }
+        let raw_header = Value::Object(header.clone());
+        header.insert("tables".into(), Value::Array(Vec::new()));
+        header.insert("inventory".into(), Value::Null);
+        let mut file = FingerprintFile::deserialize(&Value::Object(header)).map_err(json)?;
 
         // Unknown fields at any depth: every key of the input must survive a
-        // round trip through the typed value.  Checked in pieces.
-        let json = |e: serde_json::Error| FingerprintFileError::Json(e.to_string());
+        // round trip through the typed value.  Checked piece by piece.
         let mut unknown = Vec::new();
-        let header = FingerprintFile {
-            format_version: file.format_version,
-            tool_version: String::new(),
-            normalise_rules_version: file.normalise_rules_version,
-            mapping_hash: String::new(),
-            server: file.server.clone(),
-            tables: Vec::new(),
-            inventory: None,
-            sha256: String::new(),
-        };
-        unknown_keys(
-            &raw,
-            &serde_json::to_value(&header).map_err(json)?,
-            "",
-            &mut unknown,
-        );
-        if let Some(Value::Array(raw_tables)) = raw.get("tables") {
-            for (i, (rt, t)) in raw_tables.iter().zip(file.tables.iter()).enumerate() {
-                let canon = serde_json::to_value(t).map_err(json)?;
-                unknown_keys(rt, &canon, &format!("tables[{i}]"), &mut unknown);
+        let canon_header = serde_json::to_value(&file).map_err(json)?;
+        unknown_keys(&raw_header, &canon_header, "", &mut unknown);
+        drop(raw_header);
+
+        let rows: Vec<&RawValue> = serde_json::from_str(raw_tables.get()).map_err(json)?;
+        let mut tables = Vec::with_capacity(rows.len());
+        for (i, rt) in rows.iter().enumerate() {
+            let v: Value = serde_json::from_str(rt.get()).map_err(json)?;
+            let t = CapturedTable::deserialize(&v).map_err(json)?;
+            let canon = serde_json::to_value(&t).map_err(json)?;
+            unknown_keys(&v, &canon, &format!("tables[{i}]"), &mut unknown);
+            tables.push(t);
+        }
+        file.tables = tables;
+
+        if let Some(ri) = raw_inventory {
+            let v: Value = serde_json::from_str(ri.get()).map_err(json)?;
+            let inv: Option<Box<DatabaseInventory>> = Option::deserialize(&v).map_err(json)?;
+            if let Some(inv) = &inv {
+                let canon = serde_json::to_value(inv).map_err(json)?;
+                unknown_keys(&v, &canon, "inventory", &mut unknown);
             }
+            file.inventory = inv;
         }
-        if let (Some(ri), Some(inv)) = (raw.get("inventory"), &file.inventory) {
-            let canon = serde_json::to_value(inv).map_err(json)?;
-            unknown_keys(ri, &canon, "inventory", &mut unknown);
-        }
-        drop(raw);
+
         if !unknown.is_empty() {
             return Err(FingerprintFileError::UnknownFields(unknown));
         }
@@ -765,6 +855,42 @@ mod tests {
     }
 
     #[test]
+    fn the_streamed_hash_and_file_are_byte_for_byte_the_old_ones() {
+        let f = sample();
+        // The hash every existing capture carries: SHA-256 of the compact text.
+        let text = serde_json::to_string(&Hashable::from(&f)).unwrap();
+        assert_eq!(
+            compute_sha256(&f),
+            hex::encode(Sha256::digest(text.as_bytes()))
+        );
+        let dir = std::env::temp_dir().join(format!("dmux-fp-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("c.json");
+        f.write_to(&plain).unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), f.clone().to_json().unwrap());
+        let gz = dir.join("c.json.gz");
+        f.write_to(&gz).unwrap();
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&gz).unwrap())
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, f.clone().to_json().unwrap());
+        assert_eq!(FingerprintFile::read_from(&gz).unwrap().tables, f.tables);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_tables_is_still_refused() {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&sample().to_json().unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("tables");
+        assert!(matches!(
+            FingerprintFile::from_bytes(&serde_json::to_vec(&v).unwrap()),
+            Err(FingerprintFileError::Json(_))
+        ));
+    }
+
+    #[test]
     fn round_trips_and_verifies() {
         let back = round(sample()).unwrap();
         assert_eq!(back.tables, sample().tables);
@@ -848,41 +974,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_oversized_input() {
-        let big = vec![b' '; MAX_FINGERPRINT_BYTES + 1];
-        assert!(matches!(
-            FingerprintFile::from_bytes(&big),
-            Err(FingerprintFileError::TooLarge(_))
-        ));
-    }
+    /// The size checks, against a small limit so the tests stay fast.
+    const SMALL: usize = 64 * 1024;
 
     #[test]
-    fn the_size_limit_is_64_mib() {
-        assert_eq!(MAX_FINGERPRINT_BYTES, 64 * 1024 * 1024);
+    fn rejects_oversized_input() {
+        let big = vec![b' '; SMALL + 1];
+        assert_eq!(
+            FingerprintFile::from_bytes_within(&big, SMALL),
+            Err(FingerprintFileError::TooLarge(SMALL + 1))
+        );
         // Exactly at the limit is not refused for size (it fails as JSON).
-        let at = vec![b' '; MAX_FINGERPRINT_BYTES];
+        let at = vec![b' '; SMALL];
         assert!(matches!(
-            FingerprintFile::from_bytes(&at),
+            FingerprintFile::from_bytes_within(&at, SMALL),
             Err(FingerprintFileError::Json(_))
         ));
     }
 
     #[test]
+    fn the_size_limit_is_8_gib() {
+        // Raised from 64 MiB for very large databases (decision 29).
+        assert_eq!(MAX_FINGERPRINT_BYTES, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
     fn rejects_a_gzip_that_inflates_past_the_limit() {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        std::io::Write::write_all(&mut enc, &vec![b' '; MAX_FINGERPRINT_BYTES + 1]).unwrap();
+        std::io::Write::write_all(&mut enc, &vec![b' '; SMALL + 1]).unwrap();
         let gz = enc.finish().unwrap();
-        assert!(gz.len() < MAX_FINGERPRINT_BYTES);
+        assert!(gz.len() < SMALL);
         assert_eq!(
-            FingerprintFile::from_bytes(&gz),
-            Err(FingerprintFileError::TooLarge(MAX_FINGERPRINT_BYTES + 1))
+            FingerprintFile::from_bytes_within(&gz, SMALL),
+            Err(FingerprintFileError::TooLarge(SMALL + 1))
         );
         // Inflating to exactly the limit is not refused for size.
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        std::io::Write::write_all(&mut enc, &vec![b' '; MAX_FINGERPRINT_BYTES]).unwrap();
+        std::io::Write::write_all(&mut enc, &vec![b' '; SMALL]).unwrap();
         assert!(matches!(
-            FingerprintFile::from_bytes(&enc.finish().unwrap()),
+            FingerprintFile::from_bytes_within(&enc.finish().unwrap(), SMALL),
             Err(FingerprintFileError::Json(_))
         ));
     }

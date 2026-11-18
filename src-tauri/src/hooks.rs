@@ -399,6 +399,7 @@ pub fn run_custom_checks(plan: &HookPlan, results: &RunResults) -> HookRun {
                     script: dir.join(&entry.name),
                     interpreter: plan.interpreter.clone(),
                     timeout: plan.timeout,
+                    ..HookSpec::default()
                 };
                 match dmux_hooks::run_hook(&spec, &results_value) {
                     Ok(res) => ran.push((entry.name.clone(), res)),

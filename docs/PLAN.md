@@ -144,7 +144,7 @@ The user may tick four recorded options per column: ignore trailing spaces, trea
 
 - This covers in-place upgrades, where the old server is stopped before the new one starts, and networks where one machine cannot reach both databases.
 - The mapping must be fixed at capture time. An in-place upgrade keeps every name, so the identity mapping works.
-- Every file records the version of the normalisation rules it was captured with. A file made under other rules, or one that does not say, is refused and must be captured again; a file made by another Dmux release with the same rules is accepted with a warning. Dmux recomputes from the file's own column types which tables need review, and refuses a file whose stored flag says otherwise. Files over 64 MiB are refused.
+- Every file records the version of the normalisation rules it was captured with. A file made under other rules, or one that does not say, is refused and must be captured again; a file made by another Dmux release with the same rules is accepted with a warning. Dmux recomputes from the file's own column types which tables need review, and refuses a file whose stored flag says otherwise. Files over 8 GiB are refused (decision 29).
 - Without a live old database, Dmux reports which tables and how many buckets differ, but cannot list the rows.
 
 ### 3.4 Consistency and the independent spot check

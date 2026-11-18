@@ -545,7 +545,7 @@ options ticked and every query sent.
   results file, for example one written by the command-line version on a jump server. Dmux
   checks it exactly as `dmux report` does (its SHA-256, and that a PASS does not hide a
   failing table). A file that fails the check is refused with a plain message and nothing
-  is shown. Files larger than 64 MiB are refused.
+  is shown. Files larger than 1 GiB are refused.
 - **Delete local history.** The **Delete all history** button, after a confirmation, deletes
   every stored results file and the history list on this computer. Saved connections are
   kept. Reports and files you saved elsewhere are not touched. Stored results files are

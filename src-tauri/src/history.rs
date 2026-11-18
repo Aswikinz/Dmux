@@ -24,9 +24,11 @@ use crate::error::CommandError;
 use crate::run_manager::RunManager;
 use crate::store::{HistoryRow, Store};
 
-/// The largest results file the app will read (a results file holds counts and
-/// names; anything bigger is not one).
-pub const MAX_RESULTS_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest results file the app will read.  A results file holds counts,
+/// names and per-table facts, so a run over tens of thousands of tables runs
+/// to hundreds of megabytes; raised from 64 MiB for very large databases
+/// (decision 29).
+pub const MAX_RESULTS_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// How many opened results stay registered in memory at once.
 const MAX_OPENED: usize = 8;
@@ -251,7 +253,7 @@ pub fn read_verified(path: &Path) -> Result<Verification, CommandError> {
     }
     if meta.len() > MAX_RESULTS_FILE_BYTES {
         return Err(refuse(
-            "that file is too large to be a Dmux results file (the limit is 64 MiB)",
+            "that file is too large to be a Dmux results file (the limit is 1 GiB)",
         ));
     }
     let bytes = {
@@ -267,7 +269,7 @@ pub fn read_verified(path: &Path) -> Result<Verification, CommandError> {
     };
     if bytes.len() as u64 > MAX_RESULTS_FILE_BYTES {
         return Err(refuse(
-            "that file is too large to be a Dmux results file (the limit is 64 MiB)",
+            "that file is too large to be a Dmux results file (the limit is 1 GiB)",
         ));
     }
     verify_bytes(&bytes)
