@@ -8,6 +8,7 @@ import { ErrorCard } from '../design/ErrorCard';
 import { StatusBadge } from '../design/StatusBadge';
 import { qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { coverageLabel } from './ResultsScreen';
+import { IgnoredItems } from '../components/IgnoredItems';
 import { FileCode2, FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
 import type { ReportFormat, Results } from '../api/contract';
@@ -94,19 +95,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
             {coverageLabel(results.coverage)}
           </p>
         </div>
-        {results.ignored.length > 0 && (
-          <div className="mt-4">
-            <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Ignored</h3>
-            <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
-              {results.ignored.map((item) => (
-                <li key={item.id}>
-                  <span className="font-medium">{item.name}</span>
-                  <span className="ml-2 text-slate-500 dark:text-slate-400">— {item.reason}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+        <IgnoredItems ignored={results.ignored} />
         <div className="mt-4">
           <Switch
             label="Include row keys in the exported report"

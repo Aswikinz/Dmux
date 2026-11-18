@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
@@ -1025,13 +1025,38 @@ describe('ResultsScreen', () => {
     expect(screen.queryByText('CHANGED DURING CHECK')).toBeNull();
   });
 
-  it('lists ignored tables with their required reasons next to the coverage line', async () => {
+  it('counts the ignored items by the coverage line and lists each with its reason on request', async () => {
     wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'pass' })} runId="run-pass" />);
     await screen.findByText(/tables fully checked/);
-    const ignoredheading = screen.getByRole('heading', { name: 'Ignored' });
-    expect(ignoredheading).toBeDefined();
+    expect(screen.getByRole('heading', { name: 'Ignored' })).toBeDefined();
+    expect(screen.getByText('3 items, each with its reason')).toBeDefined();
+    // The list stays closed until asked for, so it never buries the verdict.
+    expect(screen.queryByText('archived_balances')).toBeNull();
+    const show = screen.getByRole('button', { name: 'Show ignored items' });
+    expect(show.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(show);
     expect(screen.getByText('archived_balances')).toBeDefined();
     expect(screen.getByText(/Legacy archive table/)).toBeDefined();
+    expect(screen.getByText('ignored_table_0002')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Hide ignored items' }));
+    expect(screen.queryByText('archived_balances')).toBeNull();
+  });
+
+  it('filters the lists by verdict, says how many are hidden, and never hides the verdict', async () => {
+    wrap(<ResultsHarness engine={createMockEngine({ forcedFixture: 'fail' })} runId="run-fail" />);
+    await screen.findByText('Failures');
+    const filter = screen.getByTestId('verdict-filter');
+    expect(within(filter).getByText('Showing every result.')).toBeDefined();
+    const passBox = within(filter).getByRole('checkbox', { name: /PASS/ });
+    const rowsBefore = screen.getAllByText('Details').length;
+    fireEvent.click(passBox);
+    // The PASS rows leave the table; the FAIL banner and the failure card stay.
+    expect(screen.getAllByText('Details').length).toBeLessThan(rowsBefore);
+    expect(screen.getAllByText('FAIL').length).toBeGreaterThan(0);
+    expect(within(filter).getByText(/results are hidden by this filter/)).toBeDefined();
+    // Hiding FAIL too leaves a plain note in place of the cards.
+    fireEvent.click(within(filter).getByRole('checkbox', { name: /^FAIL/ }));
+    expect(screen.getByTestId('failures-all-hidden')).toBeDefined();
   });
 
   it('shows the needs-review verdict in its own words', async () => {

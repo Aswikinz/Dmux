@@ -45,6 +45,7 @@ test('nothing is chosen at first; a few tables can be chosen and run on their ow
 
   // Results name every left-out table with the app's reason.
   await cta(page, 'See results').click();
+  await page.getByRole('button', { name: 'Show ignored items' }).click();
   await expect(page.getByText(/not selected for this run/).first()).toBeVisible();
 });
 

@@ -8,10 +8,12 @@ import { ErrorCard } from '../design/ErrorCard';
 import { DataTable } from '../components/DataTable';
 import { TableDetailPanel, WhatWasChecked } from '../components/TableDetailPanel';
 import { CustomChecksPanel } from '../components/CustomChecksPanel';
+import { IgnoredItems } from '../components/IgnoredItems';
+import { VerdictFilter } from '../components/VerdictFilter';
 import { LEVEL_LABELS, VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
-import type { DrillDownRow, FailureCard, IgnoreItem, Results, TableResult } from '../api/contract';
+import type { DrillDownRow, FailureCard, Results, TableResult, Verdict } from '../api/contract';
 
 interface ResultsScreenProps {
   engine: Engine;
@@ -24,26 +26,6 @@ interface ResultsScreenProps {
 
 export function coverageLabel(coverage: Results['coverage']): string {
   return `${coverage.fullValuesTables} of ${coverage.totalTables} tables fully checked, ${coverage.countsTables} counts only, ${coverage.structureTables} structure only, ${coverage.ignoredTables} ignored`;
-}
-
-/** Every ignored table/column is listed on the first page with its required reason. */
-function IgnoredList({ ignored }: { ignored: IgnoreItem[] }) {
-  if (ignored.length === 0) {
-    return null;
-  }
-  return (
-    <div className="mt-3">
-      <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-secondary dark:text-slate-400">Ignored</h3>
-      <ul className="mt-1 space-y-1 text-sm text-slate-600 dark:text-slate-300">
-        {ignored.map((item) => (
-          <li key={item.id}>
-            <span className="font-medium">{item.name}</span>
-            <span className="ml-2 text-slate-500 dark:text-slate-400">— {item.reason}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
 }
 
 /** Every ticked option is listed, in table.column: option form (H2 / decision 23). */
@@ -219,6 +201,20 @@ function FailureCardItem({
   );
 }
 
+/** How many results carry each verdict.  A failure card and the row of the
+ *  table it belongs to are one result, so nothing is counted twice. */
+export function resultCounts(results: Results): Partial<Record<Verdict, number>> {
+  const byKey = new Map<string, Verdict>();
+  for (const t of results.tableResults) byKey.set(`t:${t.tableId}`, t.verdict);
+  for (const c of results.failures) {
+    const key = `t:${c.tableId}`;
+    if (byKey.get(key) !== c.verdict) byKey.set(`c:${c.id}`, c.verdict);
+  }
+  const counts: Partial<Record<Verdict, number>> = {};
+  for (const v of byKey.values()) counts[v] = (counts[v] ?? 0) + 1;
+  return counts;
+}
+
 export function ResultsScreen({
   engine,
   runId,
@@ -234,6 +230,8 @@ export function ResultsScreen({
   // or (null) above the list of all tables.
   const [detailCard, setDetailCard] = useState<string | null>(null);
   const detailHeading = useRef<HTMLHeadingElement>(null);
+  // Verdicts the user chose to hide from the lists below (never the banner).
+  const [hiddenVerdicts, setHiddenVerdicts] = useState<Set<Verdict>>(new Set());
 
   useEffect(() => {
     let mounted = true;
@@ -339,7 +337,7 @@ export function ResultsScreen({
         <p className="mt-3 text-sm text-slate-700 dark:text-slate-300">
           {coverageLabel(results.coverage)}
         </p>
-        <IgnoredList ignored={results.ignored} />
+        <IgnoredItems ignored={results.ignored} />
         <OptionsAppliedList results={results} />
         <WarningsList warnings={results.warnings} />
         <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">
@@ -350,11 +348,28 @@ export function ResultsScreen({
 
       {results.customChecks && <CustomChecksPanel checks={results.customChecks} />}
 
+      {(() => {
+        const counts = resultCounts(results);
+        return Object.keys(counts).length > 1 ? (
+          <Panel>
+            <VerdictFilter counts={counts} hidden={hiddenVerdicts} onChange={setHiddenVerdicts} />
+          </Panel>
+        ) : null;
+      })()}
+
       {results.failures.length > 0 && (
         <Panel>
           <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">Failures</h3>
+          {results.failures.every((card) => hiddenVerdicts.has(card.verdict)) && (
+            <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="failures-all-hidden">
+              All {results.failures.length === 1 ? 'of them is' : `${results.failures.length} of them are`}{' '}
+              hidden by the filter above.
+            </p>
+          )}
           <div className="space-y-4">
-            {results.failures.map((card) => {
+            {results.failures
+              .filter((card) => !hiddenVerdicts.has(card.verdict))
+              .map((card) => {
               const expanded = expandedFailures.has(card.id);
               const related = owningTable(card, results.tableResults);
               const hasRows = card.tableId === related?.tableId && (related.drillDown?.length ?? 0) > 0;
@@ -418,7 +433,7 @@ export function ResultsScreen({
       <Panel>
         <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">All tables</h3>
         <DataTable
-          data={results.tableResults}
+          data={results.tableResults.filter((t) => !hiddenVerdicts.has(t.verdict))}
           columns={tableColumns}
           filterPlaceholder="Filter by table name"
         />
