@@ -3,6 +3,34 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 1.1.0 (2026-11-18)
+
+Reports that are easier to read and record when the check ran.
+
+### Reports
+
+- The PDF report is redesigned: the Dmux logo and "Page N of M" on every page, the
+  verdict in a banner with what it means, the counts at a glance, failures as cards with
+  their reasons, and the tables, findings and ignored items as aligned tables. Row keys,
+  when included, are grouped per table instead of one line each.
+- A new interactive HTML report: one offline file that opens in any browser, with search,
+  filters by verdict and level, a "not passing only" switch, sortable columns and
+  expandable per-table detail. It can load nothing from outside the file. Export it from
+  the Report screen or with `dmux report --html <file>`.
+- Every report (PDF, HTML, Excel and the run log) carries a check record for compliance:
+  when the check started and finished, how long it took, when the report was generated,
+  and which databases were compared (name, server and login, never a password). Results
+  files from earlier versions say these were not recorded.
+- Structure findings are listed gravest first.
+
+### Desktop app
+
+- The Connect screen leaves room between the saved-connections list and the form.
+- Choose checks keeps each way of selecting tables (by schema, by name, by size) together.
+- The Run screen removes Pause and Cancel once the run has ended.
+- History shows "Open results" and "Run log" side by side.
+- The starting check level in Settings uses the same drop-down as the rest of the app.
+
 ## 1.0.0 (2026-11-18)
 
 The first stable version. It closes the findings of the security and false-PASS

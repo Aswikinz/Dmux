@@ -717,7 +717,7 @@ const makeResults = (fixture: string): Results => {
     optionsRecorded: true,
     warnings: [],
     runFacts: {
-      toolVersion: '1.0.0 (mock)',
+      toolVersion: '1.1.0 (mock)',
       mappingHash: '3f2a9c1be0d84a7f6c55d2e1b9a0c4d87e6f1a2b3c4d5e6f708192a3b4c5d6e7',
       resultsSha256: '9b1de4c07a52f3e86d4b0a1c2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f7',
       oldConnection: mockConnection('9.6.24', 'LATIN1'),
