@@ -3,16 +3,35 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.3.0 (2026-11-18)
 
-### Fixed
+Built for very large databases, with a cleaner Results screen.
+
+### Very large databases
 
 - A run on a large database no longer stops with "mapping file too large". The app
   checked the mapping it already held as if it were a file, against a 10 MiB limit that a
   schema with thousands of tables passes easily. A mapping in memory is now checked
   without a size limit, and the limit for mapping files is 256 MiB (about four million
-  columns). Mapping files are also parsed once instead of twice, halving the memory a
-  large one needs.
+  columns). Mapping files are parsed once instead of twice.
+- Saved captures can now be up to 8 GiB (was 64 MiB, about 170 large tables). Reading a
+  capture checks one table at a time and the file hash is streamed, so comparing a
+  capture needs about twice its size in memory instead of about eleven times; writing one
+  needs no extra memory.
+- Results files opened in the app and inventory files for `dmux diff` can be up to 1 GiB
+  (was 64 MiB), and custom checks receive results of up to 1 GiB (was 1 MiB), so they
+  run on large databases instead of being skipped.
+- Every limit is still checked before a file is read, and every other check on untrusted
+  files is unchanged.
+
+### Results
+
+- The ignored items are shown as a count; **Show ignored items** lists each one with its
+  reason. The Report screen does the same. Exported reports still list every ignored item
+  on the first page.
+- A **Show** filter, with a box for each verdict and a **Hide warnings** button, narrows
+  the failures and the list of all tables, so failures stand out. The screen says how many
+  results are hidden, and the overall verdict is never filtered.
 
 ## 1.2.0 (2026-11-18)
 
