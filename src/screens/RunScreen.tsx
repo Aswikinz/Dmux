@@ -234,22 +234,18 @@ export function RunScreen({
                 each one.
               </p>
             )}
-            <div className="flex gap-3">
-              <Button
-                onClick={togglePause}
-                variant="secondary"
-                disabled={finished || progress.overallState === 'cancelled'}
-              >
-                {progress.overallState === 'paused' ? 'Resume' : 'Pause'}
-              </Button>
-              <Button
-                onClick={cancel}
-                variant="danger"
-                disabled={finished || cancelling}
-              >
-                {cancelling ? 'Cancelling…' : 'Cancel'}
-              </Button>
-            </div>
+            {/* Once the run has ended there is nothing to pause or cancel:
+                the controls go away rather than linger, greyed out. */}
+            {!finished && (
+              <div className="flex gap-3">
+                <Button onClick={togglePause} variant="secondary">
+                  {progress.overallState === 'paused' ? 'Resume' : 'Pause'}
+                </Button>
+                <Button onClick={cancel} variant="danger" disabled={cancelling}>
+                  {cancelling ? 'Cancelling…' : 'Cancel'}
+                </Button>
+              </div>
+            )}
           </Panel>
           <div className="flex items-center justify-between">
             <Button onClick={onBack} variant="secondary">

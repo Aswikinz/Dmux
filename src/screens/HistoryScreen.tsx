@@ -184,8 +184,10 @@ export function HistoryScreen({ engine, onOpenResults }: HistoryScreenProps) {
       col.display({
         id: 'actions',
         header: 'Actions',
+        // Wide enough for both actions side by side, aligned on one line.
+        size: 250,
         cell: ({ row }) => (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-nowrap items-center gap-2">
             <Button
               size="sm"
               variant="secondary"

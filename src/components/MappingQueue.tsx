@@ -132,11 +132,11 @@ export function MappingQueue({
 
   return (
     <div className={cn('flex flex-col gap-3', className)}>
-      <div className="flex items-center justify-between">
-        <span className="text-sm text-slate-600 dark:text-slate-300">
+      <div className="flex items-start justify-between gap-6">
+        <span className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-700 dark:text-slate-300">
           {queue.length === 1 ? '1 item needs attention' : `${queue.length} items need attention`}
         </span>
-        <span className="text-xs text-slate-600 dark:text-slate-400">
+        <span className="max-w-2xl text-right text-xs text-slate-600 dark:text-slate-400">
           Click an item, then choose Approve or Ignore. With the keyboard: the arrow keys move,
           Enter approves, Delete ignores. A suggestion is only used when you accept it.
         </span>

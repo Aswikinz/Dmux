@@ -110,7 +110,10 @@ function SavedProfilePicker({
   ];
 
   return (
-    <div className="space-y-2" data-testid={`${title}-saved`}>
+    <div
+      className="mb-5 space-y-2 border-b border-slate-200 pb-5 dark:border-white/10"
+      data-testid={`${title}-saved`}
+    >
       <Select
         id={`${title}-saved-select`}
         label={`Saved connections for the ${title.toLowerCase()}`}

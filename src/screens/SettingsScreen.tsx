@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { describeError } from '../api/tauriEngine';
 import { Panel } from '../design/Panel';
+import { Select } from '../design/Select';
 import { ScreenHeader } from '../design/ScreenHeader';
 import { Button } from '../design/Button';
 import { ErrorCard } from '../design/ErrorCard';
@@ -102,26 +103,23 @@ export function SettingsScreen({ engine }: SettingsScreenProps) {
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
             These are where each new check starts. You can still change them for a single run.
           </p>
-          <div className="mt-4 max-w-md">
-            <label htmlFor="starting-level" className="text-[13px] font-medium text-slate-700 dark:text-slate-300">
-              Starting check level for new plans
-            </label>
-            <select
-              id="starting-level"
-              value={settings.startingLevel}
-              onChange={(e) =>
-                void run(() =>
-                  engine.updateSettings({ startingLevel: e.target.value as AppSettings['startingLevel'] }),
-                )
-              }
-              className="mt-1 h-9 w-full rounded-[10px] border border-black/[0.1] bg-white px-3 text-sm text-ink focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/20 dark:border-white/10 dark:bg-white/[0.06] dark:text-slate-100"
-            >
-              <option value="suggested">Dmux&apos;s suggestion for each table</option>
-              <option value="full-values">Full values for every table</option>
-              <option value="counts">Counts and totals for every table</option>
-              <option value="structure">Structure only for every table</option>
-            </select>
-          </div>
+          <Select
+            id="starting-level"
+            label="Starting check level for new plans"
+            className="mt-4 max-w-md"
+            value={settings.startingLevel}
+            onChange={(e) =>
+              void run(() =>
+                engine.updateSettings({ startingLevel: e.target.value as AppSettings['startingLevel'] }),
+              )
+            }
+            options={[
+              { value: 'suggested', label: "Dmux's suggestion for each table" },
+              { value: 'full-values', label: 'Full values for every table' },
+              { value: 'counts', label: 'Counts and totals for every table' },
+              { value: 'structure', label: 'Structure only for every table' },
+            ]}
+          />
           <div className="mt-4 flex flex-wrap gap-6">
             <CountField
               id="old-parallelism"

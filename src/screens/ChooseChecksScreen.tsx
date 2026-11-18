@@ -349,72 +349,78 @@ export function ChooseChecksScreen({
               className="space-y-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700"
             >
               <p className="text-sm font-medium">Select tables, then change their level together</p>
-              <div className="flex flex-wrap items-end gap-3">
-                <Select
-                  label="Schema"
-                  options={[{ value: '', label: 'Choose a schema' }, ...schemas.map((x) => ({ value: x, label: x }))]}
-                  value={schemaChoice}
-                  onChange={(e) => setSchemaChoice(e.target.value)}
-                  className="w-44"
-                />
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={!schemaChoice}
-                  onClick={() =>
-                    replaceSelection(selectBySchema(plan.tables, schemaChoice), `schema ${schemaChoice}`)
-                  }
-                >
-                  Select schema
-                </Button>
-                <Input
-                  label="Name pattern"
-                  placeholder="acct_* (* matches anything)"
-                  value={patternText}
-                  onChange={(e) => setPatternText(e.target.value)}
-                  className="w-56"
-                />
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={!patternText.trim()}
-                  onClick={() =>
-                    replaceSelection(selectByPattern(plan.tables, patternText), `names matching ${patternText.trim()}`)
-                  }
-                >
-                  Select by name
-                </Button>
-                <Select
-                  label="Size"
-                  options={[
-                    { value: 'larger', label: 'Larger than' },
-                    { value: 'smaller', label: 'Smaller than' },
-                  ]}
-                  value={sizeDirection}
-                  onChange={(e) => setSizeDirection(e.target.value as 'larger' | 'smaller')}
-                  className="w-36"
-                />
-                <Input
-                  label="Megabytes"
-                  type="number"
-                  min={0}
-                  value={sizeMegabytes}
-                  onChange={(e) => setSizeMegabytes(e.target.value)}
-                  className="w-28"
-                />
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={sizeMegabytes.trim() === '' || !(Number(sizeMegabytes) >= 0)}
-                  onClick={() =>
-                    replaceSelection(
-                      selectBySize(plan.tables, sizeDirection, Number(sizeMegabytes)),
-                      `${sizeDirection} than ${Number(sizeMegabytes) * MEGABYTE === 0 ? '0' : sizeMegabytes} MB`,
-                    )
-                  }
-                >
-                  Select by size
-                </Button>
+              <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
+                <div className="flex items-end gap-2" data-testid="select-by-schema">
+                  <Select
+                    label="Schema"
+                    options={[{ value: '', label: 'Choose a schema' }, ...schemas.map((x) => ({ value: x, label: x }))]}
+                    value={schemaChoice}
+                    onChange={(e) => setSchemaChoice(e.target.value)}
+                    className="w-44"
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={!schemaChoice}
+                    onClick={() =>
+                      replaceSelection(selectBySchema(plan.tables, schemaChoice), `schema ${schemaChoice}`)
+                    }
+                  >
+                    Select schema
+                  </Button>
+                </div>
+                <div className="flex items-end gap-2" data-testid="select-by-name">
+                  <Input
+                    label="Name pattern"
+                    placeholder="acct_* (* matches anything)"
+                    value={patternText}
+                    onChange={(e) => setPatternText(e.target.value)}
+                    className="w-52"
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={!patternText.trim()}
+                    onClick={() =>
+                      replaceSelection(selectByPattern(plan.tables, patternText), `names matching ${patternText.trim()}`)
+                    }
+                  >
+                    Select by name
+                  </Button>
+                </div>
+                <div className="flex items-end gap-2" data-testid="select-by-size">
+                  <Select
+                    label="Size"
+                    options={[
+                      { value: 'larger', label: 'Larger than' },
+                      { value: 'smaller', label: 'Smaller than' },
+                    ]}
+                    value={sizeDirection}
+                    onChange={(e) => setSizeDirection(e.target.value as 'larger' | 'smaller')}
+                    className="w-36"
+                  />
+                  <Input
+                    label="Megabytes"
+                    type="number"
+                    min={0}
+                    value={sizeMegabytes}
+                    onChange={(e) => setSizeMegabytes(e.target.value)}
+                    className="w-24"
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={sizeMegabytes.trim() === '' || !(Number(sizeMegabytes) >= 0)}
+                    onClick={() =>
+                      replaceSelection(
+                        selectBySize(plan.tables, sizeDirection, Number(sizeMegabytes)),
+                        `${sizeDirection} than ${Number(sizeMegabytes) * MEGABYTE === 0 ? '0' : sizeMegabytes} MB`,
+                      )
+                    }
+                  >
+                    Select by size
+                  </Button>
+                </div>
               </div>
               <div className="flex flex-wrap items-end gap-3">
                 <Select

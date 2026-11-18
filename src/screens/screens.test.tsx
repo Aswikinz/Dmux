@@ -833,6 +833,9 @@ describe('RunScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(await screen.findAllByText('Cancelled')).toBeTruthy();
     expect(state.overallState).toBe('cancelled');
+    // An ended run offers nothing to pause or cancel.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
   });
 
   it('shows an error when the run fails to start', async () => {
