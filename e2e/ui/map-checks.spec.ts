@@ -85,6 +85,22 @@ for (const colorScheme of ['light', 'dark'] as const) {
   });
 }
 
+for (const colorScheme of ['light', 'dark'] as const) {
+  test(`what was mapped can be shown and is accessible in ${colorScheme} mode`, async ({ page }) => {
+    await page.emulateMedia({ colorScheme });
+    await openMap(page);
+    await page.getByRole('button', { name: 'Show what was mapped' }).click();
+    const list = page.getByTestId('matched-list');
+    await expect(list).toBeVisible();
+    await list.getByRole('button', { name: 'Show the columns of accounts' }).click();
+    await expect(list.getByText('Needs your decision').first()).toBeVisible();
+    await noSeriousViolations(page, 'map with what was mapped open');
+    // In the browser demo, Save mapping says so instead of failing silently.
+    await page.getByRole('button', { name: 'Save mapping' }).click();
+    await expect(page.getByText(/This is the browser demo, so no file was saved/)).toBeVisible();
+  });
+}
+
 test('bulk set level marks the preset Custom, and control totals start unticked', async ({ page }) => {
   await openMap(page);
   await cta(page, 'Choose checks').click();

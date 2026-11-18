@@ -7,6 +7,7 @@ import { MappingQueue } from '../components/MappingQueue';
 import { ErrorCard } from '../design/ErrorCard';
 import type { Engine } from '../api/engine';
 import { RuleEditor } from '../components/RuleEditor';
+import { MatchedList } from '../components/MatchedList';
 import type { PickerOption } from '../components/PairPicker';
 import type {
   Inventory,
@@ -52,6 +53,9 @@ export function MapScreen({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveNote, setSaveNote] = useState<{ text: string; saved: boolean } | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [showMatched, setShowMatched] = useState(false);
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
@@ -167,12 +171,34 @@ export function MapScreen({
   async function handleSave() {
     if (!mapping) return;
     setSaving(true);
+    setSaveNote(null);
+    setSaveError(null);
     try {
-      await engine.saveMapping(mapping);
+      const res = await engine.saveMapping(mapping);
+      if (res.ok) {
+        setSaveNote({
+          text: `Mapping saved to ${res.filePath}${res.hash ? ` (mapping code ${res.hash.slice(0, 12)})` : ''}.`,
+          saved: true,
+        });
+      } else if (res.cancelled) {
+        setSaveNote({ text: 'Saving cancelled. Nothing was saved.', saved: false });
+      } else if (res.demoOnly) {
+        setSaveNote({
+          text: 'This is the browser demo, so no file was saved. In the Dmux desktop app, you choose where to save the mapping.',
+          saved: false,
+        });
+      } else {
+        setSaveError(res.error ?? 'The mapping could not be saved.');
+      }
+    } catch (e) {
+      setSaveError(describeError(e));
     } finally {
       setSaving(false);
     }
   }
+
+  const tablePairs = mapping?.matches.filter((m) => m.kind !== 'column').length ?? 0;
+  const columnPairs = mapping?.matches.filter((m) => m.kind === 'column').length ?? 0;
 
   return (
     <div className="space-y-6">
@@ -194,15 +220,53 @@ export function MapScreen({
             />
           </Panel>
           <Panel>
-            <div className="mb-4 flex items-center justify-between">
-              <div className="text-sm text-slate-600 dark:text-slate-300">
-                {mapping.matches.length} matched{' '}
-                {mapping.ignored.length > 0 && `• ${mapping.ignored.length} ignored`}
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="text-sm text-slate-600 dark:text-slate-300" data-testid="matched-count">
+                {tablePairs === 1 ? '1 table' : `${tablePairs} tables`} and{' '}
+                {columnPairs === 1 ? '1 column' : `${columnPairs} columns`} paired
+                {mapping.ignored.length > 0 && ` • ${mapping.ignored.length} ignored`}
               </div>
-              <Button onClick={handleSave} disabled={saving} variant="secondary" size="sm">
-                {saving ? 'Saving…' : 'Save mapping'}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={() => setShowMatched((v) => !v)}
+                  variant="secondary"
+                  size="sm"
+                  aria-expanded={showMatched}
+                  aria-controls="matched-panel"
+                >
+                  {showMatched ? 'Hide what was mapped' : 'Show what was mapped'}
+                </Button>
+                <Button onClick={handleSave} disabled={saving} variant="secondary" size="sm">
+                  {saving ? 'Saving…' : 'Save mapping'}
+                </Button>
+              </div>
             </div>
+            {saveNote && (
+              <p
+                role="status"
+                className={
+                  saveNote.saved
+                    ? 'mb-4 text-sm text-emerald-700 dark:text-emerald-300'
+                    : 'mb-4 text-sm text-slate-700 dark:text-slate-300'
+                }
+              >
+                {saveNote.text}
+              </p>
+            )}
+            {saveError && (
+              <ErrorCard title="The mapping was not saved" className="mb-4">
+                {saveError}
+              </ErrorCard>
+            )}
+            {showMatched && (
+              <div
+                id="matched-panel"
+                className="mb-5 rounded-xl border border-slate-200 p-4 dark:border-slate-700"
+              >
+                <h3 className="mb-2 text-sm font-semibold">What was mapped</h3>
+                <MatchedList matches={mapping.matches} />
+              </div>
+            )}
             {editError && (
               <ErrorCard title="That change was not made" className="mb-4">
                 {editError}

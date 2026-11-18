@@ -16,6 +16,7 @@ pub mod data;
 pub mod gateway;
 pub mod history;
 pub mod mapping_edit;
+pub mod mapping_file;
 pub mod profiles;
 pub mod report;
 pub mod settings;

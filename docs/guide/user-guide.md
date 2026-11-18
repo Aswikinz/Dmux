@@ -269,7 +269,17 @@ up. Nothing is compared until it is mapped or deliberately ignored.
    ignore one of them differently.
 6. For a table that should not be checked, choose **Ignore** and type the reason. The
    reason is required and appears in the report.
-7. When the queue is empty, press **Choose checks**.
+7. To review everything that is already paired, press **Show what was mapped**. It lists
+   each old table with its new partner and how they were paired (same name, same name with
+   different capitals, renamed by a rule, paired by you, or still needing your decision);
+   open a table to see its columns. Search it, or tick **Only renamed or undecided** to
+   see just the pairs worth a second look. It is a view only: change a pair in the queue
+   or with rename rules.
+8. Optional: press **Save mapping** to keep the mapping in a file. A save dialog from your
+   operating system opens; the screen then shows where the file was saved and its mapping
+   code, or that saving was cancelled. The file is readable by you only, and it can be
+   used again with the command-line version (`mapping = "<file>"` in a run definition).
+9. When the queue is empty, press **Choose checks**.
 
 **What you see.** A queue, not a thousand-row board. Suggestions are never accepted
 automatically: a "close enough" name match is exactly how the wrong columns get compared.

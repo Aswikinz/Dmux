@@ -56,6 +56,7 @@ import type {
   TableRunState,
   TlsState,
   Verdict,
+  MappingSaveResult,
 } from './contract';
 
 /** A typed engine error the UI can distinguish from a connection/database error. */
@@ -221,11 +222,8 @@ interface RawRulePreview {
   tables_matched: number;
 }
 
-/** The `export_mapping` command's payload. */
-interface RawExport {
-  json: string;
-  hash: string;
-}
+/** The `save_mapping` command's outcome. */
+type RawSaveMapping = { status: 'saved'; path: string; hash: string } | { status: 'cancelled' };
 
 /** A serde-tagged `CommandError` thrown by the backend. */
 interface RawCommandError {
@@ -778,6 +776,8 @@ function translateMapping(
           newName: `${schemaMapping.target_schema}.${tableMapping.target_table}`,
           confidence: mapConfidence(tableStatus),
           approved: isAutoApproved(tableStatus),
+          kind: 'table',
+          group: `${schema}.${oldTable}`,
         },
         tableStatus,
       );
@@ -793,6 +793,10 @@ function translateMapping(
             newName: colMapping.target_column,
             confidence: mapConfidence(colStatus),
             approved: isAutoApproved(colStatus),
+            kind: 'column',
+            group: `${schema}.${oldTable}`,
+            oldLabel: oldCol,
+            newLabel: colMapping.target_column,
           },
           colStatus,
         );
@@ -1440,14 +1444,19 @@ export function createTauriEngine(): Engine {
     },
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars -- the projected mapping is rebuilt from the backend `lastRawMapping`
-    async saveMapping(_mapping: Mapping): Promise<{ hash: string; json: string }> {
+    async saveMapping(_mapping: Mapping): Promise<MappingSaveResult> {
       if (!lastRawMapping) {
         throw new Error('buildMapping must run before saveMapping');
       }
-      const exported = await invoke<RawExport>('export_mapping', {
-        mapping: lastRawMapping,
-      });
-      return { hash: exported.hash, json: exported.json };
+      // The backend validates the mapping, opens the native save dialog and
+      // writes the file itself: no path crosses the IPC.
+      try {
+        const raw = await invoke<RawSaveMapping>('save_mapping', { mapping: lastRawMapping });
+        if (raw.status === 'cancelled') return { ok: false, cancelled: true };
+        return { ok: true, filePath: raw.path, hash: raw.hash };
+      } catch (error) {
+        return { ok: false, error: describeError(error) };
+      }
     },
 
     // --- Data half: wired to the real engine (never fabricate a verdict). ---

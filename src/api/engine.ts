@@ -19,6 +19,7 @@ import type {
   RulePreview,
   ServerInfo,
   SuperuserOverride,
+  MappingSaveResult,
 } from './contract';
 
 /**
@@ -84,8 +85,9 @@ export interface Engine {
   /** Build the mapping again with these rules.  Choices made by hand are cleared. */
   rebuildMapping(rules: MappingRule[]): Promise<Mapping>;
 
-  /** Save the mapping so it can be exported later. */
-  saveMapping(mapping: Mapping): Promise<{ hash: string; json: string }>;
+  /** Save the mapping to a file the user chooses in a save dialog.  The file
+   *  can be used again by `dmux run` (`mapping = "<file>"`). */
+  saveMapping(mapping: Mapping): Promise<MappingSaveResult>;
 
   /** Build a default check plan from the mapping. */
   buildCheckPlan(

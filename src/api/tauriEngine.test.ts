@@ -359,8 +359,8 @@ describe('createTauriEngine', () => {
       if (cmd === 'build_mapping') {
         return Promise.resolve(rawMappingBuild());
       }
-      if (cmd === 'export_mapping') {
-        return Promise.resolve({ json: '{}', hash: 'abc123' });
+      if (cmd === 'save_mapping') {
+        return Promise.resolve({ status: 'saved', path: '/home/u/m.json', hash: 'abc123' });
       }
       return Promise.reject(new Error(`unexpected command ${cmd}`));
     });
@@ -370,7 +370,51 @@ describe('createTauriEngine', () => {
     await engine.buildMapping(structure);
     const saved = await engine.saveMapping(mapping());
 
-    expect(saved).toEqual({ json: '{}', hash: 'abc123' });
+    expect(saved).toEqual({ ok: true, filePath: '/home/u/m.json', hash: 'abc123' });
+    expect(invoke).toHaveBeenLastCalledWith(
+      'save_mapping',
+      expect.objectContaining({ mapping: expect.objectContaining({ version: expect.any(Number) }) }),
+    );
+  });
+
+  it('saveMapping says cancelled, or the error in plain words', async () => {
+    let answer: unknown = { status: 'cancelled' };
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      if (cmd === 'save_mapping') {
+        return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
+      }
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const engine = createTauriEngine();
+    await engine.buildMapping(await engine.compareStructure(profile(), profile()));
+    expect(await engine.saveMapping(mapping())).toEqual({ ok: false, cancelled: true });
+    answer = new Error('the mapping could not be written: disk full');
+    const failed = await engine.saveMapping(mapping());
+    expect(failed.ok).toBe(false);
+    expect(failed.error).toMatch(/disk full/);
+  });
+
+  it('buildMapping says which table each pair belongs to, with bare column names', async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'compare_structure') return Promise.resolve(rawDiff());
+      if (cmd === 'build_mapping') return Promise.resolve(rawMappingBuild());
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const engine = createTauriEngine();
+    const built = await engine.buildMapping(await engine.compareStructure(profile(), profile()));
+    const table = built.matches.find((m) => m.id === 'public.accounts');
+    expect(table).toMatchObject({ kind: 'table', group: 'public.accounts' });
+    const renamed = built.matches.find((m) => m.id === 'public.accounts.name');
+    expect(renamed).toMatchObject({
+      kind: 'column',
+      group: 'public.accounts',
+      oldLabel: 'name',
+      newLabel: 'full_name',
+    });
+    // The display fields never touch what the queue acts on.
+    expect(renamed?.ref).toBeUndefined();
   });
 
   it('saveMapping requires buildMapping first', async () => {
@@ -1194,7 +1238,7 @@ describe('mapping suggestions, edits and rules', () => {
     };
     invoke.mockImplementation((cmd: string) => {
       if (cmd === 'edit_mapping') return Promise.resolve(edited);
-      if (cmd === 'export_mapping') return Promise.resolve({ json: '{}', hash: 'h2' });
+      if (cmd === 'save_mapping') return Promise.resolve({ status: 'saved', path: '/m.json', hash: 'h2' });
       if (cmd === 'start_run') return Promise.resolve({ run_id: 'run-x' });
       return Promise.reject(new Error(`unexpected command ${cmd}`));
     });
@@ -1219,7 +1263,7 @@ describe('mapping suggestions, edits and rules', () => {
 
     await engine.saveMapping(next);
     expect(invoke).toHaveBeenCalledWith(
-      'export_mapping',
+      'save_mapping',
       expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h2' }) }),
     );
     await engine.startRun({
@@ -1257,7 +1301,7 @@ describe('mapping suggestions, edits and rules', () => {
     invoke.mockImplementation(() => Promise.resolve({ json: '{}', hash: 'h1' }));
     await engine.saveMapping(built);
     expect(invoke).toHaveBeenLastCalledWith(
-      'export_mapping',
+      'save_mapping',
       expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h1' }) }),
     );
   });
@@ -1274,7 +1318,7 @@ describe('mapping suggestions, edits and rules', () => {
         b.mapping.mapping_hash = 'h3';
         return Promise.resolve(b);
       }
-      if (cmd === 'export_mapping') return Promise.resolve({ json: '{}', hash: 'h3' });
+      if (cmd === 'save_mapping') return Promise.resolve({ status: 'saved', path: '/m.json', hash: 'h3' });
       return Promise.reject(new Error(`unexpected command ${cmd}`));
     });
     await expect(engine.previewRules(rules)).resolves.toEqual({
@@ -1286,7 +1330,7 @@ describe('mapping suggestions, edits and rules', () => {
     // A preview alone changes nothing the run would use.
     await engine.saveMapping(mapping());
     expect(invoke).toHaveBeenLastCalledWith(
-      'export_mapping',
+      'save_mapping',
       expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h1' }) }),
     );
 
@@ -1294,7 +1338,7 @@ describe('mapping suggestions, edits and rules', () => {
     expect(rebuilt.ruleSpecs).toEqual(rules);
     await engine.saveMapping(rebuilt);
     expect(invoke).toHaveBeenLastCalledWith(
-      'export_mapping',
+      'save_mapping',
       expect.objectContaining({ mapping: expect.objectContaining({ mapping_hash: 'h3' }) }),
     );
   });

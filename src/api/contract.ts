@@ -139,6 +139,15 @@ export interface MappingMatch {
   ref?: MappingItemRef;
   /** New names the engine says could be the counterpart. */
   candidates?: string[];
+  /** For showing what was mapped: a table or one of its columns. */
+  kind?: 'table' | 'column';
+  /** For showing what was mapped: the id of the table match this belongs to
+   *  (a table's own id for a table). */
+  group?: string;
+  /** For showing what was mapped: the bare old and new names (a column's own
+   *  name, without its table). */
+  oldLabel?: string;
+  newLabel?: string;
 }
 
 /** A guess at the new counterpart of an unmatched item.  Never used until the
@@ -500,6 +509,20 @@ export interface ReportRequest {
   format: ReportFormat;
   /** Include row keys in the exported report (off by default). */
   includeKeys: boolean;
+}
+
+/** The outcome of saving the mapping to a file. */
+export interface MappingSaveResult {
+  ok: boolean;
+  /** Where the file was saved (chosen in the native save dialog). */
+  filePath?: string;
+  /** The mapping code (SHA-256) written into the file. */
+  hash?: string;
+  /** The user dismissed the save dialog; nothing was written. */
+  cancelled?: boolean;
+  /** The browser demo cannot save files: nothing was written. */
+  demoOnly?: boolean;
+  error?: string;
 }
 
 export interface ReportResult {

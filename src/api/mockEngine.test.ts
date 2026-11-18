@@ -109,10 +109,12 @@ describe('mockEngine', () => {
     expect(mapping.matches.length).toBeGreaterThan(0);
   });
 
-  it('saves a mapping to a stable hash and JSON', async () => {
-    const { hash, json } = await mockEngine.saveMapping(mapping());
-    expect(hash).toMatch(/^mock-/);
-    expect(JSON.parse(json)).toEqual(mapping());
+  it('says plainly that the browser demo saves no mapping file', async () => {
+    const saved = await mockEngine.saveMapping(mapping());
+    expect(saved.ok).toBe(false);
+    expect(saved.demoOnly).toBe(true);
+    expect(saved.hash).toMatch(/^mock-/);
+    expect(await mockEngine.saveMapping(mapping())).toEqual(saved);
   });
 
   it('builds a check plan with 40 tables', async () => {

@@ -43,6 +43,7 @@ fn main() {
             commands::gateway::build_mapping,
             commands::gateway::update_mapping,
             commands::gateway::export_mapping,
+            commands::mapping_file::save_mapping,
             commands::gateway::import_mapping,
             commands::mapping_edit::edit_mapping,
             commands::mapping_edit::preview_rules,

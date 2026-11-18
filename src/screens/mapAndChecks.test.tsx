@@ -426,3 +426,105 @@ describe('chosenEstimate', () => {
   });
 });
 
+describe('MapScreen: what was mapped', () => {
+  it('is hidden until asked for, then lists every table with its columns', async () => {
+    const { engine, inventory, initial } = await diffSetup();
+    wrap(<MapHarness engine={engine} inventory={inventory} initial={initial} />);
+    const tables = initial.matches.filter((m) => m.kind === 'table').length;
+    const columns = initial.matches.filter((m) => m.kind === 'column').length;
+    expect(screen.getByTestId('matched-count').textContent).toMatch(
+      new RegExp(`${tables} tables and ${columns} columns paired`),
+    );
+    expect(screen.queryByTestId('matched-list')).toBeNull();
+
+    const show = screen.getByRole('button', { name: 'Show what was mapped' });
+    expect(show.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(show);
+    const list = screen.getByTestId('matched-list');
+    expect(within(list).getByText(/are paired\./)).toBeDefined();
+    // Open the accounts table: its columns show old -> new and how they paired.
+    fireEvent.click(within(list).getByRole('button', { name: 'Show the columns of accounts' }));
+    expect(within(list).getAllByText('balance').length).toBe(2);
+    expect(within(list).getAllByText('Same name').length).toBeGreaterThan(0);
+    expect(within(list).getAllByText('Needs your decision').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide what was mapped' }));
+    expect(screen.queryByTestId('matched-list')).toBeNull();
+  });
+
+  it('can be searched, and narrowed to renamed or undecided pairs', async () => {
+    const { engine, inventory, initial } = await diffSetup();
+    wrap(<MapHarness engine={engine} inventory={inventory} initial={initial} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Show what was mapped' }));
+    const list = screen.getByTestId('matched-list');
+    fireEvent.change(within(list).getByPlaceholderText('Find a table or column'), {
+      target: { value: 'posted' },
+    });
+    // The matching column shows under its table, opened by the search.
+    expect(within(list).getAllByText('posted_at').length).toBe(2);
+    expect(within(list).queryByText('archived_balances')).toBeNull();
+    fireEvent.change(within(list).getByPlaceholderText('Find a table or column'), {
+      target: { value: 'nothing-like-this' },
+    });
+    expect(within(list).getByText('Nothing matches.')).toBeDefined();
+    fireEvent.change(within(list).getByPlaceholderText('Find a table or column'), {
+      target: { value: '' },
+    });
+    fireEvent.click(within(list).getByRole('checkbox', { name: 'Only renamed or undecided' }));
+    // Only the undecided balance column (and its table) remains.
+    expect(within(list).getAllByText('balance').length).toBe(2);
+    expect(within(list).queryByText('posted_at')).toBeNull();
+  });
+});
+
+describe('MapScreen: Save mapping', () => {
+  const saveWith = async (result: Awaited<ReturnType<Engine['saveMapping']>> | Error) => {
+    const { engine, inventory, initial } = await diffSetup();
+    const saveMapping = vi
+      .spyOn(engine, 'saveMapping')
+      .mockImplementation(async () => {
+        if (result instanceof Error) throw result;
+        return result;
+      });
+    wrap(<MapHarness engine={engine} inventory={inventory} initial={initial} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(saveMapping).toHaveBeenCalledTimes(1));
+    return saveMapping;
+  };
+
+  it('says where the file was saved and its mapping code', async () => {
+    await saveWith({ ok: true, filePath: '/home/u/dmux-mapping.json', hash: '0123456789abcdef0123' });
+    const note = await screen.findByText(
+      'Mapping saved to /home/u/dmux-mapping.json (mapping code 0123456789ab).',
+    );
+    expect(note.className).toMatch(/emerald/);
+  });
+
+  it('says cancelled when the dialog is dismissed, not saved', async () => {
+    await saveWith({ ok: false, cancelled: true });
+    const note = await screen.findByText('Saving cancelled. Nothing was saved.');
+    expect(note.className).not.toMatch(/emerald/);
+  });
+
+  it('shows a refused save as an error in plain words', async () => {
+    await saveWith({ ok: false, error: 'the mapping could not be written: disk full' });
+    expect(await screen.findByText('The mapping was not saved')).toBeDefined();
+    expect(screen.getByText('the mapping could not be written: disk full')).toBeDefined();
+  });
+
+  it('shows a thrown error too, and never leaves the button stuck', async () => {
+    await saveWith(new Error('boom'));
+    expect(await screen.findByText('The mapping was not saved')).toBeDefined();
+    expect(
+      (screen.getByRole('button', { name: 'Save mapping' }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it('says plainly that the browser demo saves no file', async () => {
+    const { engine, inventory, initial } = await diffSetup();
+    wrap(<MapHarness engine={engine} inventory={inventory} initial={initial} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    expect(await screen.findByText(/This is the browser demo, so no file was saved/)).toBeDefined();
+  });
+});
+

@@ -33,6 +33,7 @@ import type {
   TableResult,
   TableRunState,
   Verdict,
+  MappingSaveResult,
 } from './contract';
 
 const deterministicId = (prefix: string, index: number) =>
@@ -216,6 +217,8 @@ const makeMapping = (inventory: Inventory): Mapping => {
           newName: table.name,
           confidence: 'exact',
           approved: true,
+          kind: 'table',
+          group: `m-${table.id}`,
         };
         matches.push(match);
         if (table.status !== 'same') {
@@ -230,6 +233,10 @@ const makeMapping = (inventory: Inventory): Mapping => {
             newName: `${table.name}.${col.name}`,
             confidence: col.status === 'same' ? 'exact' : 'fuzzy',
             approved: col.status === 'same',
+            kind: 'column',
+            group: `m-${table.id}`,
+            oldLabel: col.name,
+            newLabel: col.name,
           };
           matches.push(colMatch);
           if (!colMatch.approved) {
@@ -956,7 +963,7 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
       };
     },
 
-    async saveMapping(mapping: Mapping): Promise<{ hash: string; json: string }> {
+    async saveMapping(mapping: Mapping): Promise<MappingSaveResult> {
       const json = JSON.stringify(mapping);
       // Simple deterministic hash for tests.
       let hash = 0;
@@ -964,7 +971,8 @@ export function createMockEngine(options: MockEngineOptions = {}): Engine {
         hash = (hash << 5) - hash + json.charCodeAt(i);
         hash = Math.trunc(hash);
       }
-      return { hash: `mock-${Math.abs(hash).toString(16)}`, json };
+      // The browser demo has no file system: say so instead of pretending.
+      return { ok: false, demoOnly: true, hash: `mock-${Math.abs(hash).toString(16)}` };
     },
 
     async buildCheckPlan(): Promise<CheckPlan> {

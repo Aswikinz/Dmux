@@ -17,6 +17,15 @@ Choose exactly which tables a run reads.
   the results, the coverage line and every report, so nothing is left out silently.
 - Levels, the bulk tools, the totals and the time estimate cover only the chosen tables.
 
+### Map
+
+- **Show what was mapped** lists every paired table, with its columns underneath, the old
+  and new names, and how each pair was made. It can be searched and narrowed to the
+  renamed or undecided pairs.
+- **Save mapping** now saves a file. Before, it did nothing you could see. A save dialog
+  opens, and the screen says where the file went and its mapping code, or that saving was
+  cancelled or failed. The file is owner-only and can be reused with `dmux run`.
+
 ## 1.1.0 (2026-11-18)
 
 Reports that are easier to read and record when the check ran.
