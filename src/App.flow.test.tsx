@@ -88,4 +88,41 @@ describe('App full flow', () => {
       cleanup();
     }
   });
+
+  it('after a run, going back and choosing other tables runs again with the new choice', async () => {
+    const cleanup = renderForced('pass');
+    try {
+      await connectAndAdvance();
+      fireEvent.click(cta('Map tables'));
+      await screen.findByText(/No items need attention|items need attention/);
+      fireEvent.click(cta('Choose checks'));
+      await chooseAllTables();
+      fireEvent.click(cta('Run'));
+      await screen.findByText('The run has finished.');
+      const firstRows = screen.getAllByText(/^demo_bank\.table_\d{4}$/).length;
+      fireEvent.click(cta('See results'));
+      await screen.findByText(/tables fully checked/);
+
+      // Back to Choose checks, keep only the archive schema, and run again.
+      fireEvent.click(cta('Back'));
+      await screen.findByText('The run has finished.');
+      fireEvent.click(cta('Back'));
+      fireEvent.click(await screen.findByRole('button', { name: 'Clear all' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Every table in archive' }));
+      fireEvent.click(cta('Run'));
+
+      // A new run: it reads only the 4 chosen tables, not the 40 from before.
+      await screen.findByText('The run has finished.');
+      const rows = screen.getAllByText(/^demo_bank\.table_\d{4}$/).length;
+      expect(firstRows).toBe(40);
+      expect(rows).toBe(4);
+      // Its results name the 36 tables left out, with the app's reason.
+      fireEvent.click(cta('See results'));
+      fireEvent.click(await screen.findByRole('button', { name: 'Show ignored items' }));
+      expect(screen.getAllByText(/not selected for this run/).length).toBe(36);
+    } finally {
+      cleanup();
+    }
+  });
+
 });

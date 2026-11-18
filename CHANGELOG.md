@@ -3,6 +3,16 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- After a run, going back to Choose checks, changing the tables or levels and pressing
+  **Run** starts a new run. Before, it showed the finished run again. Changing the choices
+  also clears the old run's results from the steps (they stay in History), and a run that
+  is still going is never left running unseen: Run takes you back to it, and the screen
+  says so.
+
 ## 1.3.0 (2026-11-18)
 
 Built for very large databases, with a cleaner Results screen.

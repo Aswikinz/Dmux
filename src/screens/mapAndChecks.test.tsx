@@ -528,3 +528,25 @@ describe('MapScreen: Save mapping', () => {
   });
 });
 
+describe('ChooseChecksScreen with a run still going', () => {
+  it('says so, and Run returns to that run', async () => {
+    const onNext = vi.fn();
+    const engine = createMockEngine();
+    const plan = await engine.buildCheckPlan({ rules: [], matches: [], needsAttention: [], ignored: [] });
+    wrap(
+      <ChooseChecksScreen
+        engine={engine}
+        mapping={{ rules: [], matches: [], needsAttention: [], ignored: [] }}
+        plan={plan}
+        onPlanChange={() => {}}
+        runInProgress
+        onNext={onNext}
+        onBack={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('run-in-progress').textContent).toMatch(/A run is still going/);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onNext).toHaveBeenCalledTimes(1);
+  });
+});
+

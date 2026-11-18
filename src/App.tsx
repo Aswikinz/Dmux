@@ -117,6 +117,23 @@ function AppShell() {
     }
   }, [step]);
 
+  // A run still going on the backend: never orphaned by starting another.
+  const runActive =
+    progress !== null && progress.overallState !== 'done' && progress.overallState !== 'cancelled';
+
+  /** Forget the last finished run, so the next Run starts a new one.  Its
+   *  results stay in History. */
+  const forgetRun = useCallback(() => {
+    setProgress(null);
+    setResults(null);
+    setResultsOpened(false);
+    setCompleted((prev) => {
+      const next = new Set(prev);
+      for (const s of ['run', 'results', 'report'] as Step[]) next.delete(s);
+      return next;
+    });
+  }, []);
+
   const restart = useCallback(() => {
     setView('steps');
     setStep('connect');
@@ -284,8 +301,16 @@ function AppShell() {
               onPlanChange={(p) => {
                 setPlan(p);
                 markCompleted('checks');
+                // A finished run no longer matches the new choices.
+                if (!runActive) forgetRun();
               }}
-              onNext={advance}
+              runInProgress={runActive}
+              onNext={() => {
+                // Run starts a new run, unless one is still going: then it
+                // shows that run instead of leaving it running unseen.
+                if (!runActive) forgetRun();
+                advance();
+              }}
               onBack={back}
             />
           )}

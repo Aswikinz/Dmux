@@ -28,6 +28,8 @@ interface ChooseChecksScreenProps {
   mapping: Mapping;
   plan: CheckPlan | null;
   onPlanChange: (plan: CheckPlan) => void;
+  /** A run is still going: Run shows it rather than starting another. */
+  runInProgress?: boolean;
   onNext: () => void;
   onBack: () => void;
 }
@@ -98,6 +100,7 @@ export function ChooseChecksScreen({
   mapping,
   plan,
   onPlanChange,
+  runInProgress = false,
   onNext,
   onBack,
 }: ChooseChecksScreenProps) {
@@ -548,6 +551,12 @@ export function ChooseChecksScreen({
               Back
             </Button>
             <div className="flex items-center gap-4">
+              {runInProgress && (
+                <span className="max-w-md text-sm text-slate-600 dark:text-slate-300" data-testid="run-in-progress">
+                  A run is still going. Run takes you back to it; start a new one when it has
+                  finished, or after cancelling it.
+                </span>
+              )}
               {chosen.length === 0 && (
                 <span className="text-sm text-slate-600 dark:text-slate-300">
                   Choose at least one table to run.
