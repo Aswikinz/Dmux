@@ -1,5 +1,8 @@
 import type { CheckChoices, CheckPlan, PlanColumn, TableCheck } from '../api/contract';
 
+/** Names in a stable alphabetical order. */
+const byText = (a: string, b: string): number => a.localeCompare(b);
+
 /** A table's `schema.table`. */
 export const tablePath = (t: TableCheck): string => `${t.schemaName}.${t.tableName}`;
 
@@ -31,7 +34,7 @@ export function setColumnCompared(t: TableCheck, column: string, compared: boole
     : (t.controlTotalColumns ?? []).filter((c) => c !== column);
   return {
     ...t,
-    leftOutColumns: out.size > 0 ? [...out].sort() : undefined,
+    leftOutColumns: out.size > 0 ? [...out].sort(byText) : undefined,
     controlTotalColumns: totals && totals.length > 0 ? totals : undefined,
   };
 }
@@ -57,7 +60,7 @@ export function setControlTotal(t: TableCheck, column: string, on: boolean): Tab
   if (on) totals.add(column);
   else totals.delete(column);
   const base = on ? setColumnCompared(t, column, true) : t;
-  return { ...base, controlTotalColumns: totals.size > 0 ? [...totals].sort() : undefined };
+  return { ...base, controlTotalColumns: totals.size > 0 ? [...totals].sort(byText) : undefined };
 }
 
 /** The number columns Dmux suggests adding up that are still compared. */
@@ -98,7 +101,7 @@ export function planToChoices(plan: CheckPlan): CheckChoices {
         table: tablePath(t),
         level: t.level,
         leftOutColumns: effectiveLeftOut(t),
-        controlTotals: [...(t.controlTotalColumns ?? [])].sort(),
+        controlTotals: [...(t.controlTotalColumns ?? [])].sort(byText),
       })),
   };
 }
@@ -159,8 +162,8 @@ export function applyChoices(plan: CheckPlan, choices: CheckChoices): { plan: Ch
       ...t,
       included: true,
       level: choice.level,
-      leftOutColumns: leftOut.length > 0 ? leftOut.sort() : undefined,
-      controlTotalColumns: totals.length > 0 ? totals.sort() : undefined,
+      leftOutColumns: leftOut.length > 0 ? leftOut.sort(byText) : undefined,
+      controlTotalColumns: totals.length > 0 ? totals.sort(byText) : undefined,
     };
   });
   return { plan: { ...plan, tables, runWindow: choices.runWindow ?? plan.runWindow }, report };

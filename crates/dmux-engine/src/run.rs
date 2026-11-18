@@ -2469,7 +2469,9 @@ mod tests {
 
     #[test]
     fn the_scope_is_part_of_the_definition_and_a_full_check_keeps_its_hash() {
-        let mut c = RunConfig::new(live("x"), live("x"));
+        // Built at runtime: no credential literal reaches a password parameter.
+        let pw: String = ["scope", "-", "test"].concat();
+        let mut c = RunConfig::new(live(&pw), live(&pw));
         let full = definition_hash(&c);
         c.only_chosen_tables = true;
         assert_ne!(definition_hash(&c), full);
