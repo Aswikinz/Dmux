@@ -153,12 +153,33 @@ function DrillDown({ rows }: { rows: DrillDownRow[] }) {
   );
 }
 
+/**
+ * The table a failure card belongs to.  A table card names the table itself;
+ * a structure finding names a table ("s.t") or something inside one
+ * ("s.t.column", "s.t.index").  Database-wide findings (encoding, extensions,
+ * functions) and sequences belong to no table, so they have no details.
+ */
+export function owningTable(card: FailureCard, tables: TableResult[]): TableResult | undefined {
+  return (
+    tables.find((t) => t.tableId === card.tableId) ??
+    tables
+      .filter((t) => card.tableId.startsWith(`${t.tableId}.`))
+      .sort((a, b) => b.tableId.length - a.tableId.length)[0]
+  );
+}
+
 function FailureCardItem({
   card,
+  rowsShown,
+  detailsShown,
   onDrillDown,
   onDetails,
 }: {
   card: FailureCard;
+  /** Whether "Show rows" is offered (only when there are rows to show) and its state. */
+  rowsShown: boolean | null;
+  /** Whether "Show details" is offered (only when the card belongs to a table) and its state. */
+  detailsShown: boolean | null;
   onDrillDown: () => void;
   onDetails: () => void;
 }) {
@@ -174,19 +195,26 @@ function FailureCardItem({
         </div>
         <StatusBadge status={card.verdict} />
       </div>
-      <div className="mt-2 flex flex-wrap gap-2">
-        <Button onClick={onDrillDown} variant="ghost" size="sm">
-          Show rows
-        </Button>
-        <Button
-          onClick={onDetails}
-          variant="ghost"
-          size="sm"
-          aria-label={`Show details for ${card.schemaName}.${card.tableName}`}
-        >
-          Show details
-        </Button>
-      </div>
+      {(rowsShown !== null || detailsShown !== null) && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {rowsShown !== null && (
+            <Button onClick={onDrillDown} variant="ghost" size="sm" aria-expanded={rowsShown}>
+              {rowsShown ? 'Hide rows' : 'Show rows'}
+            </Button>
+          )}
+          {detailsShown !== null && (
+            <Button
+              onClick={onDetails}
+              variant="ghost"
+              size="sm"
+              aria-expanded={detailsShown}
+              aria-label={`${detailsShown ? 'Hide' : 'Show'} details for ${card.schemaName}.${card.tableName}`}
+            >
+              {detailsShown ? 'Hide details' : 'Show details'}
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -202,6 +230,9 @@ export function ResultsScreen({
   const [error, setError] = useState<string | null>(null);
   const [expandedFailures, setExpandedFailures] = useState<Set<string>>(new Set());
   const [detailId, setDetailId] = useState<string | null>(null);
+  // Where the open detail panel sits: under the failure card that opened it,
+  // or (null) above the list of all tables.
+  const [detailCard, setDetailCard] = useState<string | null>(null);
   const detailHeading = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -233,7 +264,7 @@ export function ResultsScreen({
       detailHeading.current?.focus();
       detailHeading.current?.scrollIntoView?.({ block: 'nearest' });
     }
-  }, [detailId]);
+  }, [detailId, detailCard]);
 
   const tableColumns = useMemo(() => {
     const col = createColumnHelper<TableResult>();
@@ -270,7 +301,10 @@ export function ResultsScreen({
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => setDetailId(row.original.tableId)}
+            onClick={() => {
+              setDetailCard(null);
+              setDetailId(row.original.tableId);
+            }}
             aria-label={`Details for ${row.original.schemaName}.${row.original.tableName}`}
           >
             Details
@@ -322,12 +356,25 @@ export function ResultsScreen({
           <div className="space-y-4">
             {results.failures.map((card) => {
               const expanded = expandedFailures.has(card.id);
-              const related = results.tableResults.find((t) => t.tableId === card.tableId);
+              const related = owningTable(card, results.tableResults);
+              const hasRows = card.tableId === related?.tableId && (related.drillDown?.length ?? 0) > 0;
+              const detailsOpen = related !== undefined && detailCard === card.id && detailId === related.tableId;
               return (
                 <div key={card.id}>
                   <FailureCardItem
                     card={card}
-                    onDetails={() => setDetailId(card.tableId)}
+                    rowsShown={hasRows ? expanded : null}
+                    detailsShown={related ? detailsOpen : null}
+                    onDetails={() => {
+                      if (!related) return;
+                      if (detailsOpen) {
+                        setDetailId(null);
+                        setDetailCard(null);
+                      } else {
+                        setDetailCard(card.id);
+                        setDetailId(related.tableId);
+                      }
+                    }}
                     onDrillDown={() =>
                       setExpandedFailures((prev) => {
                         const next = new Set(prev);
@@ -340,7 +387,19 @@ export function ResultsScreen({
                       })
                     }
                   />
-                  {expanded && related?.drillDown && <DrillDown rows={related.drillDown} />}
+                  {hasRows && expanded && related?.drillDown && <DrillDown rows={related.drillDown} />}
+                  {detailsOpen && related && (
+                    <div className="mt-3">
+                      <TableDetailPanel
+                        ref={detailHeading}
+                        table={related}
+                        onClose={() => {
+                          setDetailId(null);
+                          setDetailCard(null);
+                        }}
+                      />
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -349,7 +408,8 @@ export function ResultsScreen({
       )}
 
       {(() => {
-        const open = results.tableResults.find((t) => t.tableId === detailId);
+        const open =
+          detailCard === null ? results.tableResults.find((t) => t.tableId === detailId) : undefined;
         return open ? (
           <TableDetailPanel ref={detailHeading} table={open} onClose={() => setDetailId(null)} />
         ) : null;

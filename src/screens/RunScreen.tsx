@@ -227,6 +227,13 @@ export function RunScreen({
                 <ProgressRow key={t.tableId} progress={t} />
               ))}
             </div>
+            {progress.tables.some((t) => t.state === 'not-scanned') && (
+              <p className="mb-4 text-sm text-slate-600 dark:text-slate-300" data-testid="not-scanned-note">
+                Tables marked &ldquo;Not scanned&rdquo; were not read: either they have no matching
+                table in the new database, or the run stopped before reaching them. Results explain
+                each one.
+              </p>
+            )}
             <div className="flex gap-3">
               <Button
                 onClick={togglePause}

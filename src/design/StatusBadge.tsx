@@ -24,6 +24,7 @@ interface StatusBadgeProps {
     | 'done'
     | 'failed'
     | 'changed-during-check'
+    | 'not-scanned'
     | 'same'
     | 'missing'
     | 'added'
@@ -53,6 +54,7 @@ const config: Record<
   paused: { icon: Info, label: 'Paused', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   cancelled: { icon: AlertCircle, label: 'Cancelled', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   queued: { icon: Info, label: 'Queued', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
+  'not-scanned': { icon: Info, label: 'Not scanned', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   // A finished scan is not a verdict: a neutral flag, never a success tick.
   done: { icon: Flag, label: 'Scan finished', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },
   failed: { icon: XCircle, label: 'Scan failed', classes: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300' },

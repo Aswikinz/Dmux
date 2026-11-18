@@ -728,10 +728,20 @@ pub(crate) fn poll_run_with(
     for path in config.levels.keys() {
         let (schema, table) = split_path(path);
         let done = finished.contains(path);
+        // Once the run has ended, a table with no saved result was never
+        // scanned (no counterpart in the new database, or the run stopped
+        // first); "queued" would claim it is still to come.  Its verdict, if
+        // any, is on the results.
+        let ended = matches!(
+            phase,
+            RunPhase::Done | RunPhase::Failed | RunPhase::Cancelled
+        );
         let state = if done {
             "done"
         } else if working && running_table.as_deref() == Some(path.as_str()) {
             "running"
+        } else if ended {
+            "not-scanned"
         } else {
             "queued"
         };
@@ -1953,7 +1963,21 @@ mod tests {
             .runs
             .transition(&id, &[RunPhase::Running], RunPhase::Paused)
             .unwrap();
-        let p = poll_run_with(id, &state).unwrap();
+        let p = poll_run_with(id.clone(), &state).unwrap();
         assert!(p.eta_seconds_min.is_none() && p.waiting_for_window.is_none());
+        // Paused: an unscanned table is still to come.
+        assert!(p.tables.iter().all(|t| t.state == "queued"));
+
+        // Ended: a table the run never scanned is not "queued" any more.
+        state
+            .runs
+            .transition(&id, &[RunPhase::Paused], RunPhase::Cancelled)
+            .unwrap();
+        let p = poll_run_with(id, &state).unwrap();
+        assert!(
+            p.tables.iter().all(|t| t.state == "not-scanned"),
+            "{:?}",
+            p.tables.iter().map(|t| &t.state).collect::<Vec<_>>()
+        );
     }
 }

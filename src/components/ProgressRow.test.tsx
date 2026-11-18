@@ -71,4 +71,21 @@ describe('ProgressRow', () => {
     render(<ProgressRow progress={progress} />);
     expect(screen.getByText('about 12 seconds left')).toBeDefined();
   });
+
+  it('says Not scanned (never Queued) for a table the ended run did not read', () => {
+    render(
+      <ProgressRow
+        progress={{
+          tableId: 'structure.client_notes',
+          schemaName: 'structure',
+          tableName: 'client_notes',
+          state: 'not-scanned',
+          progressPercent: 0,
+        }}
+      />,
+    );
+    expect(screen.getByText('Not scanned')).toBeDefined();
+    expect(screen.queryByText('Queued')).toBeNull();
+  });
 });
+

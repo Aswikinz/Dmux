@@ -235,7 +235,9 @@ export type TableRunState =
   | 'done'
   | 'failed'
   | 'cancelled'
-  | 'changed-during-check';
+  | 'changed-during-check'
+  /** The run ended without scanning this table (see its result). */
+  | 'not-scanned';
 
 export interface TableProgress {
   tableId: string;

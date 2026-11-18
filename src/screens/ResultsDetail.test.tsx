@@ -210,3 +210,87 @@ describe('What was checked', () => {
     expect(screen.getByText(/was not recorded for this run/)).toBeDefined();
   });
 });
+
+/** The mock FAIL results plus the cards a real edge-case run produces: a
+ *  finding inside a table (a dropped column), a database-wide finding, and a
+ *  table that failed with no rows to show. */
+async function edgeEngine(): Promise<Engine> {
+  const base = createMockEngine({ forcedFixture: 'fail' });
+  const real = await base.getResults('run-fail');
+  const tableWithRows = real.tableResults.find((t) => (t.drillDown?.length ?? 0) > 0)!;
+  const dropped: TableResult = {
+    ...tableWithRows,
+    tableId: 'structure.dropped_column',
+    schemaName: 'structure',
+    tableName: 'dropped_column',
+    drillDown: undefined,
+  };
+  const results: Results = {
+    ...real,
+    tableResults: [...real.tableResults, dropped],
+    failures: [
+      ...real.failures,
+      {
+        id: 'struct-structure.dropped_column.legacy_flag',
+        tableId: 'structure.dropped_column.legacy_flag',
+        schemaName: 'structure',
+        tableName: 'dropped_column.legacy_flag',
+        level: 'structure',
+        verdict: 'FAIL',
+        summary: 'column missing in new: legacy_flag',
+        detail: 'an inventory object differs between the two databases',
+      },
+      {
+        id: 'struct-database.encoding',
+        tableId: 'database.encoding',
+        schemaName: 'database',
+        tableName: 'encoding',
+        level: 'structure',
+        verdict: 'WARNING',
+        summary: 'encoding differs',
+        detail: 'an inventory object differs between the two databases',
+      },
+    ],
+  };
+  return { ...base, getResults: async () => results };
+}
+
+function cardOf(summary: string): HTMLElement {
+  return screen.getByText(summary).closest('div.rounded-lg') as HTMLElement;
+}
+
+describe('Failure cards: Show rows and Show details always do something', () => {
+  it('opens the details of the table a column finding belongs to, right under that card', async () => {
+    wrap(<Harness engine={await edgeEngine()} runId="run-edge" />);
+    await screen.findByText('Failures');
+    const card = cardOf('column missing in new: legacy_flag');
+    fireEvent.click(within(card).getByRole('button', { name: /^Show details for structure\.dropped_column/ }));
+    const heading = screen.getByRole('heading', { name: 'Details for structure.dropped_column' });
+    // Directly below the card that was clicked, not at the end of the list.
+    expect(card.parentElement?.contains(heading)).toBe(true);
+    expect(document.activeElement).toBe(heading);
+    // The same button closes it again.
+    fireEvent.click(within(card).getByRole('button', { name: /^Hide details/ }));
+    expect(screen.queryByRole('heading', { name: 'Details for structure.dropped_column' })).toBeNull();
+  });
+
+  it('offers no buttons on a database-wide finding, which belongs to no table', async () => {
+    wrap(<Harness engine={await edgeEngine()} runId="run-edge" />);
+    await screen.findByText('Failures');
+    expect(within(cardOf('encoding differs')).queryByRole('button')).toBeNull();
+  });
+
+  it('offers Show rows only where there are rows, and it shows them', async () => {
+    wrap(<Harness engine={await edgeEngine()} runId="run-edge" />);
+    await screen.findByText('Failures');
+    expect(
+      within(cardOf('column missing in new: legacy_flag')).queryByRole('button', { name: 'Show rows' }),
+    ).toBeNull();
+    const rows = screen.getAllByRole('button', { name: 'Show rows' });
+    expect(rows.length).toBeGreaterThan(0);
+    fireEvent.click(rows[0]);
+    expect(screen.getByRole('button', { name: 'Hide rows' }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getAllByText(/missing in new|changed|extra in new/i).length).toBeGreaterThan(0);
+  });
+});
+

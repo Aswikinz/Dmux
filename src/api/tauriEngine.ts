@@ -980,6 +980,8 @@ export function mapTableState(raw: string): TableRunState {
       return 'cancelled';
     case 'changed-during-check':
       return 'changed-during-check';
+    case 'not-scanned':
+      return 'not-scanned';
     default:
       return 'queued';
   }
