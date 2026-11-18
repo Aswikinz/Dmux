@@ -1277,6 +1277,19 @@ mod tests {
         }
     }
 
+    /// Read the URL of an owner-only database (edge_bank): CI never has one,
+    /// so an unset URL always skips, in CI too.  Mandatory CI databases use
+    /// [`env_url`], which fails under CI instead.
+    fn owner_url(name: &str) -> Option<String> {
+        match std::env::var(name) {
+            Ok(u) => Some(u),
+            Err(_) => {
+                eprintln!("skipped: {name} not set (owner-only check)");
+                None
+            }
+        }
+    }
+
     fn profile_from_url(url: &str) -> ConnProfile {
         let url = url
             .strip_prefix("postgres://")
@@ -1901,10 +1914,10 @@ mod tests {
     /// DMUX_TEST_EDGE_NEW_URL point at testdata/edge_bank (owner check).
     #[tokio::test]
     async fn a_scoped_run_matches_the_full_run_for_every_table() {
-        let Some(old) = env_url("DMUX_TEST_EDGE_OLD_URL") else {
+        let Some(old) = owner_url("DMUX_TEST_EDGE_OLD_URL") else {
             return;
         };
-        let Some(new) = env_url("DMUX_TEST_EDGE_NEW_URL") else {
+        let Some(new) = owner_url("DMUX_TEST_EDGE_NEW_URL") else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();

@@ -173,6 +173,11 @@ jobs:
     env:
       DMUX_TEST_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/bank
       DMUX_TEST_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/bank
+      # The live data-half tests require demo_bank whenever CI=true (they fail
+      # rather than skip, so a missing fixture can never pass silently). Built
+      # below on the 9.4 -> 18 pair, like the main CI job does on 9.6 -> 17.
+      DMUX_TEST_DEMO_OLD_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5433/demo_bank
+      DMUX_TEST_DEMO_NEW_URL: postgres://dmux_dev:dmux_dev_only@127.0.0.1:5434/demo_bank
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -206,6 +211,11 @@ jobs:
             done
             pg_isready -h 127.0.0.1 -p "$port" -U dmux_dev -d bank
           done
+
+      # The demo_bank fixture (default --plant: the answer-key build), as in the
+      # main CI job, so the live data-half tests run on the extreme versions.
+      - name: Build demo_bank fixture (old -> new)
+        run: bash testdata/demo_bank/build.sh 5433 5434
 
       # The comparison core's live-DB tests connect to DMUX_TEST_OLD_URL/NEW_URL
       # and cross-check the extreme versions (9.4 vs 18).
