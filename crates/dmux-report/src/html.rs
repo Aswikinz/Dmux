@@ -214,18 +214,22 @@ fn hero(h: &mut String, layout: &Layout, shown: &str) {
     // Counted before anything was left out, so the tiles never under-report.
     let data = layout.data_issue_tables;
     let other = layout.other_issue_tables;
-    let tiles = [
+    let mut tiles = vec![
         ("In scope", layout.in_scope, ""),
         ("Fully checked", layout.fully_checked, ""),
         ("Counts only", layout.counts_only, ""),
         ("Ignored", layout.ignored, ""),
-        ("Data differences", data, if data > 0 { " bad" } else { "" }),
-        (
-            "Other failures",
-            other,
-            if other > 0 { " caution-tile" } else { "" },
-        ),
     ];
+    // The parts always add up to the tables in scope.
+    if layout.not_checked > 0 {
+        tiles.push(("Not checked", layout.not_checked, " caution-tile"));
+    }
+    tiles.push(("Data differences", data, if data > 0 { " bad" } else { "" }));
+    tiles.push((
+        "Other failures",
+        other,
+        if other > 0 { " caution-tile" } else { "" },
+    ));
     h.push_str(r#"<div class="tiles">"#);
     for (label, n, class) in tiles {
         let _ = write!(

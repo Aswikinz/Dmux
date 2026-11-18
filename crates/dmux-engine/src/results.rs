@@ -573,10 +573,34 @@ pub fn coverage_line(
     structure_only: usize,
     ignored: usize,
 ) -> String {
-    format!(
+    let line = format!(
         "{fully_checked} of {in_scope} tables fully checked, {counts_only} counts only, \
          {structure_only} structure only, {ignored} ignored"
-    )
+    );
+    // Tables in scope that reached no conclusion (missing on one side, only in
+    // the new database, unreadable, changed during the check) are named, so the
+    // parts always add up to the tables in scope.
+    match not_checked(
+        in_scope,
+        fully_checked,
+        counts_only,
+        structure_only,
+        ignored,
+    ) {
+        0 => line,
+        n => format!("{line}, {n} not checked"),
+    }
+}
+
+/// Tables in scope that were neither checked at any level nor ignored.
+pub fn not_checked(
+    in_scope: usize,
+    fully_checked: usize,
+    counts_only: usize,
+    structure_only: usize,
+    ignored: usize,
+) -> usize {
+    in_scope.saturating_sub(fully_checked + counts_only + structure_only + ignored)
 }
 
 /// Generate a fresh, URL-safe run identifier.
@@ -997,6 +1021,20 @@ mod tests {
             coverage_line(1529, 1480, 40, 0, 9),
             "1480 of 1529 tables fully checked, 40 counts only, 0 structure only, 9 ignored"
         );
+    }
+
+    #[test]
+    fn the_coverage_line_always_adds_up_to_the_tables_in_scope() {
+        // Two tables in scope reached no conclusion (one missing from the new
+        // database, one only in the new database): the line names them.
+        assert_eq!(
+            coverage_line(34, 32, 0, 0, 0),
+            "32 of 34 tables fully checked, 0 counts only, 0 structure only, 0 ignored, 2 not checked"
+        );
+        assert_eq!(not_checked(34, 32, 0, 0, 0), 2);
+        assert_eq!(not_checked(10, 6, 2, 1, 1), 0);
+        // Never negative, whatever the inputs.
+        assert_eq!(not_checked(1, 5, 0, 0, 0), 0);
     }
 
     #[test]

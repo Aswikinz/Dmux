@@ -9,6 +9,10 @@ Data differences first, everywhere, and less noise.
 
 ### Results
 
+- The coverage line always adds up to the tables in scope. Tables that could not be
+  checked at all (missing from the new database, only in the new database, unreadable) are
+  now named: "32 of 34 tables fully checked, 0 counts only, 0 structure only, 0 ignored,
+  2 not checked". The PDF and HTML reports show a **Not checked** tile when there are any.
 - Every failure says what kind of problem it is: **data differences** (rows or values
   differ), **structure differences**, or **other reasons** (a tool fault, data changing
   during the check, an item to review). Data differences are listed first. A table that

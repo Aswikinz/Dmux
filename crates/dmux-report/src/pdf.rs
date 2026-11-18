@@ -716,22 +716,30 @@ fn stat_tiles(c: &mut Canvas, layout: &Layout) {
     // Counted before anything was left out, so the tiles never under-report.
     let data = layout.data_issue_tables;
     let other = layout.other_issue_tables;
-    let tiles = [
+    let mut tiles = vec![
         ("In scope", layout.in_scope.to_string(), None),
         ("Fully checked", layout.fully_checked.to_string(), None),
         ("Counts only", layout.counts_only.to_string(), None),
         ("Ignored", layout.ignored.to_string(), None),
-        (
-            "Data differences",
-            data.to_string(),
-            (data > 0).then_some(Tone::Bad),
-        ),
-        (
-            "Other failures",
-            other.to_string(),
-            (other > 0).then_some(Tone::Caution),
-        ),
     ];
+    // The parts always add up to the tables in scope.
+    if layout.not_checked > 0 {
+        tiles.push((
+            "Not checked",
+            layout.not_checked.to_string(),
+            Some(Tone::Caution),
+        ));
+    }
+    tiles.push((
+        "Data differences",
+        data.to_string(),
+        (data > 0).then_some(Tone::Bad),
+    ));
+    tiles.push((
+        "Other failures",
+        other.to_string(),
+        (other > 0).then_some(Tone::Caution),
+    ));
     let gap = 6.0;
     let w = (CONTENT_W - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
     let h = 46.0;

@@ -26,7 +26,18 @@ interface ResultsScreenProps {
 }
 
 export function coverageLabel(coverage: Results['coverage']): string {
-  return `${coverage.fullValuesTables} of ${coverage.totalTables} tables fully checked, ${coverage.countsTables} counts only, ${coverage.structureTables} structure only, ${coverage.ignoredTables} ignored`;
+  const line = `${coverage.fullValuesTables} of ${coverage.totalTables} tables fully checked, ${coverage.countsTables} counts only, ${coverage.structureTables} structure only, ${coverage.ignoredTables} ignored`;
+  // Tables in scope that reached no conclusion are named, so the parts always
+  // add up to the tables in scope.
+  const notChecked = Math.max(
+    0,
+    coverage.totalTables -
+      coverage.fullValuesTables -
+      coverage.countsTables -
+      coverage.structureTables -
+      coverage.ignoredTables,
+  );
+  return notChecked > 0 ? `${line}, ${notChecked} not checked` : line;
 }
 
 /** Every ticked option is listed, in table.column: option form (H2 / decision 23). */

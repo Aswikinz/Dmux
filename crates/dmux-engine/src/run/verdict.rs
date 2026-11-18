@@ -821,9 +821,11 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(r.in_scope, 5);
+        // s.c (missing in new) and s.d (tool fault) reached no conclusion: the
+        // line names them, so its parts add up to the 5 tables in scope.
         assert_eq!(
             r.coverage_line,
-            "1 of 5 tables fully checked, 1 counts only, 1 structure only, 0 ignored"
+            "1 of 5 tables fully checked, 1 counts only, 1 structure only, 0 ignored, 2 not checked"
         );
         assert_eq!(r.tables["s.c"].verdict, Verdict::Fail);
         assert_eq!(r.tables["s.d"].verdict, Verdict::ToolFault);

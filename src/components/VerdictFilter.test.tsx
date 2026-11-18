@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
 import { VerdictFilter } from './VerdictFilter';
-import { kindCounts, resultCounts, resultItems } from '../screens/ResultsScreen';
+import { coverageLabel, kindCounts, resultCounts, resultItems } from '../screens/ResultsScreen';
 import type { IssueKind, Results, Verdict } from '../api/contract';
 
 function Harness({
@@ -95,3 +95,16 @@ describe('resultCounts and kindCounts', () => {
     expect(kindCounts(results)).toEqual({ data: 1, structure: 2 });
   });
 });
+
+describe('coverageLabel', () => {
+  it('names the tables in scope that were not checked, so the parts add up', () => {
+    const c = { totalTables: 34, fullValuesTables: 32, countsTables: 0, structureTables: 0, ignoredTables: 0 };
+    expect(coverageLabel(c)).toBe(
+      '32 of 34 tables fully checked, 0 counts only, 0 structure only, 0 ignored, 2 not checked',
+    );
+    expect(coverageLabel({ ...c, fullValuesTables: 34 })).toBe(
+      '34 of 34 tables fully checked, 0 counts only, 0 structure only, 0 ignored',
+    );
+  });
+});
+

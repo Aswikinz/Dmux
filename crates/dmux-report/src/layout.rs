@@ -436,6 +436,9 @@ pub struct Layout {
     pub ignored: usize,
     pub in_scope: usize,
     pub structure_only: usize,
+    /// Tables in scope that were neither checked at any level nor ignored
+    /// (missing on one side, only in the new database, unreadable).
+    pub not_checked: usize,
     pub ignored_items: Vec<Ignored>,
     pub warnings: Vec<String>,
     pub changed_during_check: Vec<String>,
@@ -618,6 +621,13 @@ pub fn build(
         counts_only: results.counts_only,
         ignored: results.ignored,
         in_scope: results.in_scope,
+        not_checked: dmux_engine::results::not_checked(
+            results.in_scope,
+            results.fully_checked,
+            results.counts_only,
+            results.structure_only,
+            results.ignored,
+        ),
         structure_only: results.structure_only,
         ignored_items: results
             .ignored_items
