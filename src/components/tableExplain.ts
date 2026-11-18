@@ -25,7 +25,12 @@ export function sameDecimal(a: string, b: string): boolean {
   const norm = (s: string): string => {
     let t = s.trim().replace(/^\+/, '');
     if (t.includes('.')) {
-      t = t.replace(/0+$/, '').replace(/\.$/, '');
+      // Drop trailing zeros, then a bare trailing point.  A loop, not /0+$/,
+      // which backtracks badly on long runs of zeros.
+      let end = t.length;
+      while (end > 0 && t[end - 1] === '0') end -= 1;
+      if (end > 0 && t[end - 1] === '.') end -= 1;
+      t = t.slice(0, end);
     }
     t = t.replace(/^(-?)0+(?=\d)/, '$1');
     return t === '-0' || t === '' ? '0' : t;

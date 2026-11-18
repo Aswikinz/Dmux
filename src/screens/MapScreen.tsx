@@ -136,7 +136,7 @@ export function MapScreen({
       }
     }
     for (const c of item.candidates ?? []) names.add(c);
-    return [...names].sort().map((n) => ({ value: n, label: n }));
+    return [...names].sort((a, b) => a.localeCompare(b)).map((n) => ({ value: n, label: n }));
   };
 
   const handlePreviewRules = (rules: MappingRule[]) => engine.previewRules(rules);

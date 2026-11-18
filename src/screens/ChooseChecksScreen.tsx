@@ -318,7 +318,7 @@ export function ChooseChecksScreen({
   const chosen = useMemo(() => (plan?.tables ?? []).filter(isChosen), [plan]);
 
   const schemas = useMemo(
-    () => [...new Set(chosen.map((t) => t.schemaName))].sort(),
+    () => [...new Set(chosen.map((t) => t.schemaName))].sort((a, b) => a.localeCompare(b)),
     [chosen],
   );
 

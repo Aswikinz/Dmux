@@ -251,6 +251,9 @@ export function StructureCompareView({
                     key={row.id}
                     id={`${uid}-row-${v.index}`}
                     role="row"
+                    // Focus stays on the grid (aria-activedescendant); a row
+                    // can still take focus from script, never from Tab.
+                    tabIndex={-1}
                     aria-rowindex={v.index + 2}
                     aria-level={row.depth + 1}
                     aria-expanded={row.expandable ? row.expanded : undefined}

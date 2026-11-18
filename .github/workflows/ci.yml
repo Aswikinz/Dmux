@@ -707,6 +707,19 @@ jobs:
   # is a real false-positive for secrets:S6698 — these service containers are
   # ephemeral and read-only, never loaded with real data (AGENTS.md) — so it is
   # suppressed by the multicriteria block below, scoped to .github/workflows/**.
+  #
+  # e2: rust:S4790 ("use a stronger hash than MD5") in core/apphash.rs. md5 is
+  # required there, not chosen: the bucket hashes must equal PostgreSQL's own
+  # md5() so the engine and the server agree byte for byte, and md5 is never
+  # used for security (decision 10; the md5 threat-model sentence is printed on
+  # every report). Scoped to that one file, so md5 anywhere else still fails.
+  #
+  # e3-e6: typescript:S6845 ("tabIndex only on interactive elements") on four
+  # scrolling panels that must take keyboard focus: a keyboard user scrolls them
+  # with the arrow keys (WCAG 2.1.1; axe's scrollable-region-focusable rule,
+  # which the UI tests run), and the mapping queue's arrow-key navigation needs
+  # the focus. Removing tabIndex would break keyboard access. Each is scoped to
+  # its own file.
   sonar:
     name: SonarCloud scan
     needs: checks
@@ -746,9 +759,19 @@ jobs:
             -Dsonar.exclusions=**/target/**,**/node_modules/**,**/dist/**,**/gen/**,testdata/phase0/RESULTS.md,**/coverage/**,src-tauri/icons/**,**/*.lock,**/*.sql
             -Dsonar.coverage.exclusions=**/*.test.ts,**/*.test.tsx,e2e/**,**/db_tests.rs
             -Dsonar.cpd.exclusions=testdata/**
-            -Dsonar.issue.ignore.multicriteria=e1
+            -Dsonar.issue.ignore.multicriteria=e1,e2,e3,e4,e5,e6
             -Dsonar.issue.ignore.multicriteria.e1.ruleKey=secrets:S6698
             -Dsonar.issue.ignore.multicriteria.e1.resourceKey=.github/workflows/**
+            -Dsonar.issue.ignore.multicriteria.e2.ruleKey=rust:S4790
+            -Dsonar.issue.ignore.multicriteria.e2.resourceKey=crates/dmux-engine/src/core/apphash.rs
+            -Dsonar.issue.ignore.multicriteria.e3.ruleKey=typescript:S6845
+            -Dsonar.issue.ignore.multicriteria.e3.resourceKey=src/components/TableDetailPanel.tsx
+            -Dsonar.issue.ignore.multicriteria.e4.ruleKey=typescript:S6845
+            -Dsonar.issue.ignore.multicriteria.e4.resourceKey=src/screens/HistoryScreen.tsx
+            -Dsonar.issue.ignore.multicriteria.e5.ruleKey=typescript:S6845
+            -Dsonar.issue.ignore.multicriteria.e5.resourceKey=src/screens/RunScreen.tsx
+            -Dsonar.issue.ignore.multicriteria.e6.ruleKey=typescript:S6845
+            -Dsonar.issue.ignore.multicriteria.e6.resourceKey=src/components/MappingQueue.tsx
             -Dsonar.rust.lcov.reportPaths=rust-lcov.info
             -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
             -Dsonar.sourceEncoding=UTF-8

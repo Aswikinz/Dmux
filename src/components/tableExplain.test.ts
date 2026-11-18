@@ -46,6 +46,21 @@ describe('sameDecimal', () => {
     expect(sameDecimal('100', '10')).toBe(false);
   });
 
+  it('trims a trailing point and keeps zeros before the point', () => {
+    expect(sameDecimal('100.', '100')).toBe(true);
+    expect(sameDecimal('.0', '0')).toBe(true);
+    expect(sameDecimal('100', '1')).toBe(false);
+    expect(sameDecimal('1000.0', '100')).toBe(false);
+  });
+
+  it('handles a very long run of zeros quickly', () => {
+    const zeros = '0'.repeat(200_000);
+    const start = performance.now();
+    expect(sameDecimal(`1.${zeros}`, '1')).toBe(true);
+    expect(sameDecimal(`1.${zeros}1`, '1')).toBe(false);
+    expect(performance.now() - start).toBeLessThan(500);
+  });
+
   it('lists only the totals that differ', () => {
     const d = controlTotalsDiffer([
       { column: 'a', old: '1.0', new: '1' },
