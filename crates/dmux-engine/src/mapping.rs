@@ -22,8 +22,15 @@ use thiserror::Error;
 
 /// Current mapping file format version.
 pub const MAPPING_VERSION: u32 = 1;
-/// Max size for an imported mapping file, in bytes.
-pub const MAX_MAPPING_BYTES: usize = 10 * 1024 * 1024;
+/// Max size for a mapping *file* read from disk or pasted in, in bytes.
+///
+/// A mapping holds one entry per column, about 60 to 80 bytes each, so a core
+/// banking schema with thousands of tables passes 10 MiB easily.  256 MiB
+/// allows roughly four million columns while still refusing an absurd file
+/// before it is parsed.  A mapping already in memory (one the app built and
+/// the screen sends back) is checked with [`validate`], which has no byte
+/// limit: there is nothing left to guard by then.
+pub const MAX_MAPPING_BYTES: usize = 256 * 1024 * 1024;
 
 /// Errors thrown when loading or validating a mapping.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -478,48 +485,17 @@ pub fn duplicate_table_targets(pairs: &[(String, String)]) -> BTreeMap<String, V
 /// Validates size, version and rejects unknown fields at any nesting level.
 /// Recomputes and checks the SHA-256 hash.
 pub fn from_json(bytes: &[u8]) -> Result<Mapping, MappingError> {
-    if bytes.len() > MAX_MAPPING_BYTES {
-        return Err(MappingError::TooLarge(bytes.len()));
-    }
+    check_file_size(bytes.len())?;
 
-    let raw: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| MappingError::Json(e.to_string()))?;
+    // One typed parse (`deny_unknown_fields` rejects an unknown field at any
+    // level).  Only when it fails is the text read again, to name unknown
+    // top-level fields: a large file is never held twice in memory.
+    let mapping: Mapping = match serde_json::from_slice(bytes) {
+        Ok(m) => m,
+        Err(e) => return Err(unknown_top_level(bytes).unwrap_or(MappingError::Json(e.to_string()))),
+    };
 
-    // Reject unknown top-level fields (nested fields are handled by
-    // `deny_unknown_fields`).
-    if let Some(obj) = raw.as_object() {
-        let known: BTreeSet<&str> = [
-            "version",
-            "rules",
-            "schema_mappings",
-            "ignored",
-            "mapping_hash",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-        let unknown: Vec<String> = obj
-            .keys()
-            .filter(|k| !known.contains(k.as_str()))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            return Err(MappingError::UnknownFields(unknown));
-        }
-    }
-
-    let mapping: Mapping =
-        serde_json::from_slice(bytes).map_err(|e| MappingError::Json(e.to_string()))?;
-
-    for item in &mapping.ignored {
-        if item.reason.trim().is_empty() {
-            return Err(MappingError::EmptyIgnoreReason);
-        }
-    }
-
-    if mapping.version != MAPPING_VERSION {
-        return Err(MappingError::UnsupportedVersion(mapping.version));
-    }
+    check_contents(&mapping)?;
 
     let stored_hash = mapping.mapping_hash.clone();
     let computed = compute_hash(&mapping);
@@ -531,6 +507,59 @@ pub fn from_json(bytes: &[u8]) -> Result<Mapping, MappingError> {
     }
 
     Ok(mapping)
+}
+
+/// Refuse a mapping file over [`MAX_MAPPING_BYTES`] before parsing it.
+pub fn check_file_size(len: usize) -> Result<(), MappingError> {
+    if len > MAX_MAPPING_BYTES {
+        return Err(MappingError::TooLarge(len));
+    }
+    Ok(())
+}
+
+/// Unknown top-level field names, when that is why a file failed to parse.
+fn unknown_top_level(bytes: &[u8]) -> Option<MappingError> {
+    let raw: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let known: BTreeSet<&str> = [
+        "version",
+        "rules",
+        "schema_mappings",
+        "ignored",
+        "mapping_hash",
+    ]
+    .into_iter()
+    .collect();
+    let unknown: Vec<String> = raw
+        .as_object()?
+        .keys()
+        .filter(|k| !known.contains(k.as_str()))
+        .cloned()
+        .collect();
+    (!unknown.is_empty()).then_some(MappingError::UnknownFields(unknown))
+}
+
+/// The checks every mapping passes, from a file or from memory: a supported
+/// format version and a reason on every ignored item.
+fn check_contents(mapping: &Mapping) -> Result<(), MappingError> {
+    for item in &mapping.ignored {
+        if item.reason.trim().is_empty() {
+            return Err(MappingError::EmptyIgnoreReason);
+        }
+    }
+    if mapping.version != MAPPING_VERSION {
+        return Err(MappingError::UnsupportedVersion(mapping.version));
+    }
+    Ok(())
+}
+
+/// Validate a mapping that is already in memory (for example one the desktop
+/// app's screen sends back) with the same checks as [`from_json`], and return
+/// it with a freshly computed hash: a hash supplied with it is never trusted.
+/// There is no byte limit here; the size of a file is checked where a file is
+/// read.
+pub fn validate(mapping: &Mapping) -> Result<Mapping, MappingError> {
+    check_contents(mapping)?;
+    Ok(mapping.clone().with_fresh_hash())
 }
 
 /// Serialise a mapping to canonical JSON bytes with a fresh hash.
@@ -607,6 +636,97 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mapping the size of a large core banking schema: `tables` tables of
+    /// `cols` columns, all matched by name.
+    fn large_mapping(tables: usize, cols: usize) -> Mapping {
+        let mut table_mappings = BTreeMap::new();
+        for t in 0..tables {
+            let column_mappings = (0..cols)
+                .map(|c| {
+                    let name = format!("column_name_{c:03}");
+                    (
+                        name.clone(),
+                        ColumnMapping {
+                            target_column: name,
+                            status: MappingStatus::Exact,
+                        },
+                    )
+                })
+                .collect();
+            let name = format!("table_name_{t:05}");
+            table_mappings.insert(
+                name.clone(),
+                TableMapping {
+                    target_table: name,
+                    status: MappingStatus::Exact,
+                    column_mappings,
+                },
+            );
+        }
+        let mut m = Mapping::new();
+        m.schema_mappings.insert(
+            "core".into(),
+            SchemaMapping {
+                target_schema: "core".into(),
+                table_mappings,
+            },
+        );
+        m.with_fresh_hash()
+    }
+
+    #[test]
+    fn a_large_database_mapping_is_never_refused_for_its_size() {
+        // 4,000 tables x 60 columns: well over the old 10 MiB limit.
+        let m = large_mapping(4_000, 60);
+        let bytes = to_json(&m).unwrap();
+        assert!(bytes.len() > 10 * 1024 * 1024, "{} bytes", bytes.len());
+        // In memory: checked without any byte limit.
+        assert_eq!(validate(&m).unwrap(), m);
+        // As a file: under the file limit, and it round-trips exactly.
+        assert_eq!(from_json(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_refused_before_parsing() {
+        assert!(check_file_size(MAX_MAPPING_BYTES).is_ok());
+        assert_eq!(
+            check_file_size(MAX_MAPPING_BYTES + 1),
+            Err(MappingError::TooLarge(MAX_MAPPING_BYTES + 1))
+        );
+    }
+
+    #[test]
+    fn validate_in_memory_runs_the_file_checks_and_rederives_the_hash() {
+        let mut m = Mapping::new();
+        m.mapping_hash = "stale".into();
+        let checked = validate(&m).unwrap();
+        assert_eq!(checked.mapping_hash, compute_hash(&checked));
+        assert_ne!(checked.mapping_hash, "stale");
+
+        let mut empty_reason = Mapping::new();
+        empty_reason.ignored.push(IgnoredItem {
+            path: "core.t".into(),
+            reason: "  ".into(),
+        });
+        assert_eq!(
+            validate(&empty_reason),
+            Err(MappingError::EmptyIgnoreReason)
+        );
+
+        let mut old = Mapping::new();
+        old.version = MAPPING_VERSION + 1;
+        assert_eq!(
+            validate(&old),
+            Err(MappingError::UnsupportedVersion(MAPPING_VERSION + 1))
+        );
+    }
+
+    #[test]
+    fn an_unknown_nested_field_is_still_refused() {
+        let json = br#"{"version":1,"rules":[],"schema_mappings":{"s":{"target_schema":"s","table_mappings":{},"extra":1}},"ignored":[],"mapping_hash":""}"#;
+        assert!(matches!(from_json(json), Err(MappingError::Json(_))));
+    }
 
     #[test]
     fn exact_match_is_auto_accepted() {

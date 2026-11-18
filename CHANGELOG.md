@@ -3,6 +3,17 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- A run on a large database no longer stops with "mapping file too large". The app
+  checked the mapping it already held as if it were a file, against a 10 MiB limit that a
+  schema with thousands of tables passes easily. A mapping in memory is now checked
+  without a size limit, and the limit for mapping files is 256 MiB (about four million
+  columns). Mapping files are also parsed once instead of twice, halving the memory a
+  large one needs.
+
 ## 1.2.0 (2026-11-18)
 
 Choose exactly which tables a run reads.

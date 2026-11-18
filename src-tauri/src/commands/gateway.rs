@@ -710,17 +710,19 @@ fn attention_candidates(issue: &mapping::AttentionIssue) -> Vec<String> {
 ///
 /// `update_mapping` / `export_mapping` receive a typed [`Mapping`] deserialised
 /// from the webview (audit L7), so it is untrusted input exactly like a mapping
-/// file.  [`mapping::to_json`] re-serialises it with a fresh hash and
-/// [`mapping::from_json`] then runs the engine's own validation — the format
-/// version, empty ignore reasons and the size limit — before the mapping is
-/// stored or exported.  The hash is re-derived here by design, so a stale
-/// client-supplied hash is discarded, never trusted.
+/// file.  [`mapping::validate`] runs the engine's own content checks — the
+/// format version and empty ignore reasons, with unknown fields already refused
+/// by serde — before the mapping is stored or exported.  The file-size limit is
+/// not applied: the mapping is already in memory, and a large database's
+/// mapping must never be refused for its size.  The hash is re-derived here by
+/// design, so a stale client-supplied hash is discarded, never trusted.
 pub(crate) fn validate_mapping(mapping: &Mapping) -> Result<Mapping, CommandError> {
-    mapping::to_json(mapping)
-        .and_then(|bytes| mapping::from_json(&bytes))
-        .map_err(|e| CommandError::InvalidMapping {
-            message: e.to_string(),
-        })
+    // In memory already: the engine's checks without the file-size limit, so a
+    // large database's mapping is never refused as "too large" (it is not a
+    // file).  The hash is re-derived, never trusted.
+    mapping::validate(mapping).map_err(|e| CommandError::InvalidMapping {
+        message: e.to_string(),
+    })
 }
 
 /// Update a mapping in place (re-hash it).  The caller supplies a [`Mapping`]
@@ -978,6 +980,47 @@ mod tests {
         });
         let err = update_mapping(mapping).unwrap_err();
         assert!(matches!(err, CommandError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn a_large_databases_mapping_is_accepted_when_a_run_starts() {
+        // 4,000 tables x 60 columns serialise to well over 10 MiB, the old
+        // file limit that start_run used to apply to an in-memory mapping.
+        let mut tables = std::collections::BTreeMap::new();
+        for t in 0..4_000 {
+            let columns = (0..60)
+                .map(|c| {
+                    let n = format!("column_name_{c:03}");
+                    (
+                        n.clone(),
+                        mapping::ColumnMapping {
+                            target_column: n,
+                            status: mapping::MappingStatus::Exact,
+                        },
+                    )
+                })
+                .collect();
+            let n = format!("table_name_{t:05}");
+            tables.insert(
+                n.clone(),
+                mapping::TableMapping {
+                    target_table: n,
+                    status: mapping::MappingStatus::Exact,
+                    column_mappings: columns,
+                },
+            );
+        }
+        let mut m = Mapping::new();
+        m.schema_mappings.insert(
+            "core".into(),
+            mapping::SchemaMapping {
+                target_schema: "core".into(),
+                table_mappings: tables,
+            },
+        );
+        assert!(mapping::to_json(&m).unwrap().len() > 10 * 1024 * 1024);
+        let checked = validate_mapping(&m).expect("a large mapping is not refused for its size");
+        assert_eq!(checked.schema_mappings, m.schema_mappings);
     }
 
     #[test]
