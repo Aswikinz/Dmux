@@ -106,7 +106,32 @@ describe('visibleRows', () => {
       rows: [],
       total: 0,
       differences: 0,
+      hiddenDifferences: 0,
     });
+  });
+
+  it('hides kinds of object, keeps the path to what is shown, and counts what it hid', () => {
+    const rows: StructureRow[] = [
+      row({ id: 's', depth: 0, name: 'bank', kind: 'schema', expandable: true, old: 'present', new: 'present' }),
+      row({ id: 's/t1', depth: 1, name: 'accounts', kind: 'table', expandable: true }),
+      row({ id: 's/t1/bal', depth: 2, name: 'balance', status: 'changed', old: 'a', new: 'b' }),
+      row({ id: 's/t1/ix', depth: 2, name: 'accounts_pkey', kind: 'index', status: 'changed', old: 'a', new: 'b' }),
+      row({ id: 's/fn', depth: 1, name: 'hash_ltree', kind: 'function', status: 'added', old: undefined }),
+      row({ id: 's/ext', depth: 1, name: 'ltree', kind: 'extension', status: 'added', old: undefined }),
+    ];
+    const opts = { toggled: none, onlyProblems: false, query: '' };
+    const all = visibleRows(rows, opts);
+    expect(all.differences).toBe(4);
+    expect(all.hiddenDifferences).toBe(0);
+
+    const tablesOnly = visibleRows(rows, { ...opts, hiddenGroups: new Set(['indexes', 'other'] as const) });
+    expect(ids(tablesOnly)).toEqual(['s', 's/t1', 's/t1/bal']);
+    expect(tablesOnly.differences).toBe(1);
+    expect(tablesOnly.hiddenDifferences).toBe(3);
+
+    // Hiding tables keeps an index visible under its table, as a path.
+    const indexesOnly = visibleRows(rows, { ...opts, hiddenGroups: new Set(['tables', 'other'] as const) });
+    expect(ids(indexesOnly)).toEqual(['s', 's/t1', 's/t1/ix']);
   });
 
   it('stays fast with thousands of tables', () => {

@@ -32,7 +32,7 @@ pub mod pdf;
 pub mod verify;
 pub mod xlsx;
 
-pub use layout::{IncludeKeys, ReportOptions};
+pub use layout::{IncludeKeys, LeaveOut, ReportOptions};
 pub use verify::{verify_results_file, HookEvidence, Verification};
 
 /// Build the layout for verified results, folding in hook evidence and the
@@ -244,6 +244,156 @@ mod tests {
         p.push(format!("dmux-report-golden-{}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// A run with one data difference, one structure difference (with a FAIL
+    /// and a WARNING structure finding), one pass and two run warnings.
+    fn mixed_results() -> RunResults {
+        let row = |name: &str, verdict: Verdict, changed: usize| TableResult {
+            table: name.into(),
+            level: CheckLevel::FullValues,
+            verdict,
+            old_rows: Some(10),
+            new_rows: Some(10),
+            columns_covered: None,
+            differing_buckets: Some(changed),
+            missing_buckets: Some(0),
+            extra_buckets: Some(0),
+            missing_rows: Some(0),
+            extra_rows: Some(0),
+            changed_rows: Some(changed),
+            reasons: vec![format!("reason for {name}")],
+            column_notes: vec![],
+        };
+        let finding = |object: &str, verdict: Verdict| dmux_engine::results::StructureFinding {
+            object: object.into(),
+            path: vec![],
+            verdict,
+            message: format!("finding on {object}"),
+        };
+        finalise(RunResults {
+            verdict: Verdict::Fail,
+            tables: BTreeMap::from([
+                (
+                    "core.balances".into(),
+                    row("core.balances", Verdict::Fail, 2),
+                ),
+                ("core.dropped".into(), row("core.dropped", Verdict::Fail, 0)),
+                ("core.ok".into(), row("core.ok", Verdict::Pass, 0)),
+            ]),
+            structure_findings: vec![
+                finding("core.dropped.legacy_flag", Verdict::Fail),
+                finding("public.some_function", Verdict::Warning),
+            ],
+            warnings: vec!["run warning one".into(), "run warning two".into()],
+            ..RunResults::default()
+        })
+    }
+
+    fn leave_all() -> ReportOptions {
+        ReportOptions {
+            leave_out: LeaveOut {
+                structure: true,
+                other: true,
+                warnings: true,
+                passing: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn data_differences_are_never_left_out_and_page_one_names_what_was() {
+        let v = verify::verify_results(&mixed_results()).unwrap();
+        let full = build_layout(&v, &ReportOptions::default());
+        assert_eq!(full.tables.len(), 3);
+        assert!(full.omitted.is_empty());
+        // Data differences first.
+        assert_eq!(full.tables[0].table, "core.balances");
+
+        let trimmed = build_layout(&v, &leave_all());
+        let names: Vec<&str> = trimmed.tables.iter().map(|t| t.table.as_str()).collect();
+        assert_eq!(names, vec!["core.balances"]);
+        assert!(trimmed.structure_findings.is_empty());
+        assert!(trimmed.warnings.is_empty());
+        assert_eq!(
+            trimmed.omitted,
+            vec![
+                "1 table with a structure difference",
+                "1 table that passed",
+                "2 run warnings",
+                "2 structure findings",
+            ]
+        );
+        // The verdict and the tiles still count everything.
+        assert_eq!(trimmed.verdict_word, "FAIL");
+        assert_eq!(
+            (trimmed.data_issue_tables, trimmed.other_issue_tables),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn leaving_out_warnings_keeps_failures_of_every_kind() {
+        let v = verify::verify_results(&mixed_results()).unwrap();
+        let opts = ReportOptions {
+            leave_out: LeaveOut {
+                warnings: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let l = build_layout(&v, &opts);
+        assert_eq!(l.tables.len(), 3);
+        let objects: Vec<&str> = l
+            .structure_findings
+            .iter()
+            .map(|f| f.object.as_str())
+            .collect();
+        assert_eq!(objects, vec!["core.dropped.legacy_flag"]);
+        assert_eq!(l.omitted, vec!["2 run warnings", "1 structure finding"]);
+    }
+
+    #[test]
+    fn the_leave_out_list_parses_and_data_cannot_be_left_out() {
+        assert_eq!(LeaveOut::parse("").unwrap(), LeaveOut::default());
+        let l = LeaveOut::parse("structure, warnings").unwrap();
+        assert!(l.structure && l.warnings && !l.other && !l.passing);
+        assert!(LeaveOut::parse("data").unwrap_err().contains("always"));
+        assert!(LeaveOut::parse("rows").is_err());
+    }
+
+    #[test]
+    fn the_pdf_and_html_put_data_differences_first_and_name_what_was_left_out() {
+        let v = verify::verify_results(&mixed_results()).unwrap();
+        let l = build_layout(&v, &leave_all());
+        let html = html::render(&l, "x");
+        let data_at = html.find("<h2>Data differences</h2>").unwrap();
+        let other_at = html.find("<h2>Other failures</h2>").unwrap();
+        assert!(data_at < other_at);
+        assert!(html.contains(
+            "Left out of this report when it was made: 1 table with a structure difference"
+        ));
+        assert!(!html.contains("run warning one"));
+
+        let mut warnings = Vec::new();
+        let doc = printpdf::PdfDocument::parse(
+            &pdf::render_bytes(&l, "x").unwrap(),
+            &printpdf::PdfParseOptions::default(),
+            &mut warnings,
+        )
+        .unwrap();
+        let text = doc
+            .extract_text()
+            .into_iter()
+            .map(|p| p.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Left out of this report"), "{text}");
+        let d = text.find("Data differences").unwrap();
+        let o = text.find("Other failures").unwrap();
+        assert!(d < o);
+        assert!(!text.contains("run warning one"));
     }
 
     #[test]

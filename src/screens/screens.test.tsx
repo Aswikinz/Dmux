@@ -1180,7 +1180,7 @@ describe('ReportScreen', () => {
     expect(screen.queryByText(/report saved/)).toBeNull();
     expect(screen.queryByText(/chosen-location/)).toBeNull();
     expect(screen.queryByText('Export failed')).toBeNull();
-    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /Include row keys/ }));
     fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
     expect(await screen.findByText(/browser demo, so no Excel file was saved/)).toBeDefined();
   });
@@ -1213,6 +1213,7 @@ describe('ReportScreen', () => {
       runId: 'run-pass',
       format: 'pdf',
       includeKeys: false,
+      leaveOut: { structure: false, other: false, warnings: false, passing: false },
     });
   });
 
@@ -1244,6 +1245,7 @@ describe('ReportScreen', () => {
       runId: 'run-pass',
       format: 'html',
       includeKeys: false,
+      leaveOut: { structure: false, other: false, warnings: false, passing: false },
     });
   });
 
@@ -1260,6 +1262,38 @@ describe('ReportScreen', () => {
     expect(msg.className).not.toMatch(/emerald/);
   });
 
+  it('always includes data differences and sends what the user leaves out', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.pdf' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    const panel = screen.getByTestId('report-contents');
+    const data = within(panel).getByRole('checkbox', { name: /Data differences/ }) as HTMLInputElement;
+    expect(data.checked).toBe(true);
+    expect(data.disabled).toBe(true);
+    fireEvent.click(within(panel).getByRole('button', { name: 'Only data differences' }));
+    fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
+    await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(1));
+    expect(exportReport).toHaveBeenCalledWith({
+      runId: 'run-pass',
+      format: 'pdf',
+      includeKeys: false,
+      leaveOut: { structure: true, other: true, warnings: true, passing: true },
+    });
+    // Include everything puts it all back.
+    fireEvent.click(within(panel).getByRole('button', { name: 'Include everything' }));
+    fireEvent.click(within(panel).getByRole('checkbox', { name: /Tables that passed/ }));
+    fireEvent.click(screen.getByRole('button', { name: /export pdf/i }));
+    await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(2));
+    expect(exportReport).toHaveBeenLastCalledWith({
+      runId: 'run-pass',
+      format: 'pdf',
+      includeKeys: false,
+      leaveOut: { structure: false, other: false, warnings: false, passing: true },
+    });
+  });
+
   it('sends the key choice only when the user ticks it', async () => {
     const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.xlsx' }));
     const engine: Engine = { ...createMockEngine(), exportReport };
@@ -1268,12 +1302,12 @@ describe('ReportScreen', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
     await screen.findByText(/report saved/);
-    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /Include row keys/ }));
     fireEvent.click(screen.getByRole('button', { name: /export excel/i }));
     await waitFor(() => expect(exportReport).toHaveBeenCalledTimes(2));
     expect(exportReport.mock.calls.map((c) => (c as unknown[])[0])).toEqual([
-      { runId: 'run-pass', format: 'excel', includeKeys: false },
-      { runId: 'run-pass', format: 'excel', includeKeys: true },
+      { runId: 'run-pass', format: 'excel', includeKeys: false, leaveOut: { structure: false, other: false, warnings: false, passing: false } },
+      { runId: 'run-pass', format: 'excel', includeKeys: true, leaveOut: { structure: false, other: false, warnings: false, passing: false } },
     ]);
   });
 });

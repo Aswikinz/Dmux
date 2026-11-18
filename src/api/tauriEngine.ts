@@ -57,6 +57,7 @@ import type {
   TlsState,
   Verdict,
   MappingSaveResult,
+  IssueKind,
 } from './contract';
 
 /** A typed engine error the UI can distinguish from a connection/database error. */
@@ -376,6 +377,7 @@ interface RawFailureCard {
   verdict: string;
   summary: string;
   detail: string;
+  kind?: string;
 }
 
 interface RawTableResult {
@@ -385,6 +387,7 @@ interface RawTableResult {
   verdict: string;
   level: EngineLevel;
   checked: boolean;
+  kind?: string | null;
   drill_down: RawDrillDownRow[] | null;
   column_notes: RawColumnNote[];
   old_rows?: number | null;
@@ -1152,6 +1155,11 @@ function translateConnection(c: RawConnectionInfo): ConnectionFact {
   };
 }
 
+/** The engine's issue kind, or undefined when it did not say. */
+export function mapIssueKind(kind: string | null | undefined): IssueKind | undefined {
+  return kind === 'data' || kind === 'structure' || kind === 'other' ? kind : undefined;
+}
+
 function translateResults(raw: RawResults): Results {
   const coverage: CoverageSummary = {
     totalTables: raw.coverage.total_tables,
@@ -1176,6 +1184,8 @@ function translateResults(raw: RawResults): Results {
     verdict: mapVerdict(f.verdict),
     summary: f.summary,
     detail: f.detail,
+    // An unknown kind is never guessed as "data": it is shown as other.
+    kind: mapIssueKind(f.kind) ?? 'other',
   }));
 
   const tableResults: TableResult[] = raw.table_results.map((t) => ({
@@ -1185,6 +1195,7 @@ function translateResults(raw: RawResults): Results {
     verdict: mapVerdict(t.verdict),
     level: mapLevel(t.level),
     checked: t.checked,
+    ...(mapIssueKind(t.kind) ? { kind: mapIssueKind(t.kind) } : {}),
     drillDown: t.drill_down?.map((d) => ({
       key: d.key,
       kind: mapDrillKind(d.kind),
@@ -1534,6 +1545,12 @@ export function createTauriEngine(): Engine {
             run_id: request.runId,
             format: request.format,
             include_keys: request.includeKeys,
+            leave_out: request.leaveOut ?? {
+              structure: false,
+              other: false,
+              warnings: false,
+              passing: false,
+            },
           },
         });
         if (raw.status === 'cancelled') {

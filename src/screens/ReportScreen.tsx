@@ -9,9 +9,10 @@ import { StatusBadge } from '../design/StatusBadge';
 import { qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { coverageLabel } from './ResultsScreen';
 import { IgnoredItems } from '../components/IgnoredItems';
+import { LEAVE_NOTHING_OUT, ReportContents } from '../components/ReportContents';
 import { FileCode2, FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
-import type { ReportFormat, Results } from '../api/contract';
+import type { ReportFormat, ReportLeaveOut, Results } from '../api/contract';
 
 const FORMAT_LABEL: Record<ReportFormat, string> = {
   pdf: 'PDF',
@@ -42,6 +43,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
       mounted = false;
     };
   }, [engine]);
+  const [leaveOut, setLeaveOut] = useState<ReportLeaveOut>(LEAVE_NOTHING_OUT);
   const [exporting, setExporting] = useState<ReportFormat | null>(null);
   const [resultMessage, setResultMessage] = useState<{ text: string; saved: boolean } | null>(
     null,
@@ -57,6 +59,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
         runId: results.runId,
         format,
         includeKeys,
+        leaveOut,
       });
       const label = FORMAT_LABEL[format];
       if (res.ok) {
@@ -96,6 +99,7 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
           </p>
         </div>
         <IgnoredItems ignored={results.ignored} />
+        <ReportContents results={results} leaveOut={leaveOut} onChange={setLeaveOut} />
         <div className="mt-4">
           <Switch
             label="Include row keys in the exported report"

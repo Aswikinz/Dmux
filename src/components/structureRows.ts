@@ -36,19 +36,50 @@ export interface VisibleRow extends StructureRow {
   expanded: boolean;
 }
 
+/** The kinds of object the structure view can show or hide, in groups a
+ *  reader thinks in.  Schemas are never hidden: they hold everything else. */
+export type KindGroup = 'tables' | 'indexes' | 'other';
+
+export const KIND_GROUP_LABELS: Record<KindGroup, string> = {
+  tables: 'Tables and columns',
+  indexes: 'Indexes and constraints',
+  other: 'Other PostgreSQL objects',
+};
+
+/** The group a row's kind belongs to; `null` for a schema. */
+export function kindGroup(kind: StructureRow['kind']): KindGroup | null {
+  switch (kind) {
+    case 'schema':
+      return null;
+    case 'table':
+    case 'column':
+      return 'tables';
+    case 'index':
+    case 'constraint':
+      return 'indexes';
+    default:
+      // extensions, functions, sequences, views, triggers
+      return 'other';
+  }
+}
+
 export interface VisibleOptions {
   /** Rows the user flipped away from their default open/closed state. */
   toggled: ReadonlySet<string>;
   onlyProblems: boolean;
   query: string;
+  /** Kinds of object to leave out (none by default). */
+  hiddenGroups?: ReadonlySet<KindGroup>;
 }
 
 export interface VisibleResult {
   rows: VisibleRow[];
   /** Every row, whatever the filters. */
   total: number;
-  /** Rows that differ between the two databases. */
+  /** Rows that differ between the two databases, among the kinds shown. */
   differences: number;
+  /** Differences in the kinds the user chose to hide. */
+  hiddenDifferences: number;
 }
 
 function matches(row: StructureRow, q: string): boolean {
@@ -83,19 +114,29 @@ export function visibleRows(rows: StructureRow[], opts: VisibleOptions): Visible
   const selfMatch = rows.map((r) => q !== '' && matches(r, q));
   // A row is kept when it passes both filters: it matches the search (itself or
   // through an ancestor that matches) and, with "only problems", it differs.
+  const hidden = opts.hiddenGroups ?? new Set<KindGroup>();
+  // A schema is shown for what it holds, or for its own difference.
+  const kindShown = rows.map((r) => {
+    const g = kindGroup(r.kind);
+    return g === null ? hidden.size === 0 || r.status !== 'same' : !hidden.has(g);
+  });
   const underMatch = new Array<boolean>(n).fill(false);
   const kept = new Array<boolean>(n).fill(false);
   for (let i = 0; i < n; i += 1) {
     const p = parent[i];
     underMatch[i] = p >= 0 && (selfMatch[p] || underMatch[p]);
     kept[i] =
-      (q === '' || selfMatch[i] || underMatch[i]) && (!opts.onlyProblems || rows[i].status !== 'same');
+      kindShown[i] &&
+      (q === '' || selfMatch[i] || underMatch[i]) &&
+      (!opts.onlyProblems || rows[i].status !== 'same');
   }
   const keptBelow = new Array<boolean>(n).fill(false);
   let differences = 0;
+  let hiddenDifferences = 0;
   for (let i = n - 1; i >= 0; i -= 1) {
     const own = rows[i].status !== 'same' ? 1 : 0;
-    differences += own;
+    if (kindShown[i]) differences += own;
+    else hiddenDifferences += own;
     const p = parent[i];
     if (p >= 0) {
       problemsBelow[p] += problemsBelow[i] + own;
@@ -125,5 +166,5 @@ export function visibleRows(rows: StructureRow[], opts: VisibleOptions): Visible
     }
     out.push({ ...row, problemsBelow: problemsBelow[i], expanded });
   }
-  return { rows: out, total: n, differences };
+  return { rows: out, total: n, differences, hiddenDifferences };
 }

@@ -13,7 +13,8 @@
 //! the resulting PDF/XLSX text for those sentinels.
 
 use dmux_engine::results::{
-    CheckLevel, ConnectionInfo, RunResults, TableDetail, TableResult, Verdict,
+    table_issue_kind, CheckLevel, ConnectionInfo, IssueKind, RunResults, TableDetail, TableResult,
+    Verdict,
 };
 
 use crate::verify::HookEvidence;
@@ -57,6 +58,65 @@ pub struct ReportOptions {
     /// Callers that write a real report pass the current time; `None` leaves
     /// the line out, which keeps the golden tests byte-deterministic.
     pub generated_at: Option<String>,
+    /// What the user chose to leave out of this report.  Data differences can
+    /// never be left out; whatever is left out is named on page 1.
+    pub leave_out: LeaveOut,
+}
+
+/// Parts of a report the user may leave out, so the data differences stand
+/// out.  All `false` (the default) keeps everything.  Data differences are not
+/// listed here because they are always included.  The overall verdict, the
+/// coverage line, the counts, the run log and the results file are never
+/// filtered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeaveOut {
+    /// Tables whose problem is a structure difference, and structure findings.
+    pub structure: bool,
+    /// Tables that failed for another reason (fault, moving data, review).
+    pub other: bool,
+    /// Anything whose verdict is WARNING, and the run-level warnings.
+    pub warnings: bool,
+    /// Tables that passed.
+    pub passing: bool,
+}
+
+impl LeaveOut {
+    /// Parse a comma-separated list: structure, other, warnings, passing.
+    pub fn parse(list: &str) -> Result<LeaveOut, String> {
+        let mut out = LeaveOut::default();
+        for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "structure" => out.structure = true,
+                "other" => out.other = true,
+                "warnings" => out.warnings = true,
+                "passing" => out.passing = true,
+                "data" => {
+                    return Err("data differences are always in the report".to_string());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown part {other:?}: use structure, other, warnings or passing"
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether a table (by its kind and verdict word) stays in the report.
+    fn keeps_table(&self, kind: Option<IssueKind>, verdict_word: &str) -> bool {
+        match kind {
+            Some(IssueKind::Data) => true,
+            None => !self.passing,
+            Some(k) => {
+                let by_kind = match k {
+                    IssueKind::Structure => !self.structure,
+                    _ => !self.other,
+                };
+                by_kind && !(self.warnings && verdict_word == "WARNING")
+            }
+        }
+    }
 }
 
 /// The current instant in UTC RFC 3339 with whole seconds, for
@@ -284,6 +344,8 @@ pub struct TableSummary {
     pub level: String,
     pub verdict: String,
     pub verdict_word: String,
+    /// The kind of problem; `None` for a PASS.
+    pub kind: Option<IssueKind>,
     pub old_rows: Option<String>,
     pub new_rows: Option<String>,
     pub differing_buckets: String,
@@ -414,6 +476,13 @@ pub struct Layout {
     pub generated_at: Option<String>,
     pub old_source: Option<String>,
     pub new_source: Option<String>,
+    /// What was left out of this report at the user's choice, in plain words
+    /// ("23 structure findings").  Empty when nothing was left out.
+    pub omitted: Vec<String>,
+    /// Tables with data differences, and tables that failed for any other
+    /// reason, counted before anything was left out.
+    pub data_issue_tables: usize,
+    pub other_issue_tables: usize,
 }
 
 /// Render an optional count as a place-holder-free string.
@@ -434,26 +503,76 @@ pub fn build(
 ) -> Layout {
     let include_keys = options.include_keys;
 
-    // Order tables failures-first, then by name (BTreeMap already sorted).
+    // Data differences first, then structure differences, other reasons and
+    // the tables that passed; by name within each (BTreeMap already sorted).
+    let kind_of = |name: &String| table_issue_kind(name, &results.tables[name], results);
+    let rank = |k: Option<IssueKind>| match k {
+        Some(IssueKind::Data) => 0,
+        Some(IssueKind::Structure) => 1,
+        Some(IssueKind::Other) => 2,
+        None => 3,
+    };
     let mut names: Vec<&String> = results.tables.keys().collect();
     names.sort_by(|a, b| {
-        let va = results.tables[*a].verdict;
-        let vb = results.tables[*b].verdict;
-        let fa = is_failure(va);
-        let fb = is_failure(vb);
-        fb.cmp(&fa).then_with(|| a.cmp(b))
+        rank(kind_of(a))
+            .cmp(&rank(kind_of(b)))
+            .then_with(|| a.cmp(b))
     });
 
-    let tables: Vec<TableSummary> = names
+    let leave = options.leave_out;
+    let all_tables: Vec<TableSummary> = names
         .iter()
         .map(|name| {
-            summarise(
+            let mut t = summarise(
                 results.tables.get(*name).expect("present"),
                 results.details.get(*name),
                 include_keys,
-            )
+            );
+            t.kind = kind_of(name);
+            t
         })
         .collect();
+    let data_issue_tables = all_tables
+        .iter()
+        .filter(|t| t.kind == Some(IssueKind::Data))
+        .count();
+    let other_issue_tables = all_tables
+        .iter()
+        .filter(|t| matches!(t.kind, Some(IssueKind::Structure | IssueKind::Other)))
+        .count();
+    let (tables, dropped): (Vec<TableSummary>, Vec<TableSummary>) = all_tables
+        .into_iter()
+        .partition(|t| leave.keeps_table(t.kind, &t.verdict_word));
+    let mut omitted: Vec<String> = Vec::new();
+    let count = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let dropped_of =
+        |pred: &dyn Fn(&TableSummary) -> bool| dropped.iter().filter(|t| pred(t)).count();
+    let n = dropped_of(&|t| t.kind == Some(IssueKind::Structure));
+    if n > 0 {
+        omitted.push(count(
+            n,
+            "table with a structure difference",
+            "tables with structure differences",
+        ));
+    }
+    let n = dropped_of(&|t| t.kind == Some(IssueKind::Other));
+    if n > 0 {
+        omitted.push(count(
+            n,
+            "table that failed for another reason",
+            "tables that failed for other reasons",
+        ));
+    }
+    let n = dropped_of(&|t| t.kind.is_none());
+    if n > 0 {
+        omitted.push(count(n, "table that passed", "tables that passed"));
+    }
 
     let mut differences: Vec<Difference> = tables
         .iter()
@@ -508,7 +627,14 @@ pub fn build(
                 reason: sanitize(&i.reason),
             })
             .collect(),
-        warnings: results.warnings.iter().map(|w| sanitize(w)).collect(),
+        warnings: if leave.warnings {
+            if !results.warnings.is_empty() {
+                omitted.push(count(results.warnings.len(), "run warning", "run warnings"));
+            }
+            Vec::new()
+        } else {
+            results.warnings.iter().map(|w| sanitize(w)).collect()
+        },
         changed_during_check: results
             .changed_during_check
             .iter()
@@ -520,8 +646,19 @@ pub fn build(
         differences,
         structure_findings: {
             // Gravest first, then in the engine's (deterministic) order.
-            let mut found: Vec<&dmux_engine::results::StructureFinding> =
-                results.structure_findings.iter().collect();
+            let all = results.structure_findings.len();
+            let mut found: Vec<&dmux_engine::results::StructureFinding> = results
+                .structure_findings
+                .iter()
+                .filter(|f| !(leave.structure || (leave.warnings && f.verdict == Verdict::Warning)))
+                .collect();
+            if found.len() < all {
+                omitted.push(count(
+                    all - found.len(),
+                    "structure finding",
+                    "structure findings",
+                ));
+            }
             found.sort_by_key(|f| std::cmp::Reverse(dmux_engine::results::severity(f.verdict)));
             found
                 .into_iter()
@@ -584,6 +721,10 @@ pub fn build(
         generated_at: options.generated_at.as_deref().map(display_time),
         old_source: results.old_source.as_deref().map(sanitize),
         new_source: results.new_source.as_deref().map(sanitize),
+        // Last, so it holds what the fields above left out.
+        omitted,
+        data_issue_tables,
+        other_issue_tables,
     }
 }
 
@@ -638,6 +779,7 @@ fn summarise(tr: &TableResult, detail: Option<&TableDetail>, include_keys: bool)
         level: level_word(tr.level).to_string(),
         verdict: verdict_word(tr.verdict).to_string(),
         verdict_word: verdict_word(tr.verdict).to_string(),
+        kind: None,
         old_rows: opt_count(tr.old_rows),
         new_rows: opt_count(tr.new_rows),
         differing_buckets: usize_or_dash(tr.differing_buckets),

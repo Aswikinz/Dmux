@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use dmux_report::layout::Layout;
-use dmux_report::ReportOptions;
+use dmux_report::{LeaveOut, ReportOptions};
 
 use crate::error::CommandError;
 use crate::state::AppState;
@@ -60,6 +60,61 @@ pub struct ExportReportInput {
     /// Include key / covered-column names.  Off unless the user ticks it.
     #[serde(default)]
     pub include_keys: bool,
+    /// Parts the user chose to leave out.  Data differences cannot be left
+    /// out (there is no field for them); page 1 names whatever was.
+    #[serde(default)]
+    pub leave_out: LeaveOutInput,
+}
+
+/// What the Report screen may leave out of a report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct LeaveOutInput {
+    #[serde(default)]
+    pub structure: bool,
+    #[serde(default)]
+    pub other: bool,
+    #[serde(default)]
+    pub warnings: bool,
+    #[serde(default)]
+    pub passing: bool,
+}
+
+impl From<LeaveOutInput> for LeaveOut {
+    fn from(l: LeaveOutInput) -> Self {
+        LeaveOut {
+            structure: l.structure,
+            other: l.other,
+            warnings: l.warnings,
+            passing: l.passing,
+        }
+    }
+}
+
+/// The user's report choices: row keys, and what to leave out.  A plain
+/// `bool` means keys on or off with nothing left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportChoices {
+    pub include_keys: bool,
+    pub leave_out: LeaveOut,
+}
+
+impl From<bool> for ReportChoices {
+    fn from(include_keys: bool) -> Self {
+        ReportChoices {
+            include_keys,
+            leave_out: LeaveOut::default(),
+        }
+    }
+}
+
+impl From<&ExportReportInput> for ReportChoices {
+    fn from(input: &ExportReportInput) -> Self {
+        ReportChoices {
+            include_keys: input.include_keys,
+            leave_out: input.leave_out.into(),
+        }
+    }
 }
 
 /// The export outcome: the saved path, or that the dialog was dismissed.
@@ -100,15 +155,17 @@ pub(crate) fn verification_for(
 /// the run manager's typed error.
 pub(crate) fn verified_layout(
     run_id: &str,
-    include_keys: bool,
+    choices: impl Into<ReportChoices>,
     state: &AppState,
 ) -> Result<(Layout, String), CommandError> {
+    let choices = choices.into();
     let verification = verification_for(run_id, state)?;
     let layout = dmux_report::build_layout(
         &verification,
         &ReportOptions {
-            include_keys,
+            include_keys: choices.include_keys,
             generated_at: Some(dmux_report::layout::now_utc()),
+            leave_out: choices.leave_out,
         },
     );
     Ok((layout, verification.sha256))
@@ -134,11 +191,11 @@ fn with_extension(path: PathBuf, format: ReportFormat) -> PathBuf {
 pub(crate) fn render_report(
     run_id: &str,
     format: ReportFormat,
-    include_keys: bool,
+    choices: impl Into<ReportChoices>,
     state: &AppState,
     path: &Path,
 ) -> Result<(), CommandError> {
-    let (layout, sha256) = verified_layout(run_id, include_keys, state)?;
+    let (layout, sha256) = verified_layout(run_id, choices, state)?;
     let failed = |e: String| CommandError::Report {
         message: format!("the report could not be written: {e}"),
     };
@@ -177,7 +234,8 @@ pub async fn export_report<R: tauri::Runtime>(
 
     // Refuse early: unknown, unfinished, stopped or failed runs, and results
     // that do not verify.
-    verified_layout(&input.run_id, input.include_keys, &state)?;
+    let choices = ReportChoices::from(&input);
+    verified_layout(&input.run_id, choices, &state)?;
 
     let format = input.format;
     let dialog = app
@@ -199,11 +257,10 @@ pub async fn export_report<R: tauri::Runtime>(
 
     let app2 = app.clone();
     let run_id = input.run_id.clone();
-    let include_keys = input.include_keys;
     let target = path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        render_report(&run_id, format, include_keys, &state, &target)
+        render_report(&run_id, format, choices, &state, &target)
     })
     .await
     .map_err(|e| CommandError::internal(format!("the report task failed: {e}")))??;
@@ -481,6 +538,37 @@ mod tests {
             verified_layout(&id, false, &s),
             Err(CommandError::Report { .. })
         ));
+    }
+
+    #[test]
+    fn what_the_user_leaves_out_reaches_the_report_but_never_the_data() {
+        let input: ExportReportInput = serde_json::from_str(
+            r#"{"run_id":"r","format":"pdf","leave_out":{"structure":true,"passing":true}}"#,
+        )
+        .unwrap();
+        let choices = ReportChoices::from(&input);
+        assert!(choices.leave_out.structure && choices.leave_out.passing);
+        assert!(!choices.leave_out.other && !choices.leave_out.warnings);
+        // There is no way to name data differences: an unknown key is refused.
+        assert!(serde_json::from_str::<ExportReportInput>(
+            r#"{"run_id":"r","format":"pdf","leave_out":{"data":true}}"#
+        )
+        .is_err());
+        // Absent, nothing is left out.
+        let plain: ExportReportInput =
+            serde_json::from_str(r#"{"run_id":"r","format":"pdf"}"#).unwrap();
+        assert_eq!(plain.leave_out, LeaveOutInput::default());
+
+        let s = state();
+        let id = finished(&s, Ok(results(Verdict::Pass)));
+        // The one table passed: leaving out passing tables drops it, and page
+        // 1 says so; the verdict is untouched.
+        let (all, _) = verified_layout(&id, false, &s).unwrap();
+        let (trimmed, _) = verified_layout(&id, choices, &s).unwrap();
+        assert_eq!(all.tables.len(), 1);
+        assert!(trimmed.tables.is_empty());
+        assert_eq!(trimmed.omitted, vec!["1 table that passed"]);
+        assert_eq!(trimmed.verdict_word, all.verdict_word);
     }
 
     #[test]

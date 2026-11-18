@@ -287,6 +287,11 @@ struct ReportArgs {
     /// Include key / covered-column names in the detail (default: off).
     #[arg(long)]
     include_keys: bool,
+    /// Leave parts out of the PDF, HTML and Excel reports, comma-separated:
+    /// structure, other, warnings, passing.  Data differences are always
+    /// included, and page 1 names what was left out.  The log is never trimmed.
+    #[arg(long, value_name = "PARTS")]
+    leave_out: Option<String>,
 }
 
 /// Parse the `--tls` mode string into a [`TlsMode`].  Errors are a
@@ -598,9 +603,17 @@ fn run_report(args: ReportArgs) -> ExitCode {
         }
     };
 
+    let leave_out = match dmux_report::LeaveOut::parse(args.leave_out.as_deref().unwrap_or("")) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("dmux report: --leave-out: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    };
     let options = dmux_report::ReportOptions {
         include_keys: args.include_keys,
         generated_at: Some(dmux_report::layout::now_utc()),
+        leave_out,
     };
     let layout = dmux_report::build_layout(&verification, &options);
     let sha256 = verification.sha256;

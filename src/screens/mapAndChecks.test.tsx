@@ -7,7 +7,7 @@ import type { Engine } from '../api/engine';
 import type { CheckPlan, Inventory, Mapping } from '../api/contract';
 import { defaultNewProfile, defaultOldProfile } from './ConnectScreen';
 import { MapScreen } from './MapScreen';
-import { ChooseChecksScreen, chosenEstimate } from './ChooseChecksScreen';
+import { ChooseChecksScreen, chosenEstimate, matchesCheck } from './ChooseChecksScreen';
 
 /** Nothing is chosen on Choose checks until the user picks: choose every
  *  table, then wait for the level controls. */
@@ -547,6 +547,38 @@ describe('ChooseChecksScreen with a run still going', () => {
     expect(screen.getByTestId('run-in-progress').textContent).toMatch(/A run is still going/);
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
     expect(onNext).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Choose checks search', () => {
+  const t = {
+    tableId: 'core.accounts',
+    schemaName: 'core',
+    tableName: 'accounts',
+    level: 'counts' as const,
+    controlTotalSuggestions: ['balance'],
+  };
+
+  it('matches the table, schema, level in words and control-total columns', () => {
+    expect(matchesCheck(t, '')).toBe(true);
+    expect(matchesCheck(t, 'core.acc')).toBe(true);
+    expect(matchesCheck(t, 'counts and totals')).toBe(true);
+    expect(matchesCheck(t, 'balance')).toBe(true);
+    expect(matchesCheck(t, 'loans')).toBe(false);
+  });
+
+  it('narrows the level list by a control-total column, and the chooser has a labelled search', async () => {
+    wrap(<ChecksHarness engine={createMockEngine()} />);
+    expect(await screen.findByLabelText('Search schemas and tables')).toBeDefined();
+    await chooseAllTables();
+    const before = screen.getAllByRole('combobox', { name: /^Check level for / }).length;
+    expect(screen.getByText('Search the chosen tables')).toBeDefined();
+    fireEvent.change(screen.getByPlaceholderText('Table, schema, level or control-total column'), {
+      target: { value: 'balance' },
+    });
+    const after = screen.getAllByRole('combobox', { name: /^Check level for / }).length;
+    expect(after).toBeGreaterThan(0);
+    expect(after).toBeLessThan(before);
   });
 });
 

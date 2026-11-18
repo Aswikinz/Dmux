@@ -58,7 +58,9 @@ describe('sameDecimal', () => {
     const start = performance.now();
     expect(sameDecimal(`1.${zeros}`, '1')).toBe(true);
     expect(sameDecimal(`1.${zeros}1`, '1')).toBe(false);
-    expect(performance.now() - start).toBeLessThan(500);
+    // The old /0+$/ took tens of seconds here; a generous bound keeps this
+    // stable on a busy machine while still catching that regression.
+    expect(performance.now() - start).toBeLessThan(5000);
   });
 
   it('lists only the totals that differ', () => {

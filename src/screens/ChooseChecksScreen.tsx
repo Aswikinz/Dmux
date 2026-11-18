@@ -73,6 +73,19 @@ export function applyPreset(
   return { ...plan, tables: plan.tables.map((t) => ({ ...t, level: levelFor(t) })) };
 }
 
+/** The level list's search: schema, table, the level in words, and the
+ *  control-total columns a table offers. */
+export function matchesCheck(t: TableCheck, query: string): boolean {
+  const q = query.trim();
+  if (!q) return true;
+  const level = levelOptions.find((o) => o.value === t.level)?.label ?? t.level;
+  return [
+    `${t.schemaName}.${t.tableName}`,
+    level,
+    ...(t.controlTotalSuggestions ?? []),
+  ].some((v) => v.toLowerCase().includes(q));
+}
+
 /** A fresh plan starts with no table chosen: the user picks what this run reads. */
 export function withNoneChosen(plan: CheckPlan): CheckPlan {
   return { ...plan, tables: plan.tables.map((t) => ({ ...t, included: false })) };
@@ -535,10 +548,14 @@ export function ChooseChecksScreen({
                 A control-total column you tick is added up in every table that has a column with that
                 name. Nothing is added up until you tick it.
               </p>
+              <p className="-mb-2 text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                Search the chosen tables
+              </p>
               <DataTable
                 data={chosen}
                 columns={columns}
-                filterPlaceholder="Filter by schema or table name"
+                filterPlaceholder="Table, schema, level or control-total column"
+                filterFn={matchesCheck}
               />
             </Panel>
           )}

@@ -22,6 +22,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::layout::{self, Layout, TableSummary, Tone};
+use dmux_engine::results::IssueKind;
 
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo-128.png");
 
@@ -145,6 +146,7 @@ pub fn render(layout: &Layout, results_sha256: &str) -> String {
     header(&mut h, layout);
     h.push_str("<main>\n");
     hero(&mut h, layout, &shown);
+    toolbar(&mut h, layout);
     record(&mut h, layout);
     failures(&mut h, layout);
     options(&mut h, layout);
@@ -209,28 +211,83 @@ fn hero(h: &mut String, layout: &Layout, shown: &str) {
     );
     h.push('\n');
 
-    let not_passing = layout
-        .tables
-        .iter()
-        .filter(|t| t.verdict_word != "PASS")
-        .count();
+    // Counted before anything was left out, so the tiles never under-report.
+    let data = layout.data_issue_tables;
+    let other = layout.other_issue_tables;
     let tiles = [
-        ("In scope", layout.in_scope, false),
-        ("Fully checked", layout.fully_checked, false),
-        ("Counts only", layout.counts_only, false),
-        ("Structure only", layout.structure_only, false),
-        ("Ignored", layout.ignored, false),
-        ("Tables not passing", not_passing, not_passing > 0),
+        ("In scope", layout.in_scope, ""),
+        ("Fully checked", layout.fully_checked, ""),
+        ("Counts only", layout.counts_only, ""),
+        ("Ignored", layout.ignored, ""),
+        ("Data differences", data, if data > 0 { " bad" } else { "" }),
+        (
+            "Other failures",
+            other,
+            if other > 0 { " caution-tile" } else { "" },
+        ),
     ];
     h.push_str(r#"<div class="tiles">"#);
-    for (label, n, flag) in tiles {
+    for (label, n, class) in tiles {
         let _ = write!(
             h,
-            r#"<div class="tile{}"><strong>{n}</strong><span>{label}</span></div>"#,
-            if flag { " bad" } else { "" }
+            r#"<div class="tile{class}"><strong>{n}</strong><span>{label}</span></div>"#
         );
     }
     h.push_str("</div>\n");
+    if !layout.omitted.is_empty() {
+        let _ = writeln!(
+            h,
+            r#"<p class="left-out" data-testid="left-out">Left out of this report when it was made: {}. The verdict, coverage and counts above include them; the run log and the results file list everything.</p>"#,
+            esc(&layout.omitted.join(", "))
+        );
+    }
+}
+
+/// The search and filter bar for the whole report: one search box and boxes
+/// for each kind of item, applied to the failure cards, the table list, the
+/// structure findings, the ignored items and the warnings.  It only hides and
+/// shows what is already on the page.
+fn toolbar(h: &mut String, layout: &Layout) {
+    let n_kind = |k: &str| layout.tables.iter().filter(|t| kind_key(t) == k).count();
+    let warnings = layout
+        .tables
+        .iter()
+        .filter(|t| t.verdict_word == "WARNING")
+        .count()
+        + layout
+            .structure_findings
+            .iter()
+            .filter(|f| f.verdict == "WARNING")
+            .count()
+        + layout.warnings.len()
+        + layout.changed_during_check.len();
+    let boxes = [
+        ("data", IssueKind::Data.label(), n_kind("data")),
+        (
+            "structure",
+            IssueKind::Structure.label(),
+            n_kind("structure") + layout.structure_findings.len(),
+        ),
+        ("other", IssueKind::Other.label(), n_kind("other")),
+        ("warning", "Warnings", warnings),
+        ("pass", "Passed tables", n_kind("pass")),
+    ];
+    h.push_str(
+        r#"<div class="toolbar js-only" role="search" aria-label="Search and filter the report">"#,
+    );
+    h.push_str(r#"<label class="search"><span class="sr">Search the whole report</span><input type="search" id="gq" placeholder="Search the whole report" autocomplete="off"></label>"#);
+    h.push_str(r#"<fieldset class="chips"><legend class="sr">Show</legend>"#);
+    for (key, label, n) in boxes {
+        let _ = write!(
+            h,
+            r#"<label class="chip {}"><input type="checkbox" class="gk" value="{key}" checked> {} <span class="n">{n}</span></label>"#,
+            if key == "data" { "bad" } else { "neutral" },
+            esc(label)
+        );
+    }
+    h.push_str("</fieldset>");
+    h.push_str(r#"<button type="button" class="btn" id="gonly">Only data differences</button><button type="button" class="btn" id="greset">Clear</button><span class="count" id="gcount" aria-live="polite"></span></div>"#);
+    h.push('\n');
 }
 
 fn record(h: &mut String, layout: &Layout) {
@@ -241,39 +298,92 @@ fn record(h: &mut String, layout: &Layout) {
     h.push_str("</dl></section>\n");
 }
 
+/// Shown in a section whose every card the search or filters hid.
+const EMPTY_NOTE: &str =
+    r#"<p class="muted gempty" hidden>Nothing here matches the search or filters.</p>"#;
+
+/// One failure as a card.
+fn failure_card(h: &mut String, t: &TableSummary) {
+    let search = format!(
+        "{} {} {} {}",
+        t.table,
+        t.verdict_word,
+        t.level,
+        t.reasons.join(" ")
+    )
+    .to_lowercase();
+    let _ = write!(
+        h,
+        r##"<li class="f" data-kind="{}" data-verdict="{}" data-search="{}"><div class="card-head">{}<a href="#t-{}">{}</a><span class="muted">{}</span></div><ul>"##,
+        kind_key(t),
+        esc(&t.verdict_word),
+        esc(&search),
+        pill(&t.verdict_word),
+        anchor(&t.table),
+        esc(&t.table),
+        esc(&t.level)
+    );
+    if t.reasons.is_empty() {
+        h.push_str("<li>no reason recorded</li>");
+    }
+    for r in &t.reasons {
+        let _ = write!(h, "<li>{}</li>", esc(r));
+    }
+    h.push_str("</ul></li>");
+}
+
+/// Data differences first (always in the report), then every other failure,
+/// grouped by kind.
 fn failures(h: &mut String, layout: &Layout) {
-    let failing: Vec<&TableSummary> = layout
-        .tables
-        .iter()
-        .filter(|t| t.verdict_word != "PASS")
-        .collect();
-    h.push_str("<section><h2>Failures and findings</h2>");
-    if failing.is_empty() {
-        h.push_str(
-            r#"<p class="muted">None. Every table that was checked passed at its level.</p>"#,
-        );
+    let of = |k: IssueKind| -> Vec<&TableSummary> {
+        layout.tables.iter().filter(|t| t.kind == Some(k)).collect()
+    };
+    h.push_str(r#"<section class="data-first" id="data-differences"><h2>Data differences</h2>"#);
+    let data = of(IssueKind::Data);
+    if data.is_empty() {
+        h.push_str(r#"<p class="muted">None. No rows or values differ in the tables that were compared.</p>"#);
     } else {
-        h.push_str(r#"<ul class="cards">"#);
-        for t in failing {
-            let _ = write!(
-                h,
-                r##"<li><div class="card-head">{}<a href="#t-{}">{}</a><span class="muted">{}</span></div><ul>"##,
-                pill(&t.verdict_word),
-                anchor(&t.table),
-                esc(&t.table),
-                esc(&t.level)
-            );
-            if t.reasons.is_empty() {
-                h.push_str("<li>no reason recorded</li>");
-            }
-            for r in &t.reasons {
-                let _ = write!(h, "<li>{}</li>", esc(r));
-            }
-            h.push_str("</ul></li>");
+        h.push_str(r#"<p class="muted">Tables where rows or values differ between the two databases.</p><ul class="cards">"#);
+        for t in data {
+            failure_card(h, t);
+        }
+        h.push_str("</ul>");
+        h.push_str(EMPTY_NOTE);
+    }
+    h.push_str("</section>\n");
+
+    let structure = of(IssueKind::Structure);
+    let other = of(IssueKind::Other);
+    h.push_str("<section><h2>Other failures</h2>");
+    if structure.is_empty() && other.is_empty() {
+        h.push_str(if layout.omitted.is_empty() {
+            r#"<p class="muted">None.</p>"#
+        } else {
+            r#"<p class="muted">None in this report (see what was left out above).</p>"#
+        });
+    }
+    for (kind, list) in [(IssueKind::Structure, structure), (IssueKind::Other, other)] {
+        if list.is_empty() {
+            continue;
+        }
+        let _ = write!(h, r#"<h3>{}</h3><ul class="cards">"#, esc(kind.label()));
+        for t in list {
+            failure_card(h, t);
         }
         h.push_str("</ul>");
     }
+    h.push_str(EMPTY_NOTE);
     h.push_str("</section>\n");
+}
+
+/// The kind of a table for the filter: data, structure, other, or pass.
+fn kind_key(t: &TableSummary) -> &'static str {
+    match t.kind {
+        Some(IssueKind::Data) => "data",
+        Some(IssueKind::Structure) => "structure",
+        Some(IssueKind::Other) => "other",
+        None => "pass",
+    }
 }
 
 /// A stable id fragment for a table name (letters, digits, '-', '_', '.').
@@ -329,6 +439,29 @@ fn tables(h: &mut String, layout: &Layout) {
 
     h.push_str(r#"<div class="controls js-only" role="group" aria-label="Filter tables">"#);
     h.push_str(r#"<label class="search"><span class="sr">Search tables</span><input type="search" id="tq" placeholder="Search tables, reasons, columns" autocomplete="off"></label>"#);
+    // Kind of problem: data differences first.
+    let mut kinds: Vec<(&str, &str, usize)> = Vec::new();
+    for (key, label) in [
+        ("data", IssueKind::Data.label()),
+        ("structure", IssueKind::Structure.label()),
+        ("other", IssueKind::Other.label()),
+        ("pass", "Passed"),
+    ] {
+        let n = layout.tables.iter().filter(|t| kind_key(t) == key).count();
+        if n > 0 {
+            kinds.push((key, label, n));
+        }
+    }
+    h.push_str(r#"<fieldset class="chips"><legend class="sr">Kind of problem</legend>"#);
+    for (key, label, n) in &kinds {
+        let _ = write!(
+            h,
+            r#"<label class="chip {}"><input type="checkbox" class="tk" value="{key}" checked> {} <span class="n">{n}</span></label>"#,
+            if *key == "data" { "bad" } else { "neutral" },
+            esc(label)
+        );
+    }
+    h.push_str("</fieldset>");
     h.push_str(r#"<fieldset class="chips"><legend class="sr">Verdict</legend>"#);
     for (w, n) in &verdicts {
         let _ = write!(
@@ -387,8 +520,9 @@ fn tables(h: &mut String, layout: &Layout) {
         let search = search.join(" ").to_lowercase();
         let _ = write!(
             h,
-            r#"<tbody class="t" id="t-{}" data-verdict="{}" data-level="{}" data-search="{}" data-rank="{}">"#,
+            r#"<tbody class="t f" id="t-{}" data-kind="{}" data-verdict="{}" data-level="{}" data-search="{}" data-rank="{}">"#,
             anchor(&t.table),
+            kind_key(t),
             esc(&t.verdict_word),
             esc(&t.level),
             esc(&search),
@@ -531,7 +665,7 @@ fn structure(h: &mut String, layout: &Layout) {
         let search = format!("{} {} {}", f.object, f.verdict, f.message).to_lowercase();
         let _ = write!(
             h,
-            r#"<tr data-verdict="{}" data-search="{}"><td class="mono">{}</td><td>{}</td><td>{}</td></tr>"#,
+            r#"<tr class="f" data-kind="structure" data-verdict="{}" data-search="{}"><td class="mono">{}</td><td>{}</td><td>{}</td></tr>"#,
             esc(&f.verdict),
             esc(&search),
             esc(&f.object),
@@ -551,7 +685,8 @@ fn lists(h: &mut String, layout: &Layout) {
         for i in &layout.ignored_items {
             let _ = write!(
                 h,
-                "<tr><td class=\"mono\">{}</td><td>{}</td></tr>",
+                r#"<tr class="f" data-kind="ignored" data-verdict="" data-search="{}"><td class="mono">{}</td><td>{}</td></tr>"#,
+                esc(&format!("{} {}", i.path, i.reason).to_lowercase()),
                 esc(&i.path),
                 esc(&i.reason)
             );
@@ -567,7 +702,12 @@ fn lists(h: &mut String, layout: &Layout) {
     if !warnings.is_empty() {
         h.push_str("<section><h2>Warnings</h2><ul>");
         for w in &warnings {
-            let _ = write!(h, "<li>{}</li>", esc(w));
+            let _ = write!(
+                h,
+                r#"<li class="f" data-kind="note" data-verdict="WARNING" data-search="{}">{}</li>"#,
+                esc(&w.to_lowercase()),
+                esc(w)
+            );
         }
         h.push_str("</ul></section>\n");
     }
@@ -721,6 +861,13 @@ section{background:var(--card);border:1px solid var(--rule);border-radius:12px;p
 .tile{background:var(--card);border:1px solid var(--rule);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column}
 .tile strong{font-size:26px;line-height:1.1}.tile span{font-size:12.5px;color:var(--muted)}
 .tile.bad{background:var(--bad-bg);border-color:transparent}.tile.bad strong{color:var(--bad)}
+.tile.caution-tile{background:var(--caution-bg);border-color:transparent}.tile.caution-tile strong{color:var(--caution)}
+.toolbar{position:sticky;top:0;z-index:5;display:none;flex-wrap:wrap;align-items:center;gap:10px;margin:12px 0;padding:10px 14px;border:1px solid var(--rule);border-radius:12px;background:color-mix(in srgb,var(--card) 92%,transparent);backdrop-filter:blur(8px)}
+.js .toolbar.js-only{display:flex}
+.toolbar .count{margin:0 0 0 auto}
+.left-out{margin:0 0 16px;padding:12px 16px;border-radius:10px;background:var(--caution-bg);color:var(--caution);font-size:14px}
+section.data-first{border-left:4px solid var(--bad)}
+section h3{font-size:15px;margin:14px 0 8px;color:var(--muted)}
 dl.kv{display:grid;grid-template-columns:minmax(150px,220px) 1fr;margin:0;border-radius:8px;overflow:hidden}
 dl.kv dt,dl.kv dd{margin:0;padding:8px 12px;border-top:1px solid var(--rule)}
 dl.kv dt:first-of-type,dl.kv dt:first-of-type+dd{border-top:0}
@@ -779,6 +926,11 @@ const JS: &str = r#"(function () {
   var $ = function (id) { return document.getElementById(id); };
   var all = function (sel, el) { return Array.prototype.slice.call((el || document).querySelectorAll(sel)); };
 
+  // An item is shown only when the section's own filter (lh) and the global
+  // filter (gh) both allow it.
+  var show = function (el) { el.hidden = el.getAttribute('data-lh') === '1' || el.getAttribute('data-gh') === '1'; };
+  var refresh = [];
+
   var printBtn = $('print');
   if (printBtn) printBtn.addEventListener('click', function () { window.print(); });
 
@@ -788,6 +940,7 @@ const JS: &str = r#"(function () {
     var bodies = all('tbody.t', table);
     var q = $('tq'), lvl = $('tl'), notPass = $('tf'), count = $('tcount'), empty = $('tempty');
     var chips = all('input.tv');
+    var kindChips = all('input.tk');
     var setOpen = function (tb, open) {
       var d = tb.querySelector('tr.detail'), b = tb.querySelector('button.toggle');
       d.classList.toggle('open', open);
@@ -802,28 +955,32 @@ const JS: &str = r#"(function () {
       var text = q.value.trim().toLowerCase();
       var allowed = {};
       chips.forEach(function (c) { if (c.checked) allowed[c.value] = true; });
+      var kinds = {};
+      kindChips.forEach(function (c) { if (c.checked) kinds[c.value] = true; });
       var shown = 0;
       bodies.forEach(function (tb) {
         var v = tb.getAttribute('data-verdict');
-        var ok = !!allowed[v] &&
+        var ok = !!allowed[v] && !!kinds[tb.getAttribute('data-kind')] &&
           (!lvl.value || tb.getAttribute('data-level') === lvl.value) &&
           (!notPass.checked || v !== 'PASS') &&
           (!text || tb.getAttribute('data-search').indexOf(text) !== -1);
-        tb.hidden = !ok;
-        if (ok) shown++;
+        tb.setAttribute('data-lh', ok ? '' : '1');
+        show(tb);
+        if (!tb.hidden) shown++;
       });
       count.textContent = 'Showing ' + shown + ' of ' + bodies.length + ' tables';
       empty.hidden = shown !== 0;
     };
-    [q, lvl, notPass].concat(chips).forEach(function (el) {
+    [q, lvl, notPass].concat(chips, kindChips).forEach(function (el) {
       el.addEventListener('input', apply);
       el.addEventListener('change', apply);
     });
     $('expand').addEventListener('click', function () { bodies.forEach(function (tb) { if (!tb.hidden) setOpen(tb, true); }); });
     $('collapse').addEventListener('click', function () { bodies.forEach(function (tb) { setOpen(tb, false); }); });
+    refresh.push(apply);
     $('reset').addEventListener('click', function () {
       q.value = ''; lvl.value = ''; notPass.checked = false;
-      chips.forEach(function (c) { c.checked = true; });
+      chips.concat(kindChips).forEach(function (c) { c.checked = true; });
       apply();
     });
 
@@ -861,13 +1018,60 @@ const JS: &str = r#"(function () {
       rows.forEach(function (tr) {
         var ok = (!sv.value || tr.getAttribute('data-verdict') === sv.value) &&
           (!text || tr.getAttribute('data-search').indexOf(text) !== -1);
-        tr.hidden = !ok;
-        if (ok) n++;
+        tr.setAttribute('data-lh', ok ? '' : '1');
+        show(tr);
+        if (!tr.hidden) n++;
       });
       sc.textContent = 'Showing ' + n + ' of ' + rows.length + ' findings';
     };
+    refresh.push(applyS);
     sq.addEventListener('input', applyS);
     sv.addEventListener('change', applyS);
+  }
+
+  // ---- the whole report ----
+  var gq = $('gq');
+  if (gq) {
+    var items = all('.f'), boxes = all('input.gk'), gcount = $('gcount');
+    var applyG = function () {
+      var text = gq.value.trim().toLowerCase(), on = {}, n = 0;
+      boxes.forEach(function (b) { if (b.checked) on[b.value] = true; });
+      items.forEach(function (el) {
+        var k = el.getAttribute('data-kind'), v = el.getAttribute('data-verdict');
+        var kindOk = k === 'ignored' || k === 'note' || !!on[k];
+        var ok = kindOk && (v !== 'WARNING' || !!on.warning) &&
+          (!text || el.getAttribute('data-search').indexOf(text) !== -1);
+        el.setAttribute('data-gh', ok ? '' : '1');
+        show(el);
+        if (!el.hidden) n++;
+      });
+      refresh.forEach(function (f) { f(); });
+      // A group of cards with nothing left to show loses its heading, and a
+      // section emptied by the filter says so.
+      all('ul.cards').forEach(function (ul) {
+        var any = all('li.f', ul).some(function (li) { return !li.hidden; });
+        ul.hidden = !any;
+        var head = ul.previousElementSibling;
+        if (head && head.tagName === 'H3') head.hidden = !any;
+      });
+      all('p.gempty').forEach(function (p) {
+        var sec = p.parentNode, cards = all('li.f', sec);
+        p.hidden = cards.length === 0 || cards.some(function (li) { return !li.hidden; });
+      });
+      gcount.textContent = 'Showing ' + n + ' of ' + items.length + ' items';
+    };
+    gq.addEventListener('input', applyG);
+    boxes.forEach(function (b) { b.addEventListener('change', applyG); });
+    $('gonly').addEventListener('click', function () {
+      boxes.forEach(function (b) { b.checked = b.value === 'data'; });
+      applyG();
+    });
+    $('greset').addEventListener('click', function () {
+      gq.value = '';
+      boxes.forEach(function (b) { b.checked = true; });
+      applyG();
+    });
+    applyG();
   }
 })();
 "#;
@@ -960,6 +1164,7 @@ mod tests {
             &ReportOptions {
                 include_keys,
                 generated_at: Some("2026-11-18T10:00:00Z".into()),
+                ..Default::default()
             },
         );
         render(&layout, "f00d")
@@ -1038,6 +1243,28 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn the_whole_report_can_be_searched_and_filtered() {
+        let h = html(false);
+        assert!(h.contains(r#"id="gq""#), "global search box");
+        for key in ["data", "structure", "other", "warning", "pass"] {
+            assert!(
+                h.contains(&format!(r#"class="gk" value="{key}" checked"#)),
+                "{key} box"
+            );
+        }
+        assert!(h.contains(r#"id="gonly""#) && h.contains(r#"id="greset""#));
+        // Every card, table and finding carries what the filter needs.
+        assert!(h.contains(r#"<li class="f" data-kind="data" data-verdict="FAIL""#));
+        assert!(h.contains(r#"<tbody class="t f" id="t-demo_bank.loans" data-kind="pass""#));
+        assert!(h.contains(r#"<tr class="f" data-kind="structure" data-verdict="FAIL""#));
+        // Data differences come before the other failures.
+        assert!(
+            h.find("<h2>Data differences</h2>").unwrap()
+                < h.find("<h2>Other failures</h2>").unwrap()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Search } from 'lucide-react';
 import { cn } from '../design/cn';
 import { StatusBadge } from '../design/StatusBadge';
 import type { StructureRow } from '../api/contract';
-import { visibleRows, type VisibleRow } from './structureRows';
+import { KIND_GROUP_LABELS, visibleRows, type KindGroup, type VisibleRow } from './structureRows';
 
 /** One line is this tall, so scrolling maths never needs to measure. */
 export const STRUCTURE_ROW_HEIGHT = 36;
@@ -83,11 +83,12 @@ export function StructureCompareView({
   const [query, setQuery] = useState('');
   const [toggled, setToggled] = useState<ReadonlySet<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [hiddenGroups, setHiddenGroups] = useState<ReadonlySet<KindGroup>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const shown = useMemo(
-    () => visibleRows(rows, { toggled, onlyProblems: showOnlyProblems, query }),
-    [rows, toggled, showOnlyProblems, query],
+    () => visibleRows(rows, { toggled, onlyProblems: showOnlyProblems, query, hiddenGroups }),
+    [rows, toggled, showOnlyProblems, query, hiddenGroups],
   );
   const list = shown.rows;
   const activeIndex = Math.max(
@@ -172,6 +173,7 @@ export function StructureCompareView({
   };
 
   const problemWord = shown.differences === 1 ? 'difference' : 'differences';
+  const tablesOnly = hiddenGroups.size === 2 && !hiddenGroups.has('tables');
   const activeDomId = list.length > 0 ? `${uid}-row-${activeIndex}` : undefined;
 
   return (
@@ -194,8 +196,38 @@ export function StructureCompareView({
         <p className="text-sm text-slate-700 dark:text-slate-300" role="status" data-testid="structure-count">
           {shown.differences.toLocaleString()} {problemWord} · showing {list.length.toLocaleString()} of{' '}
           {shown.total.toLocaleString()} items
+          {shown.hiddenDifferences > 0 &&
+            ` · ${shown.hiddenDifferences.toLocaleString()} more in the kinds you hid`}
         </p>
       </div>
+      <fieldset className="flex flex-wrap items-center gap-x-4 gap-y-2" data-testid="structure-kinds">
+        <legend className="float-left mr-1 text-sm font-medium text-slate-700 dark:text-slate-200">
+          Show:
+        </legend>
+        {(Object.keys(KIND_GROUP_LABELS) as KindGroup[]).map((g) => (
+          <label key={g} className="flex items-center gap-1.5 text-sm text-slate-700 dark:text-slate-200">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-accent-600"
+              checked={!hiddenGroups.has(g)}
+              onChange={(e) => {
+                const next = new Set(hiddenGroups);
+                if (e.target.checked) next.delete(g);
+                else next.add(g);
+                setHiddenGroups(next);
+              }}
+            />
+            {KIND_GROUP_LABELS[g]}
+          </label>
+        ))}
+        <button
+          type="button"
+          className="rounded-lg border border-black/[0.1] px-2.5 py-1 text-[13px] font-medium text-slate-700 hover:bg-black/[0.04] dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/[0.06]"
+          onClick={() => setHiddenGroups(tablesOnly ? new Set() : new Set<KindGroup>(['indexes', 'other']))}
+        >
+          {tablesOnly ? 'Show every kind' : 'Tables and columns only'}
+        </button>
+      </fieldset>
 
       <div
         ref={scrollRef}

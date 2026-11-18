@@ -2,15 +2,34 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
 import { VerdictFilter } from './VerdictFilter';
-import { resultCounts } from '../screens/ResultsScreen';
-import type { Results, Verdict } from '../api/contract';
+import { kindCounts, resultCounts, resultItems } from '../screens/ResultsScreen';
+import type { IssueKind, Results, Verdict } from '../api/contract';
 
-function Harness({ counts }: { counts: Partial<Record<Verdict, number>> }) {
+function Harness({
+  counts,
+  kinds = {},
+}: {
+  counts: Partial<Record<Verdict, number>>;
+  kinds?: Partial<Record<IssueKind, number>>;
+}) {
   const [hidden, setHidden] = useState<Set<Verdict>>(new Set());
+  const [hiddenKinds, setHiddenKinds] = useState<Set<IssueKind>>(new Set());
+  const total =
+    Object.entries(counts).reduce((n, [v, c]) => n + (hidden.has(v as Verdict) ? (c ?? 0) : 0), 0) +
+    Object.entries(kinds).reduce((n, [k, c]) => n + (hiddenKinds.has(k as IssueKind) ? (c ?? 0) : 0), 0);
   return (
     <>
-      <VerdictFilter counts={counts} hidden={hidden} onChange={setHidden} />
+      <VerdictFilter
+        counts={counts}
+        hidden={hidden}
+        onChange={setHidden}
+        kindCounts={kinds}
+        hiddenKinds={hiddenKinds}
+        onKindsChange={setHiddenKinds}
+        hiddenTotal={total}
+      />
       <output data-testid="hidden">{[...hidden].sort().join(',')}</output>
+      <output data-testid="hidden-kinds">{[...hiddenKinds].sort().join(',')}</output>
     </>
   );
 }
@@ -32,24 +51,47 @@ describe('VerdictFilter', () => {
     expect(screen.getByTestId('hidden').textContent).toBe('');
   });
 
+  it('lists the kinds of problem data first, and "Only data differences" hides the rest', () => {
+    render(
+      <Harness counts={{ FAIL: 9 }} kinds={{ other: 2, structure: 5, data: 2 }} />,
+    );
+    const labels = screen
+      .getAllByRole('checkbox')
+      .map((b) => b.closest('label')?.textContent);
+    expect(labels).toEqual(['Data differences(2)', 'Structure differences(5)', 'Other reasons(2)']);
+    fireEvent.click(screen.getByRole('button', { name: 'Only data differences' }));
+    expect(screen.getByTestId('hidden-kinds').textContent).toBe('other,structure');
+    expect(screen.getByText(/7 results are hidden by this filter/)).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Show every kind' }));
+    expect(screen.getByTestId('hidden-kinds').textContent).toBe('');
+  });
+
   it('offers nothing when there is only one kind of result', () => {
     const { container } = render(<Harness counts={{ PASS: 30 }} />);
     expect(container.querySelector('[data-testid="verdict-filter"]')).toBeNull();
   });
 });
 
-describe('resultCounts', () => {
+describe('resultCounts and kindCounts', () => {
+  const results = {
+    tableResults: [
+      { tableId: 's.a', verdict: 'FAIL', kind: 'data' },
+      { tableId: 's.b', verdict: 'PASS' },
+      { tableId: 's.c', verdict: 'FAIL', kind: 'structure' },
+    ],
+    failures: [
+      { id: 'c1', tableId: 's.a', verdict: 'FAIL', kind: 'data' },
+      { id: 'c2', tableId: 'database.encoding', verdict: 'WARNING', kind: 'structure' },
+      { id: 'c3', tableId: 's.c', verdict: 'FAIL', kind: 'structure' },
+    ],
+  } as unknown as Results;
+
   it('counts a failure card and its table row as one result', () => {
-    const results = {
-      tableResults: [
-        { tableId: 's.a', verdict: 'FAIL' },
-        { tableId: 's.b', verdict: 'PASS' },
-      ],
-      failures: [
-        { id: 'c1', tableId: 's.a', verdict: 'FAIL' },
-        { id: 'c2', tableId: 'database.encoding', verdict: 'WARNING' },
-      ],
-    } as unknown as Results;
-    expect(resultCounts(results)).toEqual({ FAIL: 1, PASS: 1, WARNING: 1 });
+    expect(resultItems(results)).toHaveLength(4);
+    expect(resultCounts(results)).toEqual({ FAIL: 2, PASS: 1, WARNING: 1 });
+  });
+
+  it('counts kinds only for failures', () => {
+    expect(kindCounts(results)).toEqual({ data: 1, structure: 2 });
   });
 });

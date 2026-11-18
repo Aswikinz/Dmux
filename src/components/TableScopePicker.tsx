@@ -101,9 +101,12 @@ export function TableScopePicker({ tables, onChange }: TableScopePickerProps) {
         </p>
       </div>
 
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="relative min-w-[16rem] flex-1">
-          <span className="sr-only">Find a schema or table</span>
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="flex min-w-[16rem] flex-1 flex-col gap-1">
+          <span className="text-[13px] font-medium text-slate-700 dark:text-slate-300">
+            Search schemas and tables
+          </span>
+          <span className="relative">
           <Search
             className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
             aria-hidden="true"
@@ -115,6 +118,7 @@ export function TableScopePicker({ tables, onChange }: TableScopePickerProps) {
             placeholder="Find a schema or table"
             className="h-9 w-full rounded-[10px] border border-black/[0.1] bg-white pl-9 pr-3 text-sm text-ink focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/20 dark:border-white/10 dark:bg-white/[0.06] dark:text-slate-100"
           />
+          </span>
         </label>
         {q && (
           <Button

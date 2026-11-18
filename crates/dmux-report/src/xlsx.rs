@@ -162,6 +162,25 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
                 .map(|(k, v)| (k.to_string(), v)),
         );
         pairs.extend::<Vec<(String, String)>>(vec![
+            (
+                "Tables with data differences".into(),
+                layout.data_issue_tables.to_string(),
+            ),
+            (
+                "Tables with other failures".into(),
+                layout.other_issue_tables.to_string(),
+            ),
+        ]);
+        if !layout.omitted.is_empty() {
+            pairs.push((
+                "Left out of this report".into(),
+                format!(
+                    "{}. The verdict, coverage and counts include them; the run log and the results file list everything.",
+                    layout.omitted.join(", ")
+                ),
+            ));
+        }
+        pairs.extend::<Vec<(String, String)>>(vec![
             ("Fully checked".into(), layout.fully_checked.to_string()),
             ("Counts only".into(), layout.counts_only.to_string()),
             ("Structure only".into(), layout.structure_only.to_string()),
@@ -220,6 +239,7 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
         let header = [
             "Table",
             "Verdict",
+            "Kind of problem",
             "Level",
             "Old rows",
             "New rows",
@@ -241,6 +261,7 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
             rows.push(vec![
                 t.table.clone(),
                 t.verdict_word.clone(),
+                t.kind.map_or("-", |k| k.label()).to_string(),
                 t.level.clone(),
                 t.old_rows.clone().unwrap_or_else(|| "-".into()),
                 t.new_rows.clone().unwrap_or_else(|| "-".into()),
@@ -527,6 +548,7 @@ mod tests {
             level: "full values".into(),
             verdict: "FAIL".into(),
             verdict_word: "FAIL".into(),
+            kind: None,
             old_rows: Some("100".into()),
             new_rows: Some("99".into()),
             differing_buckets: "1".into(),

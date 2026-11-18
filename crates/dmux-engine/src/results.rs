@@ -465,6 +465,75 @@ pub fn options_recorded(results: &RunResults) -> bool {
     results.results_version >= OPTIONS_RECORDED_VERSION
 }
 
+/// What kind of problem a non-PASS result is, so a reader can put data
+/// differences first.  Decided only from typed evidence, never from the wording
+/// of a reason.  It changes no verdict: it only groups what is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueKind {
+    /// The comparison found the data differs: missing, extra or changed rows,
+    /// differing buckets, different row counts or different control totals.
+    Data,
+    /// The structure differs: a missing or added table or column, a changed
+    /// type, index, constraint and so on.
+    Structure,
+    /// Anything else: a tool fault, data changing during the check, or an item
+    /// that needs a person's review.
+    Other,
+}
+
+impl IssueKind {
+    /// The kind in plain words.
+    pub fn label(self) -> &'static str {
+        match self {
+            IssueKind::Data => "Data differences",
+            IssueKind::Structure => "Structure differences",
+            IssueKind::Other => "Other reasons",
+        }
+    }
+}
+
+/// The kind of a table's result, or `None` for a PASS.
+///
+/// In order: a TOOL FAULT or CHANGED DURING CHECK is `Other` (differences seen
+/// while the data was moving are not evidence about the migration); any data
+/// evidence makes it `Data`; a non-PASS structure finding on the table or one
+/// of its columns makes it `Structure`; anything else is `Other`.
+pub fn table_issue_kind(path: &str, t: &TableResult, results: &RunResults) -> Option<IssueKind> {
+    if t.verdict == Verdict::Pass {
+        return None;
+    }
+    if matches!(t.verdict, Verdict::ToolFault | Verdict::ChangedDuringCheck) {
+        return Some(IssueKind::Other);
+    }
+    let some = |v: Option<usize>| v.unwrap_or(0) > 0;
+    let counts_differ = matches!((t.old_rows, t.new_rows), (Some(o), Some(n)) if o != n);
+    let totals_differ = results
+        .details
+        .get(path)
+        .is_some_and(|d| !d.control_totals.is_empty());
+    if some(t.missing_rows)
+        || some(t.extra_rows)
+        || some(t.changed_rows)
+        || some(t.differing_buckets)
+        || some(t.missing_buckets)
+        || some(t.extra_buckets)
+        || counts_differ
+        || totals_differ
+    {
+        return Some(IssueKind::Data);
+    }
+    let prefix = format!("{path}.");
+    if results
+        .structure_findings
+        .iter()
+        .any(|f| f.verdict != Verdict::Pass && (f.object == path || f.object.starts_with(&prefix)))
+    {
+        return Some(IssueKind::Structure);
+    }
+    Some(IssueKind::Other)
+}
+
 /// The precedence order for combining verdicts: a run is PASS only when every
 /// contributing verdict is PASS.  Any non-PASS verdict pulls the run down;
 /// TOOL_FAULT is the gravest because a reader must never mistake a broken tool
@@ -662,6 +731,100 @@ pub fn any_options_applied(results: &RunResults) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    fn kind_of(t: TableResult, findings: Vec<StructureFinding>) -> Option<IssueKind> {
+        let path = t.table.clone();
+        let r = RunResults {
+            structure_findings: findings,
+            tables: BTreeMap::from([(path.clone(), t.clone())]),
+            ..RunResults::default()
+        };
+        table_issue_kind(&path, &t, &r)
+    }
+
+    fn plain(verdict: super::Verdict) -> TableResult {
+        TableResult {
+            table: "s.t".into(),
+            level: CheckLevel::FullValues,
+            verdict,
+            old_rows: Some(10),
+            new_rows: Some(10),
+            columns_covered: None,
+            differing_buckets: Some(0),
+            missing_buckets: Some(0),
+            extra_buckets: Some(0),
+            missing_rows: Some(0),
+            extra_rows: Some(0),
+            changed_rows: Some(0),
+            reasons: vec![],
+            column_notes: vec![],
+        }
+    }
+
+    fn finding(object: &str, verdict: super::Verdict) -> StructureFinding {
+        StructureFinding {
+            object: object.into(),
+            path: vec![],
+            verdict,
+            message: "differs".into(),
+        }
+    }
+
+    #[test]
+    fn data_evidence_makes_a_data_issue() {
+        use super::Verdict as V;
+        assert_eq!(kind_of(plain(V::Pass), vec![]), None);
+        let mut t = plain(V::Fail);
+        t.changed_rows = Some(1);
+        assert_eq!(kind_of(t, vec![]), Some(IssueKind::Data));
+        let mut t = plain(V::Fail);
+        t.new_rows = Some(9);
+        assert_eq!(kind_of(t, vec![]), Some(IssueKind::Data));
+        let mut t = plain(V::WidelyDifferent);
+        t.differing_buckets = Some(300);
+        // Data evidence wins over a structure finding on the same table.
+        assert_eq!(
+            kind_of(t, vec![finding("s.t.c", V::Fail)]),
+            Some(IssueKind::Data)
+        );
+    }
+
+    #[test]
+    fn a_structure_finding_without_data_evidence_is_a_structure_issue() {
+        use super::Verdict as V;
+        let t = plain(V::Fail);
+        assert_eq!(
+            kind_of(t.clone(), vec![finding("s.t.legacy_flag", V::Fail)]),
+            Some(IssueKind::Structure)
+        );
+        assert_eq!(
+            kind_of(t.clone(), vec![finding("s.t", V::Fail)]),
+            Some(IssueKind::Structure)
+        );
+        // A finding on another table, or one that passed, does not count.
+        assert_eq!(
+            kind_of(t.clone(), vec![finding("s.tother", V::Fail)]),
+            Some(IssueKind::Other)
+        );
+        assert_eq!(
+            kind_of(t, vec![finding("s.t.c", V::Pass)]),
+            Some(IssueKind::Other)
+        );
+    }
+
+    #[test]
+    fn faults_and_moving_data_are_other_reasons_even_with_differences() {
+        use super::Verdict as V;
+        for v in [V::ToolFault, V::ChangedDuringCheck] {
+            let mut t = plain(v);
+            t.changed_rows = Some(5);
+            assert_eq!(kind_of(t, vec![]), Some(IssueKind::Other), "{v:?}");
+        }
+        assert_eq!(
+            kind_of(plain(V::NeedsReview), vec![]),
+            Some(IssueKind::Other)
+        );
+    }
 
     #[test]
     fn results_without_table_facts_serialise_without_the_key_and_keep_their_digest() {

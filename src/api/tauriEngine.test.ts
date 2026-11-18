@@ -621,9 +621,28 @@ describe('data half is wired to the backend', () => {
     const engine = createTauriEngine();
     const res = await engine.exportReport({ runId: 'run-1', format: 'pdf', includeKeys: false });
     expect(invoke).toHaveBeenCalledWith('export_report', {
-      input: { run_id: 'run-1', format: 'pdf', include_keys: false },
+      input: { run_id: 'run-1', format: 'pdf', include_keys: false, leave_out: { structure: false, other: false, warnings: false, passing: false } },
     });
     expect(res).toEqual({ ok: true, filePath: '/home/u/dmux-run-1.pdf' });
+  });
+
+  it('exportReport sends what the user left out (and never a way to leave out data)', async () => {
+    invoke.mockResolvedValueOnce({ status: 'saved', path: '/r.pdf' });
+    const engine = createTauriEngine();
+    await engine.exportReport({
+      runId: 'run-1',
+      format: 'html',
+      includeKeys: false,
+      leaveOut: { structure: true, other: false, warnings: true, passing: true },
+    });
+    expect(invoke).toHaveBeenCalledWith('export_report', {
+      input: {
+        run_id: 'run-1',
+        format: 'html',
+        include_keys: false,
+        leave_out: { structure: true, other: false, warnings: true, passing: true },
+      },
+    });
   });
 
   it('exportReport reports a dismissed dialog as cancelled', async () => {
@@ -631,7 +650,7 @@ describe('data half is wired to the backend', () => {
     const engine = createTauriEngine();
     const res = await engine.exportReport({ runId: 'run-1', format: 'excel', includeKeys: true });
     expect(invoke).toHaveBeenCalledWith('export_report', {
-      input: { run_id: 'run-1', format: 'excel', include_keys: true },
+      input: { run_id: 'run-1', format: 'excel', include_keys: true, leave_out: { structure: false, other: false, warnings: false, passing: false } },
     });
     expect(res).toEqual({ ok: false, cancelled: true });
   });

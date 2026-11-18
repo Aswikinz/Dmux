@@ -98,3 +98,20 @@ for (const colorScheme of ['light', 'dark'] as const) {
     ).toEqual([]);
   });
 }
+
+test('kinds of object can be hidden so table and column changes stand out', async ({ page }) => {
+  await openStructure(page, 'diff');
+  const kinds = page.getByTestId('structure-kinds');
+  await expect(kinds.getByRole('checkbox', { name: 'Tables and columns' })).toBeChecked();
+  await kinds.getByRole('button', { name: 'Tables and columns only' }).click();
+  await expect(kinds.getByRole('checkbox', { name: 'Indexes and constraints' })).not.toBeChecked();
+  await expect(kinds.getByRole('checkbox', { name: 'Other PostgreSQL objects' })).not.toBeChecked();
+  // Table and column changes are still there.
+  await expect(rows(page).filter({ hasText: /^balance/ })).toBeVisible();
+  await kinds.getByRole('button', { name: 'Show every kind' }).click();
+  await expect(kinds.getByRole('checkbox', { name: 'Indexes and constraints' })).toBeChecked();
+  await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+  const results = await new AxeBuilder({ page }).analyze();
+  const serious = results.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
+  expect(serious.map((v) => v.id)).toEqual([]);
+});

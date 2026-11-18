@@ -589,6 +589,7 @@ const makeResults = (fixture: string): Results => {
       drillDown = [drillDownSample('missing'), drillDownSample('extra'), drillDownSample('changed')];
       failures.push({
         id: `fail-${i}`,
+        kind: 'data',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -603,6 +604,7 @@ const makeResults = (fixture: string): Results => {
       drillDown = [drillDownSample('changed')];
       failures.push({
         id: `widediff-${i}`,
+        kind: 'data',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -616,6 +618,7 @@ const makeResults = (fixture: string): Results => {
       verdict = 'NEEDS_REVIEW';
       failures.push({
         id: `review-${i}`,
+        kind: 'other',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -629,6 +632,7 @@ const makeResults = (fixture: string): Results => {
       verdict = 'WARNING';
       failures.push({
         id: `warn-${i}`,
+        kind: 'other',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -641,6 +645,7 @@ const makeResults = (fixture: string): Results => {
       verdict = 'CHANGED_DURING_CHECK';
       failures.push({
         id: `cdc-${i}`,
+        kind: 'other',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -654,6 +659,7 @@ const makeResults = (fixture: string): Results => {
       verdict = 'TOOL_FAULT';
       failures.push({
         id: `fault-${i}`,
+        kind: 'other',
         tableId: deterministicId('tbl', i),
         schemaName: 'demo_bank',
         tableName: `table_${i.toString().padStart(4, '0')}`,
@@ -676,6 +682,7 @@ const makeResults = (fixture: string): Results => {
       schemaName: 'demo_bank',
       tableName: `table_${i.toString().padStart(4, '0')}`,
       verdict,
+      ...(card?.kind && verdict !== 'PASS' ? { kind: card.kind } : {}),
       level,
       checked: fixture !== 'cancelled',
       drillDown,
@@ -730,7 +737,7 @@ const makeResults = (fixture: string): Results => {
     optionsRecorded: true,
     warnings: [],
     runFacts: {
-      toolVersion: '1.3.0 (mock)',
+      toolVersion: '1.3.1 (mock)',
       mappingHash: '3f2a9c1be0d84a7f6c55d2e1b9a0c4d87e6f1a2b3c4d5e6f708192a3b4c5d6e7',
       resultsSha256: '9b1de4c07a52f3e86d4b0a1c2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f7',
       oldConnection: mockConnection('9.6.24', 'LATIN1'),

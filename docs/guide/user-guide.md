@@ -202,7 +202,11 @@ new one, before any data is compared.
    items you are looking at.
 4. Tick **Show only problems** to hide what matches. Type in the search box to find a
    table, column, index or constraint by name, or by a word in its definition. Search
-   works across thousands of tables.
+   works across thousands of tables. To cut the noise, untick the kinds of object you do
+   not need under **Show**: *Tables and columns*, *Indexes and constraints*, or *Other
+   PostgreSQL objects* (extensions, functions, sequences, views and triggers). **Tables and
+   columns only** does this in one click. The count says how many differences are in the
+   kinds you hid, so nothing disappears silently.
 5. Open a table (click the arrow beside its name, or press the right arrow key) to see its
    columns, indexes and constraints.
 6. Continue to **Map** when you have read the problems.
@@ -310,7 +314,8 @@ and see how long that will take before you start.
 1. Under **Tables to check**, choose the tables this run reads. Nothing is chosen at first.
    Tick a schema's box to choose all of its tables, open a schema with the arrow to tick
    single tables, type in **Find a schema or table** and press **Select N matching**, or
-   press **Select all**. **Clear all** starts again. A schema with only some tables chosen
+   press **Select all**. **Clear all** starts again. Use **Search schemas and tables** to
+   find tables by name. A schema with only some tables chosen
    shows a dash in its box. During busy hours, choose only the few tables you need: Dmux
    never reads a table you leave out. Each left-out table is listed in the results and on
    the first page of every report as "not selected for this run", and it counts as ignored
@@ -332,12 +337,16 @@ and see how long that will take before you start.
    amounts or balances, **unticked**. Nothing is added up until you tick it. A ticked
    column is added up in every table that has a column with that name.
 6. Read the estimate: a range per table and in total. It covers only the chosen tables.
+   **Search the chosen tables**, above the list of levels, finds a table by name, by level
+   (for example "full values") or by a control-total column (for example "amount").
 7. If the databases are only quiet at certain hours, switch on **Only run during certain
    hours** and set the times, for example 22:00 until 05:00. It is off unless you turn it on.
    Outside those hours Dmux waits between tables, and carries on by itself when the hours
    start again. A window that crosses midnight works. The times are the clock of the
    computer running Dmux.
-8. Press **Run**.
+8. Press **Run**. After a run you can come back here, choose other tables or levels and
+   press **Run** again: it starts a new run with the new choices (the earlier run stays in
+   History). If a run is still going, **Run** takes you back to it instead.
 
 **What you see.** A list of tables with their level, their size on disk and an estimated
 time. The estimate is a range, because it is measured on your servers at that moment, and
@@ -409,11 +418,25 @@ table being written to by someone else shows "changed during check", never a tic
 
 **Steps.**
 
-1. Read the verdict and the coverage line at the top.
+1. Read the verdict and the coverage line at the top. The ignored items are counted there;
+   press **Show ignored items** to list each one with its reason.
 2. Read the failure cards: each says what is wrong, how big the gap is and what to do next.
+   Each card also says what kind of problem it is, and **data differences come first**:
+   - *Data differences*: rows or values differ (missing, extra or changed rows, different
+     row counts or control totals).
+   - *Structure differences*: a table, column, type, index or similar differs, but no row
+     or value was found to differ.
+   - *Other reasons*: Dmux could not fully check the table (a tool fault, data changing
+     during the check, or an item a person must review). A table that changed during the
+     check is always here, even if it shows differences, because those may come from the
+     writes made during the check rather than from the migration.
 3. Open a failing table to see the rows that are missing, extra or changed, with the
    differing columns side by side.
-4. Filter to problems only, and search for a table name.
+4. Narrow what is shown with the filter above the failures. **Kind of problem** has a box
+   for each kind and an **Only data differences** button; **Show** has a box for each
+   verdict and a **Hide warnings** button. The filter changes only the lists: the overall
+   verdict at the top never changes, and the screen says how many results are hidden.
+   Search for a table name in **All tables**.
 5. Open **Details** on any table in **All tables**, or **Show details** on a failure card, to
    see why that table got its verdict. This works for a table that passed as much as for
    one that failed.
@@ -490,13 +513,20 @@ value printed on the signed PDF report.
 1. Read the verdict and coverage line at the top of the screen.
 2. Tick **Include row keys in the exported report** only if the recipient needs key values.
    It is off by default, and row values are never exported.
-3. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or
+3. Under **What goes into the report**, choose what the report holds. Data differences are
+   always included and always come first. Untick *Structure differences*, *Failures for
+   other reasons*, *Warnings* or *Tables that passed* to leave them out, or press **Only
+   data differences**. Whatever you leave out is named on the report's first page, and the
+   verdict, coverage and counts still include it, so a shorter report never reads as a
+   cleaner result. The run log always lists everything. On the command line, use
+   `dmux report --leave-out structure,other,warnings,passing` (any of them).
+4. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or
    **Export HTML** for a web page you can search and filter. Export as many as you need.
-4. A save dialog from your operating system opens. Choose where to save and confirm.
-5. The screen then shows the path the file was saved to. If you close the dialog, it says
+5. A save dialog from your operating system opens. Choose where to save and confirm.
+6. The screen then shows the path the file was saved to. If you close the dialog, it says
    the export was cancelled and nothing was saved. If something fails, it says so in plain
    words.
-6. Check the first page: the verdict and what it means, the coverage line, and the
+7. Check the first page: the verdict and what it means, the coverage line, and the
    **check record**: when the check started and finished, how long it took, when the
    report was generated, which two databases were compared (name, server and login, never
    a password), the run identifier and the Dmux version. Failures, ignored items with
@@ -506,9 +536,11 @@ value printed on the signed PDF report.
 **What you see.** A PDF sized for a signature, with the Dmux logo and "Page N of M" on every
 page; an Excel file with the detail behind it; and an HTML report. The HTML report is one
 file that opens in any browser and needs no network: it is not allowed to load anything
-from outside the file. It holds the same content as the PDF, and lets you search the tables,
-filter them by verdict and level, show only the tables that did not pass, sort any column,
-and open each table's detail. Printing it from the browser gives a clean copy. Times in
+from outside the file. It holds the same content as the PDF. A bar at the top stays in view
+while you scroll: search the whole report at once (failures, tables, structure findings,
+ignored items and warnings), tick which kinds to show, or press **Only data differences**.
+The list of tables also has its own search, filters by kind, verdict and level, a "not
+passing only" switch, sortable columns and each table's detail. Printing it from the browser gives a clean copy. Times in
 every report are in UTC. Results files made before version 1.1 carry no check times, so
 their reports say "not recorded (older results file)".
 Dmux builds each file from its own copy of the finished run's results and verifies it

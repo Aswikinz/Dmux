@@ -32,6 +32,7 @@ use printpdf::{
 
 use crate::layout::{self, Layout, ReportOptions, TableSummary, Tone};
 use crate::verify::HookEvidence;
+use dmux_engine::results::IssueKind;
 
 const FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
@@ -622,6 +623,7 @@ fn compose(c: &mut Canvas, layout: &Layout, results_sha256: &str) {
     title_block(c, layout);
     verdict_banner(c, layout);
     stat_tiles(c, layout);
+    left_out_note(c, layout);
 
     c.heading("Check record", 60.0);
     c.key_values(&layout::record_rows(layout), 120.0, BODY);
@@ -711,31 +713,35 @@ fn verdict_banner(c: &mut Canvas, layout: &Layout) {
 }
 
 fn stat_tiles(c: &mut Canvas, layout: &Layout) {
-    let attention = layout
-        .tables
-        .iter()
-        .filter(|t| t.verdict_word != "PASS")
-        .count();
+    // Counted before anything was left out, so the tiles never under-report.
+    let data = layout.data_issue_tables;
+    let other = layout.other_issue_tables;
     let tiles = [
-        ("In scope", layout.in_scope.to_string()),
-        ("Fully checked", layout.fully_checked.to_string()),
-        ("Counts only", layout.counts_only.to_string()),
-        ("Structure only", layout.structure_only.to_string()),
-        ("Ignored", layout.ignored.to_string()),
-        ("Tables not passing", attention.to_string()),
+        ("In scope", layout.in_scope.to_string(), None),
+        ("Fully checked", layout.fully_checked.to_string(), None),
+        ("Counts only", layout.counts_only.to_string(), None),
+        ("Ignored", layout.ignored.to_string(), None),
+        (
+            "Data differences",
+            data.to_string(),
+            (data > 0).then_some(Tone::Bad),
+        ),
+        (
+            "Other failures",
+            other.to_string(),
+            (other > 0).then_some(Tone::Caution),
+        ),
     ];
     let gap = 6.0;
     let w = (CONTENT_W - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
     let h = 46.0;
     c.ensure(h + 6.0);
     let top = c.y;
-    for (i, (label, value)) in tiles.iter().enumerate() {
+    for (i, (label, value, tone)) in tiles.iter().enumerate() {
         let x = MARGIN_X + i as f32 * (w + gap);
-        let flagged = i == tiles.len() - 1 && attention > 0;
-        let (fg, bg) = if flagged {
-            tone_colours(Tone::Bad)
-        } else {
-            (INK, ZEBRA)
+        let (fg, bg) = match tone {
+            Some(t) => tone_colours(*t),
+            None => (INK, ZEBRA),
         };
         c.rounded(x, top, w, h, 6.0, bg);
         c.text(x + 9.0, top + 22.0, value, true, 16.0, fg);
@@ -744,36 +750,90 @@ fn stat_tiles(c: &mut Canvas, layout: &Layout) {
     c.y = top + h + 6.0;
 }
 
-fn needs_attention(c: &mut Canvas, layout: &Layout) {
-    let failing: Vec<&TableSummary> = layout
-        .tables
-        .iter()
-        .filter(|t| t.verdict_word != "PASS")
-        .collect();
-    c.heading("Failures and findings", 40.0);
-    if failing.is_empty() {
-        c.muted("None. Every table that was checked passed at its level.");
+/// What the user left out of this report, on page 1, so a trimmed report can
+/// never read as cleaner than the run.
+fn left_out_note(c: &mut Canvas, layout: &Layout) {
+    if layout.omitted.is_empty() {
         return;
     }
-    for t in failing {
-        let reasons: Vec<String> = if t.reasons.is_empty() {
-            vec!["no reason recorded".to_string()]
-        } else {
-            t.reasons.clone()
-        };
-        let name_lines = c.wrap(&t.table, CONTENT_W - 150.0, true, 10.0);
-        c.ensure(24.0 + reasons.len() as f32 * BODY * 1.45);
-        let top = c.y;
-        let pw = c.pill(MARGIN_X, top, &t.verdict_word);
-        let mut y = top;
-        for line in &name_lines {
-            c.text(MARGIN_X + pw + 8.0, y + 10.0, line, true, 10.0, INK);
-            y += 13.0;
+    let text = format!(
+        "Left out of this report when it was made: {}. The verdict, coverage and counts above include them; the run log and the results file list everything.",
+        layout.omitted.join(", ")
+    );
+    let lines = c.wrap(&text, CONTENT_W - 24.0, false, BODY);
+    let h = lines.len() as f32 * BODY * 1.45 + 14.0;
+    c.ensure(h + 8.0);
+    let top = c.y + 2.0;
+    let (strong, tint) = tone_colours(Tone::Caution);
+    c.rounded(MARGIN_X, top, CONTENT_W, h, 6.0, tint);
+    let mut y = top + 7.0 + BODY;
+    for line in &lines {
+        c.text(MARGIN_X + 12.0, y, line, false, BODY, strong);
+        y += BODY * 1.45;
+    }
+    c.y = top + h + 8.0;
+}
+
+/// One failure as a card: verdict pill, table name, level and reasons.
+fn failure_card(c: &mut Canvas, t: &TableSummary) {
+    let reasons: Vec<String> = if t.reasons.is_empty() {
+        vec!["no reason recorded".to_string()]
+    } else {
+        t.reasons.clone()
+    };
+    let name_lines = c.wrap(&t.table, CONTENT_W - 150.0, true, 10.0);
+    c.ensure(24.0 + reasons.len() as f32 * BODY * 1.45);
+    let top = c.y;
+    let pw = c.pill(MARGIN_X, top, &t.verdict_word);
+    let mut y = top;
+    for line in &name_lines {
+        c.text(MARGIN_X + pw + 8.0, y + 10.0, line, true, 10.0, INK);
+        y += 13.0;
+    }
+    c.text_right(PAGE_W - MARGIN_X, top + 10.0, &t.level, false, SMALL, MUTED);
+    c.y = y + 4.0;
+    c.bullets(&reasons);
+    c.y += 6.0;
+}
+
+/// Data differences first (always in the report), then every other failure,
+/// grouped by kind.
+fn needs_attention(c: &mut Canvas, layout: &Layout) {
+    let of = |k: IssueKind| -> Vec<&TableSummary> {
+        layout.tables.iter().filter(|t| t.kind == Some(k)).collect()
+    };
+    c.heading("Data differences", 40.0);
+    let data = of(IssueKind::Data);
+    if data.is_empty() {
+        c.muted("None. No rows or values differ in the tables that were compared.");
+    } else {
+        c.muted("Tables where rows or values differ between the two databases.");
+        for t in data {
+            failure_card(c, t);
         }
-        c.text_right(PAGE_W - MARGIN_X, top + 10.0, &t.level, false, SMALL, MUTED);
-        c.y = y + 4.0;
-        c.bullets(&reasons);
-        c.y += 6.0;
+    }
+
+    let structure = of(IssueKind::Structure);
+    let other = of(IssueKind::Other);
+    c.heading("Other failures", 40.0);
+    if structure.is_empty() && other.is_empty() {
+        c.muted(if layout.omitted.is_empty() {
+            "None."
+        } else {
+            "None in this report (see what was left out on page 1)."
+        });
+        return;
+    }
+    for (kind, list) in [(IssueKind::Structure, structure), (IssueKind::Other, other)] {
+        if list.is_empty() {
+            continue;
+        }
+        c.ensure(40.0);
+        c.para_at(MARGIN_X, CONTENT_W, kind.label(), true, BODY + 0.5, MUTED);
+        c.y += 2.0;
+        for t in list {
+            failure_card(c, t);
+        }
     }
 }
 

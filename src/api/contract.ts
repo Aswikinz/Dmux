@@ -288,6 +288,17 @@ export type Verdict =
   | 'TOOL_FAULT'
   | 'WARNING';
 
+/** What kind of problem a failure is: the comparison found the data differs,
+ *  the structure differs, or something else (a fault, data changing during the
+ *  check, an item to review).  Groups what is shown; changes no verdict. */
+export type IssueKind = 'data' | 'structure' | 'other';
+
+export const ISSUE_KIND_LABELS: Record<IssueKind, string> = {
+  data: 'Data differences',
+  structure: 'Structure differences',
+  other: 'Other reasons',
+};
+
 export interface FailureCard {
   id: string;
   tableId: string;
@@ -298,6 +309,8 @@ export interface FailureCard {
   verdict: Verdict;
   summary: string;
   detail: string;
+  /** Absent in results from an engine that did not say. */
+  kind?: IssueKind;
 }
 
 export interface DrillDownRow {
@@ -359,6 +372,8 @@ export interface TableResult {
   schemaName: string;
   tableName: string;
   verdict: Verdict;
+  /** The kind of problem; absent for a PASS. */
+  kind?: IssueKind;
   level: CheckLevel;
   checked: boolean;
   drillDown?: DrillDownRow[];
@@ -509,6 +524,16 @@ export interface ReportRequest {
   format: ReportFormat;
   /** Include row keys in the exported report (off by default). */
   includeKeys: boolean;
+  /** Parts left out of the report.  Data differences are always included;
+   *  page 1 names whatever was left out.  Absent: nothing left out. */
+  leaveOut?: ReportLeaveOut;
+}
+
+export interface ReportLeaveOut {
+  structure: boolean;
+  other: boolean;
+  warnings: boolean;
+  passing: boolean;
 }
 
 /** The outcome of saving the mapping to a file. */

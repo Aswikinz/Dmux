@@ -217,6 +217,9 @@ pub struct FailureCardDto {
     pub verdict: String,
     pub summary: String,
     pub detail: String,
+    /// Data differences, structure differences or other reasons
+    /// (`dmux_engine::results::table_issue_kind`).
+    pub kind: dmux_engine::results::IssueKind,
 }
 
 /// One table's result, mirroring the contract's `TableResult`.
@@ -229,6 +232,8 @@ pub struct TableResultDto {
     pub verdict: String,
     pub level: CheckLevel,
     pub checked: bool,
+    /// The kind of problem, or `None` for a PASS.
+    pub kind: Option<dmux_engine::results::IssueKind>,
     pub drill_down: Option<Vec<DrillDownRowDto>>,
     pub column_notes: Vec<ColumnNoteDto>,
     /// Facts the Results detail panel explains a verdict from.  Everything
@@ -993,7 +998,8 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
                 | Verdict::ChangedDuringCheck
         );
 
-        if t.verdict != Verdict::Pass {
+        let kind = dmux_engine::results::table_issue_kind(path, t, results);
+        if let Some(kind) = kind {
             failures.push(FailureCardDto {
                 id: format!("fail-{path}"),
                 table_id: path.clone(),
@@ -1003,6 +1009,7 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
                 verdict: verdict.clone(),
                 summary: summary_for(t),
                 detail: detail_for(t),
+                kind,
             });
         }
 
@@ -1013,6 +1020,7 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
             verdict,
             level: t.level,
             checked,
+            kind,
             drill_down: drill_down_for(path, results),
             column_notes: t
                 .column_notes
@@ -1072,6 +1080,7 @@ fn map_results(run_id: &str, results: &RunResults) -> ResultsDto {
             verdict: verdict_string(f.verdict),
             summary: f.message.clone(),
             detail: "an inventory object differs between the two databases".to_string(),
+            kind: dmux_engine::results::IssueKind::Structure,
         });
     }
 
@@ -1305,6 +1314,59 @@ mod tests {
     fn split_path_handles_plain_and_empty() {
         assert_eq!(split_path("s.t"), ("s".to_string(), "t".to_string()));
         assert_eq!(split_path("t"), ("".to_string(), "t".to_string()));
+    }
+
+    /// Every failure card and table row says what kind of problem it is, so
+    /// the Results screen can put data differences first.
+    #[test]
+    fn map_results_tags_each_failure_with_its_kind() {
+        use dmux_engine::results::{IssueKind, StructureFinding, TableResult};
+        let row = |name: &str, verdict: Verdict, changed: usize| TableResult {
+            table: name.into(),
+            level: CheckLevel::FullValues,
+            verdict,
+            old_rows: Some(10),
+            new_rows: Some(10),
+            columns_covered: None,
+            differing_buckets: Some(changed),
+            missing_buckets: Some(0),
+            extra_buckets: Some(0),
+            missing_rows: Some(0),
+            extra_rows: Some(0),
+            changed_rows: Some(changed),
+            reasons: vec![],
+            column_notes: vec![],
+        };
+        let r = RunResults {
+            tables: BTreeMap::from([
+                ("s.data".into(), row("s.data", Verdict::Fail, 3)),
+                ("s.cols".into(), row("s.cols", Verdict::Fail, 0)),
+                ("s.ok".into(), row("s.ok", Verdict::Pass, 0)),
+            ]),
+            structure_findings: vec![StructureFinding {
+                object: "s.cols.legacy_flag".into(),
+                path: vec![],
+                verdict: Verdict::Fail,
+                message: "column missing in new: legacy_flag".into(),
+            }],
+            ..RunResults::default()
+        };
+        let dto = map_results("run-k", &r);
+        let card = |id: &str| dto.failures.iter().find(|f| f.id == id).unwrap().kind;
+        assert_eq!(card("fail-s.data"), IssueKind::Data);
+        assert_eq!(card("fail-s.cols"), IssueKind::Structure);
+        assert_eq!(card("struct-s.cols.legacy_flag"), IssueKind::Structure);
+        let row_kind = |id: &str| {
+            dto.table_results
+                .iter()
+                .find(|t| t.table_id == id)
+                .unwrap()
+                .kind
+        };
+        assert_eq!(row_kind("s.ok"), None);
+        assert_eq!(row_kind("s.data"), Some(IssueKind::Data));
+        let json = serde_json::to_string(&dto.failures[0]).unwrap();
+        assert!(json.contains("\"kind\":\""), "{json}");
     }
 
     /// The facts the Results detail panel explains a table from reach the DTO

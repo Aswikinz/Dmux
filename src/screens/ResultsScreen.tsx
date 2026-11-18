@@ -13,7 +13,8 @@ import { VerdictFilter } from '../components/VerdictFilter';
 import { LEVEL_LABELS, VerdictBanner, qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import type { Engine } from '../api/engine';
-import type { DrillDownRow, FailureCard, Results, TableResult, Verdict } from '../api/contract';
+import { ISSUE_KIND_LABELS } from '../api/contract';
+import type { DrillDownRow, FailureCard, IssueKind, Results, TableResult, Verdict } from '../api/contract';
 
 interface ResultsScreenProps {
   engine: Engine;
@@ -172,6 +173,16 @@ function FailureCardItem({
           <h3 className="font-semibold text-slate-900 dark:text-slate-100">
             {card.schemaName}.{card.tableName}
           </h3>
+          <p
+            className={
+              (card.kind ?? 'other') === 'data'
+                ? 'text-[11px] font-semibold uppercase tracking-[0.06em] text-accent-700 dark:text-accent-300'
+                : 'text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500 dark:text-slate-400'
+            }
+            data-testid="card-kind"
+          >
+            {ISSUE_KIND_LABELS[card.kind ?? 'other']}
+          </p>
           <p className="text-sm font-medium text-slate-700 dark:text-slate-300">{card.summary}</p>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{card.detail}</p>
         </div>
@@ -201,19 +212,54 @@ function FailureCardItem({
   );
 }
 
-/** How many results carry each verdict.  A failure card and the row of the
- *  table it belongs to are one result, so nothing is counted twice. */
-export function resultCounts(results: Results): Partial<Record<Verdict, number>> {
-  const byKey = new Map<string, Verdict>();
-  for (const t of results.tableResults) byKey.set(`t:${t.tableId}`, t.verdict);
-  for (const c of results.failures) {
-    const key = `t:${c.tableId}`;
-    if (byKey.get(key) !== c.verdict) byKey.set(`c:${c.id}`, c.verdict);
+/** One result: a table row, or a failure card with no row of its own.  A
+ *  card and the row of the table it belongs to are one result, so nothing is
+ *  counted twice. */
+interface ResultItem {
+  verdict: Verdict;
+  kind?: IssueKind;
+}
+
+export function resultItems(results: Results): ResultItem[] {
+  const byKey = new Map<string, ResultItem>();
+  for (const t of results.tableResults) {
+    byKey.set(`t:${t.tableId}`, { verdict: t.verdict, kind: t.kind });
   }
+  for (const c of results.failures) {
+    const row = byKey.get(`t:${c.tableId}`);
+    if (row && row.verdict === c.verdict) {
+      row.kind ??= c.kind;
+    } else {
+      byKey.set(`c:${c.id}`, { verdict: c.verdict, kind: c.kind ?? 'other' });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/** How many results carry each verdict. */
+export function resultCounts(results: Results): Partial<Record<Verdict, number>> {
   const counts: Partial<Record<Verdict, number>> = {};
-  for (const v of byKey.values()) counts[v] = (counts[v] ?? 0) + 1;
+  for (const { verdict } of resultItems(results)) counts[verdict] = (counts[verdict] ?? 0) + 1;
   return counts;
 }
+
+/** How many failures are of each kind (a PASS has no kind). */
+export function kindCounts(results: Results): Partial<Record<IssueKind, number>> {
+  const counts: Partial<Record<IssueKind, number>> = {};
+  for (const { kind } of resultItems(results)) {
+    if (kind) counts[kind] = (counts[kind] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Whether a result is hidden by the verdict or kind filter. */
+const isHidden = (
+  item: { verdict: Verdict; kind?: IssueKind },
+  verdicts: Set<Verdict>,
+  kinds: Set<IssueKind>,
+) => verdicts.has(item.verdict) || (item.kind !== undefined && kinds.has(item.kind));
+
+const KIND_RANK: Record<IssueKind, number> = { data: 0, structure: 1, other: 2 };
 
 export function ResultsScreen({
   engine,
@@ -232,6 +278,7 @@ export function ResultsScreen({
   const detailHeading = useRef<HTMLHeadingElement>(null);
   // Verdicts the user chose to hide from the lists below (never the banner).
   const [hiddenVerdicts, setHiddenVerdicts] = useState<Set<Verdict>>(new Set());
+  const [hiddenKinds, setHiddenKinds] = useState<Set<IssueKind>>(new Set());
 
   useEffect(() => {
     let mounted = true;
@@ -350,9 +397,21 @@ export function ResultsScreen({
 
       {(() => {
         const counts = resultCounts(results);
-        return Object.keys(counts).length > 1 ? (
+        const kinds = kindCounts(results);
+        const hiddenTotal = resultItems(results).filter((i) =>
+          isHidden(i, hiddenVerdicts, hiddenKinds),
+        ).length;
+        return Object.keys(counts).length > 1 || Object.keys(kinds).length > 1 ? (
           <Panel>
-            <VerdictFilter counts={counts} hidden={hiddenVerdicts} onChange={setHiddenVerdicts} />
+            <VerdictFilter
+              counts={counts}
+              hidden={hiddenVerdicts}
+              onChange={setHiddenVerdicts}
+              kindCounts={kinds}
+              hiddenKinds={hiddenKinds}
+              onKindsChange={setHiddenKinds}
+              hiddenTotal={hiddenTotal}
+            />
           </Panel>
         ) : null;
       })()}
@@ -360,7 +419,9 @@ export function ResultsScreen({
       {results.failures.length > 0 && (
         <Panel>
           <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">Failures</h3>
-          {results.failures.every((card) => hiddenVerdicts.has(card.verdict)) && (
+          {results.failures.every((card) =>
+            isHidden({ ...card, kind: card.kind ?? 'other' }, hiddenVerdicts, hiddenKinds),
+          ) && (
             <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="failures-all-hidden">
               All {results.failures.length === 1 ? 'of them is' : `${results.failures.length} of them are`}{' '}
               hidden by the filter above.
@@ -368,8 +429,17 @@ export function ResultsScreen({
           )}
           <div className="space-y-4">
             {results.failures
-              .filter((card) => !hiddenVerdicts.has(card.verdict))
-              .map((card) => {
+              .filter(
+                (card) => !isHidden({ ...card, kind: card.kind ?? 'other' }, hiddenVerdicts, hiddenKinds),
+              )
+              // Data differences first: they are what a sign-off is about.
+              .map((card, index) => ({ card, index }))
+              .sort(
+                (a, b) =>
+                  KIND_RANK[a.card.kind ?? 'other'] - KIND_RANK[b.card.kind ?? 'other'] ||
+                  a.index - b.index,
+              )
+              .map(({ card }) => {
               const expanded = expandedFailures.has(card.id);
               const related = owningTable(card, results.tableResults);
               const hasRows = card.tableId === related?.tableId && (related.drillDown?.length ?? 0) > 0;
@@ -433,7 +503,7 @@ export function ResultsScreen({
       <Panel>
         <h3 className="mb-4 text-[17px] font-semibold tracking-[-0.01em] text-ink dark:text-white">All tables</h3>
         <DataTable
-          data={results.tableResults.filter((t) => !hiddenVerdicts.has(t.verdict))}
+          data={results.tableResults.filter((t) => !isHidden(t, hiddenVerdicts, hiddenKinds))}
           columns={tableColumns}
           filterPlaceholder="Filter by table name"
         />
