@@ -3,7 +3,9 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.4.0 (2026-11-18)
+
+Column-level checks, saved check choices, checks of chosen tables, and faster runs.
 
 ### Checks of chosen tables
 
