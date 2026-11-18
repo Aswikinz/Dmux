@@ -133,7 +133,7 @@ new = { host = "new-db.internal", port = 5432, db = "bank", user = "dmux_reader"
 
 ```bash
 dmux run run.toml --out results.json      # exit code 0 = PASS, 1 = FAIL, 2 = warnings
-dmux report --results results.json --pdf report.pdf --xlsx report.xlsx
+dmux report --results results.json --pdf report.pdf --xlsx report.xlsx --html report.html
 ```
 
 `dmux capture` and `dmux compare` save a database's fingerprint to a file and compare it

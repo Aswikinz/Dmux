@@ -79,7 +79,8 @@ warning for a file whose origin you have not checked.
 server when the laptop cannot reach the database. It runs `dmux capture`, `dmux compare`
 and `dmux run <definition file>`, and writes a results file. Turn that file into the PDF
 and Excel reports with `dmux report --results results.json --pdf report.pdf --xlsx
-report.xlsx`; it checks the file's SHA-256 first and refuses a file that was edited.
+report.xlsx` (add `--html report.html` for the interactive web page); it checks the file's
+SHA-256 first and refuses a file that was edited.
 You can also open that results file in the desktop app (see "History" below), which checks it the same way and shows the verdict and findings. Exit codes are 0 for pass, 1 for fail and 2 for warnings, so a
 script can act on the result.
 
@@ -470,15 +471,27 @@ value printed on the signed PDF report.
 1. Read the verdict and coverage line at the top of the screen.
 2. Tick **Include row keys in the exported report** only if the recipient needs key values.
    It is off by default, and row values are never exported.
-3. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or both.
+3. Press **Export PDF** for the summary, **Export Excel** for the detail behind it, or
+   **Export HTML** for a web page you can search and filter. Export as many as you need.
 4. A save dialog from your operating system opens. Choose where to save and confirm.
 5. The screen then shows the path the file was saved to. If you close the dialog, it says
    the export was cancelled and nothing was saved. If something fails, it says so in plain
    words.
-6. Check the first page: the verdict, the coverage line, the ignored items with reasons,
-   the run identifier, the tool version, the mapping code and the results checksum.
+6. Check the first page: the verdict and what it means, the coverage line, and the
+   **check record**: when the check started and finished, how long it took, when the
+   report was generated, which two databases were compared (name, server and login, never
+   a password), the run identifier and the Dmux version. Failures, ignored items with
+   reasons and structure findings follow; the integrity hashes (results checksum, mapping
+   code) are near the end, before the sign-off block.
 
-**What you see.** A PDF sized for a signature, and an Excel file with the detail behind it.
+**What you see.** A PDF sized for a signature, with the Dmux logo and "Page N of M" on every
+page; an Excel file with the detail behind it; and an HTML report. The HTML report is one
+file that opens in any browser and needs no network: it is not allowed to load anything
+from outside the file. It holds the same content as the PDF, and lets you search the tables,
+filter them by verdict and level, show only the tables that did not pass, sort any column,
+and open each table's detail. Printing it from the browser gives a clean copy. Times in
+every report are in UTC. Results files made before version 1.1 carry no check times, so
+their reports say "not recorded (older results file)".
 Dmux builds each file from its own copy of the finished run's results and verifies it
 before saving, and it will not export a run that is not finished or that failed. The file is
 saved readable by you only (on Linux, mode 0600); copy it to a shared place yourself when

@@ -47,12 +47,49 @@ fn is_stripped(c: char) -> bool {
 }
 
 /// Render options the caller ticks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReportOptions {
     /// Include key / covered-column names in the differences detail.  Default
     /// false: keys stay out of reports unless the user explicitly asks
     /// (PLAN.md 2.3, security rule 6).
     pub include_keys: bool,
+    /// When this report was generated, in UTC RFC 3339 (see [`now_utc`]).
+    /// Callers that write a real report pass the current time; `None` leaves
+    /// the line out, which keeps the golden tests byte-deterministic.
+    pub generated_at: Option<String>,
+}
+
+/// The current instant in UTC RFC 3339 with whole seconds, for
+/// [`ReportOptions::generated_at`].
+pub fn now_utc() -> String {
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+/// An RFC 3339 instant in plain words: "18 Nov 2026, 11:06:40 UTC".  Text that
+/// does not parse is shown as written (sanitised), never dropped.
+pub fn display_time(rfc3339: &str) -> String {
+    match rfc3339.parse::<jiff::Timestamp>() {
+        Ok(t) => t.strftime("%-d %b %Y, %H:%M:%S UTC").to_string(),
+        Err(_) => sanitize(rfc3339),
+    }
+}
+
+/// How long the check took, in plain words ("2 min 5 s", "1 h 3 min").  `None`
+/// when either end is missing or unreadable, or the end precedes the start.
+pub fn display_duration(started: &str, finished: &str) -> Option<String> {
+    let s = started.parse::<jiff::Timestamp>().ok()?;
+    let f = finished.parse::<jiff::Timestamp>().ok()?;
+    let secs = f.as_second() - s.as_second();
+    if secs < 0 {
+        return None;
+    }
+    Some(match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min {} s", secs / 60, secs % 60),
+        _ => format!("{} h {} min", secs / 3600, (secs % 3600) / 60),
+    })
 }
 
 /// Convenience alias kept for callers that spell the option as a bool.
@@ -86,6 +123,51 @@ pub fn verdict_display(word: &str, options_applied: bool, options_recorded: bool
         "PASS (with options)".to_string()
     } else {
         "PASS".to_string()
+    }
+}
+
+/// What an overall verdict word means, in the same plain words as the app's
+/// Results screen.  Unknown words get no sentence.
+pub fn verdict_meaning(word: &str) -> &'static str {
+    match word {
+        "PASS" => "The two databases match at the levels you chose.",
+        "FAIL" => "The two databases do not match. The findings below say what differs.",
+        "WIDELY DIFFERENT" => {
+            "Many rows differ, so Dmux stopped listing them one by one. The findings below show a sample."
+        }
+        "NEEDS REVIEW" => {
+            "Dmux could not fully confirm a match. A person must review the items below before sign-off."
+        }
+        "CHANGED DURING CHECK" => {
+            "Data changed while Dmux was reading it, so this result cannot be relied on. Run the check again on a database that is not being written to."
+        }
+        "TOOL FAULT" => {
+            "Dmux could not complete a check. This says nothing about your data; the reasons are listed below."
+        }
+        "WARNING" => {
+            "No difference was found, but something needs your attention. The warnings are listed below."
+        }
+        _ => "",
+    }
+}
+
+/// The colour family a verdict word is shown in.  Colour is never the only
+/// signal: every format prints the word itself next to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Bad,
+    Caution,
+    Neutral,
+}
+
+/// The tone for a verdict word (PASS green, FAIL red, review amber, fault grey).
+pub fn verdict_tone(word: &str) -> Tone {
+    match word {
+        "PASS" => Tone::Good,
+        "FAIL" | "WIDELY DIFFERENT" => Tone::Bad,
+        "WARNING" | "NEEDS REVIEW" | "CHANGED DURING CHECK" => Tone::Caution,
+        _ => Tone::Neutral,
     }
 }
 
@@ -323,6 +405,15 @@ pub struct Layout {
     pub custom_checks: Vec<CustomCheck>,
     pub hook_scripts: Vec<HookScriptLine>,
     pub hook_warnings: Vec<String>,
+    /// The compliance record, already in plain words: when the check started
+    /// and finished, how long it took, when this report was generated, and
+    /// what each side was.  `None` when the results file predates the record.
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub duration: Option<String>,
+    pub generated_at: Option<String>,
+    pub old_source: Option<String>,
+    pub new_source: Option<String>,
 }
 
 /// Render an optional count as a place-holder-free string.
@@ -427,15 +518,20 @@ pub fn build(
         wal_end_lsn: results.wal_end_lsn.as_deref().map(sanitize),
         tables,
         differences,
-        structure_findings: results
-            .structure_findings
-            .iter()
-            .map(|f| StructureFindingLine {
-                object: sanitize(&f.object),
-                verdict: verdict_word(f.verdict).to_string(),
-                message: sanitize(&f.message),
-            })
-            .collect(),
+        structure_findings: {
+            // Gravest first, then in the engine's (deterministic) order.
+            let mut found: Vec<&dmux_engine::results::StructureFinding> =
+                results.structure_findings.iter().collect();
+            found.sort_by_key(|f| std::cmp::Reverse(dmux_engine::results::severity(f.verdict)));
+            found
+                .into_iter()
+                .map(|f| StructureFindingLine {
+                    object: sanitize(&f.object),
+                    verdict: verdict_word(f.verdict).to_string(),
+                    message: sanitize(&f.message),
+                })
+                .collect()
+        },
         suggestions: results
             .suggestions
             .iter()
@@ -479,7 +575,40 @@ pub fn build(
         capture_sha256_old: results.capture_sha256_old.as_deref().map(sanitize),
         capture_sha256_new: results.capture_sha256_new.as_deref().map(sanitize),
         connections: connection_lines_for(results),
+        started_at: results.started_at.as_deref().map(display_time),
+        finished_at: results.finished_at.as_deref().map(display_time),
+        duration: match (&results.started_at, &results.finished_at) {
+            (Some(s), Some(f)) => display_duration(s, f),
+            _ => None,
+        },
+        generated_at: options.generated_at.as_deref().map(display_time),
+        old_source: results.old_source.as_deref().map(sanitize),
+        new_source: results.new_source.as_deref().map(sanitize),
     }
+}
+
+/// The compliance record as (label, value) rows, in reading order.  Every
+/// format renders these, so a missing value says so rather than vanishing.
+pub fn record_rows(layout: &Layout) -> Vec<(&'static str, String)> {
+    let or_not = |v: &Option<String>| {
+        v.clone()
+            .unwrap_or_else(|| "not recorded (older results file)".to_string())
+    };
+    let mut rows = vec![
+        ("Check started", or_not(&layout.started_at)),
+        ("Check finished", or_not(&layout.finished_at)),
+    ];
+    if let Some(d) = &layout.duration {
+        rows.push(("Duration", d.clone()));
+    }
+    if let Some(g) = &layout.generated_at {
+        rows.push(("Report generated", g.clone()));
+    }
+    rows.push(("Old database", or_not(&layout.old_source)));
+    rows.push(("New database", or_not(&layout.new_source)));
+    rows.push(("Run ID", layout.run_id.clone()));
+    rows.push(("Dmux version", layout.tool_version.clone()));
+    rows
 }
 
 fn summarise(tr: &TableResult, detail: Option<&TableDetail>, include_keys: bool) -> TableSummary {
@@ -612,6 +741,54 @@ mod tests {
 
     const SENTINEL_VALUE: &str = "SECRET-ROW-VALUE-12345";
 
+    #[test]
+    fn times_and_durations_read_plainly() {
+        assert_eq!(
+            display_time("2026-11-18T09:05:07Z"),
+            "18 Nov 2026, 09:05:07 UTC"
+        );
+        // Unreadable text is shown (sanitised), never dropped.
+        assert_eq!(display_time("yesterday\u{202E}"), "yesterday");
+        let d = |a, b| display_duration(a, b);
+        assert_eq!(
+            d("2026-11-18T09:00:00Z", "2026-11-18T09:00:52Z").as_deref(),
+            Some("52 s")
+        );
+        assert_eq!(
+            d("2026-11-18T09:00:00Z", "2026-11-18T09:02:05Z").as_deref(),
+            Some("2 min 5 s")
+        );
+        assert_eq!(
+            d("2026-11-18T09:00:00Z", "2026-11-18T10:03:00Z").as_deref(),
+            Some("1 h 3 min")
+        );
+        assert_eq!(
+            d("2026-11-18T09:00:00Z", "2026-11-18T08:00:00Z"),
+            None,
+            "end before start"
+        );
+        assert_eq!(d("nope", "2026-11-18T08:00:00Z"), None);
+    }
+
+    #[test]
+    fn verdict_words_have_a_meaning_and_a_tone() {
+        for w in [
+            "PASS",
+            "FAIL",
+            "WIDELY DIFFERENT",
+            "NEEDS REVIEW",
+            "CHANGED DURING CHECK",
+            "TOOL FAULT",
+            "WARNING",
+        ] {
+            assert!(!verdict_meaning(w).is_empty(), "{w}");
+        }
+        assert_eq!(verdict_tone("PASS"), Tone::Good);
+        assert_eq!(verdict_tone("WIDELY DIFFERENT"), Tone::Bad);
+        assert_eq!(verdict_tone("CHANGED DURING CHECK"), Tone::Caution);
+        assert_eq!(verdict_tone("TOOL FAULT"), Tone::Neutral);
+    }
+
     fn table(name: &str, verdict: Verdict, level: CheckLevel) -> TableResult {
         TableResult {
             table: name.to_string(),
@@ -689,7 +866,10 @@ mod tests {
         let layout = build(
             &fixture(Verdict::Fail),
             None,
-            &ReportOptions { include_keys: true },
+            &ReportOptions {
+                include_keys: true,
+                ..Default::default()
+            },
         );
         assert!(layout.tables.iter().any(|t| !t.keys.is_empty()));
         assert!(layout.differences.iter().any(|d| !d.keys.is_empty()));
@@ -723,7 +903,14 @@ mod tests {
             .unwrap();
         assert!(t.keyed_rows.is_empty(), "keys must be absent by default");
 
-        let with_keys = build(&r, None, &ReportOptions { include_keys: true });
+        let with_keys = build(
+            &r,
+            None,
+            &ReportOptions {
+                include_keys: true,
+                ..Default::default()
+            },
+        );
         let t = with_keys
             .tables
             .iter()

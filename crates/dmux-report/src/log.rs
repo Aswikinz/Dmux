@@ -110,8 +110,14 @@ pub fn build_log(
         coverage: results.coverage_line.clone(),
         results_sha256: results.results_sha256.clone(),
         user: NOT_RECORDED.to_string(),
-        time: NOT_RECORDED.to_string(),
-        profiles: NOT_RECORDED.to_string(),
+        time: match (&results.started_at, &results.finished_at) {
+            (Some(s), Some(f)) => format!("started {s}, finished {f}"),
+            _ => NOT_RECORDED.to_string(),
+        },
+        profiles: match (&results.old_source, &results.new_source) {
+            (Some(o), Some(n)) => format!("old: {o}; new: {n}"),
+            _ => NOT_RECORDED.to_string(),
+        },
         options: options_text(results),
         queries: NOT_RECORDED.to_string(),
         warnings: results.warnings.clone(),

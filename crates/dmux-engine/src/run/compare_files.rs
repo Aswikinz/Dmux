@@ -73,11 +73,16 @@ pub fn compare_two_files(
     old: &FingerprintFile,
     new: &FingerprintFile,
 ) -> Result<RunOutcome, RunError> {
-    compare_two_files_with(
-        old,
-        new,
-        &RunConfig::new(Input::File(old.clone()), Input::File(new.clone())),
-    )
+    let started = jiff::Timestamp::now();
+    let config = RunConfig::new(Input::File(old.clone()), Input::File(new.clone()));
+    let outcome = compare_two_files_with(old, new, &config)?;
+    Ok(super::stamp_record(
+        outcome,
+        started,
+        jiff::Timestamp::now(),
+        &config.old,
+        &config.new,
+    ))
 }
 
 /// Compare two fingerprint files (no live database on either side).

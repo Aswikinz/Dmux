@@ -486,7 +486,9 @@ export interface AppSettingsUpdate {
   includeKeysDefault?: boolean;
 }
 
-export type ReportFormat = 'pdf' | 'excel';
+/** pdf: the summary to sign; excel: the detail workbook; html: one offline
+ *  page with search, filters and sorting. */
+export type ReportFormat = 'pdf' | 'excel' | 'html';
 
 export interface ReportRequest {
   /** The finished run to report on.  The backend renders from its own copy of

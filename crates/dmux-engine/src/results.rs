@@ -390,6 +390,21 @@ pub struct RunResults {
     /// totals), keyed like `tables`.  Not serialised when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub table_facts: BTreeMap<String, TableFacts>,
+    /// When the check started and finished, in UTC (RFC 3339, whole seconds),
+    /// for the compliance record on every report.  Absent in files written
+    /// before they were recorded; not serialised when absent, so those files'
+    /// SHA-256 still verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// What each side was, in plain words: "bank on db1:5432 (login dmux)" for
+    /// a live database or "saved capture file" for a fingerprint file.  Never
+    /// a password.  Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_source: Option<String>,
 }
 
 impl Default for RunResults {
@@ -426,6 +441,10 @@ impl Default for RunResults {
             capture_sha256_old: None,
             capture_sha256_new: None,
             table_facts: BTreeMap::new(),
+            started_at: None,
+            finished_at: None,
+            old_source: None,
+            new_source: None,
         }
     }
 }

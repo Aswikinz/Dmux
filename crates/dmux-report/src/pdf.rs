@@ -1,46 +1,87 @@
 //! The PDF summary (PLAN.md 4.7, 1, 2.4 and 5).
 //!
-//! Generated entirely in Rust with `printpdf` — no browser printing.  Liberation
+//! Generated entirely in Rust with `printpdf`: no browser printing.  Liberation
 //! Sans (regular and bold) is embedded from the bundled files under `fonts/`;
-//! their permissive licence is `fonts/OFL-1.1.txt`.
+//! their permissive licence is `fonts/OFL-1.1.txt`.  The Dmux logo is embedded
+//! from `assets/logo-128.rgba` (the app icon as raw RGBA pixels, so no image
+//! decoder is needed).
 //!
-//! Page 1 carries the overall verdict (a word, never colour alone), the coverage
-//! line, every failure, every ignored item with its reason, structure findings,
-//! the run identity (run ID, tool version, mapping hash, results SHA-256,
-//! definition hash), the "what a PASS does not prove" paragraph, the md5
-//! threat-model sentence (decision 10), the hash-integrity sentence (audit M1 /
-//! decision 23),
-//! the hook custom checks with script hashes, and a sign-off block.  Per-table
-//! sections follow (verdict, level, counts, differences summary).  Text wraps at
-//! word boundaries and pages automatically.
+//! Page 1 reads top to bottom the way a reviewer signs: the overall verdict in a
+//! banner (a word, never colour alone) with what it means, the coverage line and
+//! counts, the check record (when the check ran, how long it took, when this
+//! report was generated, which databases were compared), then everything that
+//! needs attention.  Later sections hold every table, the per-table detail,
+//! the connections, the integrity hashes, the limits of the method (the "what a
+//! PASS does not prove" paragraph, the md5 threat model, the hash-integrity
+//! sentence), the hook custom checks with script hashes and the sign-off block.
+//! Every page carries the logo, the run ID and "Page N of M".
 //!
-//! The output is byte-deterministic for a given results file: the Info
-//! dictionary's wall-clock dates and the trailer's random document ID are
-//! neutralised, so the golden/hash tests remain stable.
+//! The output is byte-deterministic for a given layout: the Info dictionary's
+//! wall-clock dates and the trailer's random document ID are neutralised and all
+//! resource IDs are fixed, so the golden/hash tests remain stable.  The only
+//! time printed is the one the layout carries.
 
 use std::path::Path;
 
 use dmux_engine::results::RunResults;
 use printpdf::{
-    Color, Mm, Op, ParsedFont, PdfDocument, PdfFontHandle, PdfFontParseWarning, PdfSaveOptions, Pt,
-    Rgb, TextItem,
+    Color, LinePoint, Op, PaintMode, ParsedFont, PdfDocument, PdfFontHandle, PdfFontParseWarning,
+    PdfSaveOptions, Point, Polygon, PolygonRing, Pt, RawImage, RawImageData, RawImageFormat, Rect,
+    Rgb, TextItem, WindingOrder, XObjectId, XObjectTransform,
 };
 
-use crate::layout::{self, Layout, ReportOptions};
+use crate::layout::{self, Layout, ReportOptions, TableSummary, Tone};
 use crate::verify::HookEvidence;
 
 const FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
+/// The app icon, 128 x 128 RGBA, 8 bits per channel.
+const LOGO_RGBA: &[u8] = include_bytes!("../assets/logo-128.rgba");
+const LOGO_PX: usize = 128;
 
-/// A4 in millimetres.
-const PAGE_W_MM: f32 = 210.0;
-const PAGE_H_MM: f32 = 297.0;
-/// Body text size and leading.
-const BODY_PT: f32 = 10.0;
-const LEADING_PT: f32 = 14.0;
-const MARGIN_MM: f32 = 18.0;
-/// Em-based char-width estimate for wrapping (Liberation Sans ≈ 0.5 em average).
-const CHAR_W_FACTOR: f32 = 0.5;
+/// A4 in points, with the text area inside the margins.
+const PAGE_W: f32 = 595.28;
+const PAGE_H: f32 = 841.89;
+const MARGIN_X: f32 = 48.0;
+const CONTENT_W: f32 = PAGE_W - 2.0 * MARGIN_X;
+/// Content starts below the running header and stops above the footer.
+const CONTENT_TOP: f32 = 84.0;
+const CONTENT_BOTTOM: f32 = PAGE_H - 58.0;
+
+const BODY: f32 = 9.5;
+const SMALL: f32 = 8.0;
+
+/// An RGB colour, 0..=1 per channel.
+#[derive(Clone, Copy)]
+struct Rgb3(f32, f32, f32);
+
+const fn hex(v: u32) -> Rgb3 {
+    Rgb3(
+        ((v >> 16) & 0xff) as f32 / 255.0,
+        ((v >> 8) & 0xff) as f32 / 255.0,
+        (v & 0xff) as f32 / 255.0,
+    )
+}
+
+const INK: Rgb3 = hex(0x1d1d1f);
+const MUTED: Rgb3 = hex(0x5f5f64);
+const FAINT: Rgb3 = hex(0x8e8e93);
+const RULE: Rgb3 = hex(0xdcdce2);
+const ZEBRA: Rgb3 = hex(0xf6f6f9);
+const HEAD_FILL: Rgb3 = hex(0xeeedfb);
+const ACCENT: Rgb3 = hex(0x4a3df0);
+const ACCENT_DARK: Rgb3 = hex(0x2a2487);
+
+/// (strong, tint) colours for a tone.  The strong colour is dark enough for
+/// text on the tint and on white (WCAG AA at body size).
+fn tone_colours(t: Tone) -> (Rgb3, Rgb3) {
+    match t {
+        Tone::Good => (hex(0x0b6e4f), hex(0xe7f6ef)),
+        Tone::Bad => (hex(0xb42318), hex(0xfdecea)),
+        Tone::Caution => (hex(0x8a4b00), hex(0xfff3dc)),
+        Tone::Neutral => (hex(0x3f3f46), hex(0xefeff2)),
+    }
+}
 
 /// Errors rendering the PDF.
 #[derive(Debug, thiserror::Error)]
@@ -88,12 +129,31 @@ fn save_bytes(doc: PdfDocument) -> Result<Vec<u8>, PdfError> {
     Ok(bytes)
 }
 
-/// A styled line of text, reduced to (font-kind, text) for the flow renderer.
-enum Run {
-    Heading(String),
-    Body(String),
-    Bold(String),
-    Title(String),
+/// A font registered in the document plus its metrics for measuring text.
+struct Face {
+    id: printpdf::FontId,
+    metrics: ParsedFont,
+}
+
+impl Face {
+    /// The advance width of `text` at `size`, in points.
+    fn width(&self, text: &str, size: f32) -> f32 {
+        let upem = f32::from(self.metrics.units_per_em.max(1));
+        let units: f32 = text
+            .chars()
+            .map(|c| {
+                self.metrics
+                    .lookup_glyph_index(c as u32)
+                    .and_then(|g| self.metrics.get_glyph_width(g))
+                    .map_or(upem * 0.55, f32::from)
+            })
+            .sum();
+        units / upem * size
+    }
+
+    fn handle(&self) -> PdfFontHandle {
+        PdfFontHandle::External(self.id.clone())
+    }
 }
 
 /// Build the printpdf document from a layout.
@@ -103,364 +163,925 @@ pub fn build_document(layout: &Layout, results_sha256: &str) -> Result<PdfDocume
     let bold = ParsedFont::from_bytes(FONT_BOLD, 0, &mut warnings_w).ok_or(PdfError::Font)?;
 
     let mut doc = PdfDocument::new("Dmux migration verification report");
-    // Register the fonts under deterministic IDs (FontId::new() is random, which
-    // would leak into /BaseFont and every content stream and defeat the
-    // byte-determinism the golden/hash tests rely on).  FontId is a public newtype
-    // and `resources.fonts.map` is public, so we insert directly.
-    let regular_id = printpdf::FontId("FREGULAR".to_string());
-    let bold_id = printpdf::FontId("FBOLD".to_string());
+    // Register fonts and the logo under deterministic IDs (the `new()`
+    // constructors are random, which would leak into every content stream and
+    // defeat the byte-determinism the golden/hash tests rely on).
+    let reg = Face {
+        id: printpdf::FontId("FREGULAR".to_string()),
+        metrics: regular.clone(),
+    };
+    let bld = Face {
+        id: printpdf::FontId("FBOLD".to_string()),
+        metrics: bold.clone(),
+    };
     doc.resources
         .fonts
         .map
-        .insert(regular_id.clone(), printpdf::PdfFont::new(regular));
+        .insert(reg.id.clone(), printpdf::PdfFont::new(regular));
     doc.resources
         .fonts
         .map
-        .insert(bold_id.clone(), printpdf::PdfFont::new(bold));
+        .insert(bld.id.clone(), printpdf::PdfFont::new(bold));
+    let logo = XObjectId("XLOGO".to_string());
+    doc.resources.xobjects.map.insert(
+        logo.clone(),
+        printpdf::XObject::Image(RawImage {
+            pixels: RawImageData::U8(LOGO_RGBA.to_vec()),
+            width: LOGO_PX,
+            height: LOGO_PX,
+            data_format: RawImageFormat::RGBA8,
+            tag: Vec::new(),
+        }),
+    );
 
-    let mut runs: Vec<Run> = Vec::new();
-    build_runs(layout, results_sha256, &mut runs);
-
-    let pages = flow(runs, &regular_id, &bold_id);
+    let mut c = Canvas::new(&reg, &bld, logo);
+    compose(&mut c, layout, results_sha256);
+    let pages = c.finish(&layout.run_id, layout.generated_at.as_deref());
     doc.with_pages(pages);
     Ok(doc)
 }
 
-/// Lay the runs out into wrapped, paginated pages.
-fn flow(
-    runs: Vec<Run>,
-    regular: &printpdf::FontId,
-    bold: &printpdf::FontId,
-) -> Vec<printpdf::PdfPage> {
-    let page_w = Mm(PAGE_W_MM);
-    let page_h = Mm(PAGE_H_MM);
-    let text_w_mm = PAGE_W_MM - 2.0 * MARGIN_MM;
-    // y tracks the top of the current text line, measured downward from the TOP
-    // of the page.  printpdf's Point origin is the bottom-left, so the cursor's
-    // y-from-bottom is PAGE_H_MM - y.
-    let usable_h = PAGE_H_MM - 2.0 * MARGIN_MM;
-    let pt_to_mm = |pt: f32| pt * 0.352_778;
+// ---------------------------------------------------------------------------
+// The canvas: a top-down cursor over A4 pages with a running header.
+// Coordinates are points measured from the TOP-left; printpdf's origin is the
+// bottom-left, so every op converts with `PAGE_H - y`.
+// ---------------------------------------------------------------------------
 
-    let mut pages: Vec<printpdf::PdfPage> = Vec::new();
-    let mut ops: Vec<Op> = Vec::new();
-    let mut y = MARGIN_MM; // distance from top
-
-    for run in runs {
-        let (font_kind, content) = match run {
-            Run::Heading(s) => (1u8, s),
-            Run::Body(s) => (0u8, s),
-            Run::Bold(s) => (1u8, s),
-            Run::Title(s) => (2u8, s),
-        };
-        let font_size = match font_kind {
-            2 => 20.0,
-            1 => 13.0,
-            _ => BODY_PT,
-        };
-        let leading_pt = match font_kind {
-            2 => 26.0,
-            1 => 17.0,
-            _ => LEADING_PT,
-        };
-        let leading_mm = pt_to_mm(leading_pt);
-        let lines = wrap(&content, text_w_mm, font_size);
-        let use_bold = font_kind == 1 || font_kind == 2;
-        let font_handle = if use_bold {
-            PdfFontHandle::External(bold.clone())
-        } else {
-            PdfFontHandle::External(regular.clone())
-        };
-
-        for line in lines {
-            // Paginate before a line that would fall below the bottom margin.
-            if y + leading_mm > MARGIN_MM + usable_h && !ops.is_empty() {
-                pages.push(printpdf::PdfPage::new(
-                    page_w,
-                    page_h,
-                    std::mem::take(&mut ops),
-                ));
-                y = MARGIN_MM;
-            }
-            ops.push(Op::StartTextSection);
-            ops.push(Op::SetTextCursor {
-                pos: printpdf::Point::new(Mm(MARGIN_MM), Mm(PAGE_H_MM - y)),
-            });
-            ops.push(Op::SetFont {
-                font: font_handle.clone(),
-                size: Pt(font_size),
-            });
-            ops.push(Op::SetLineHeight { lh: Pt(leading_pt) });
-            ops.push(Op::SetFillColor {
-                col: Color::Rgb(Rgb {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    icc_profile: None,
-                }),
-            });
-            ops.push(Op::ShowText {
-                items: vec![TextItem::Text(line)],
-            });
-            ops.push(Op::EndTextSection);
-            y += leading_mm;
-        }
-
-        // A small extra gap after headings.
-        if font_kind == 1 {
-            y += 2.0;
-        }
-    }
-
-    if !ops.is_empty() {
-        pages.push(printpdf::PdfPage::new(page_w, page_h, ops));
-    }
-
-    pages
+struct Canvas<'a> {
+    reg: &'a Face,
+    bold: &'a Face,
+    logo: XObjectId,
+    pages: Vec<Vec<Op>>,
+    ops: Vec<Op>,
+    y: f32,
 }
 
-/// Word-wrap text to `max_w_mm` at `font_size`, breaking on spaces.
-fn wrap(text: &str, max_w_mm: f32, font_size: f32) -> Vec<String> {
-    let char_w_mm = font_size * CHAR_W_FACTOR * 0.352778; // pt → mm
-    let max_chars = ((max_w_mm / char_w_mm).floor() as usize).max(1);
-    let mut out = Vec::new();
-    for hard in text.split('\n') {
-        if hard.is_empty() {
-            out.push(String::new());
-            continue;
+/// One table column: header, share of the width, right-aligned or not.
+struct Col {
+    head: &'static str,
+    share: f32,
+    right: bool,
+}
+
+const fn col(head: &'static str, share: f32, right: bool) -> Col {
+    Col { head, share, right }
+}
+
+impl<'a> Canvas<'a> {
+    fn new(reg: &'a Face, bold: &'a Face, logo: XObjectId) -> Self {
+        let mut c = Canvas {
+            reg,
+            bold,
+            logo,
+            pages: Vec::new(),
+            ops: Vec::new(),
+            y: CONTENT_TOP,
+        };
+        c.header();
+        c
+    }
+
+    fn face(&self, bold: bool) -> &'a Face {
+        if bold {
+            self.bold
+        } else {
+            self.reg
         }
-        let mut line = String::new();
-        for word in hard.split_whitespace() {
-            if line.is_empty() {
-                line = word.to_string();
-            } else if line.chars().count() + 1 + word.chars().count() <= max_chars {
-                line.push(' ');
-                line.push_str(word);
-            } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
-            }
-            // A single over-long word still overflows; hard-break it.
-            while line.chars().count() > max_chars {
-                let mut split_at = max_chars;
-                while split_at > 0 && !line.is_char_boundary(split_at) {
-                    split_at -= 1;
+    }
+
+    // --- primitives --------------------------------------------------------
+
+    fn fill(&mut self, c: Rgb3) {
+        self.ops.push(Op::SetFillColor { col: colour(c) });
+    }
+
+    /// Draw `s` with its baseline at `baseline` (from the top).
+    fn text(&mut self, x: f32, baseline: f32, s: &str, bold: bool, size: f32, c: Rgb3) {
+        if s.is_empty() {
+            return;
+        }
+        let font = self.face(bold).handle();
+        self.ops.push(Op::StartTextSection);
+        self.ops.push(Op::SetFont {
+            font,
+            size: Pt(size),
+        });
+        self.fill(c);
+        self.ops.push(Op::SetTextCursor {
+            pos: Point {
+                x: Pt(x),
+                y: Pt(PAGE_H - baseline),
+            },
+        });
+        self.ops.push(Op::ShowText {
+            items: vec![TextItem::Text(s.to_string())],
+        });
+        self.ops.push(Op::EndTextSection);
+    }
+
+    fn text_right(&mut self, right: f32, baseline: f32, s: &str, bold: bool, size: f32, c: Rgb3) {
+        let w = self.face(bold).width(s, size);
+        self.text(right - w, baseline, s, bold, size, c);
+    }
+
+    fn rect(&mut self, x: f32, top: f32, w: f32, h: f32, c: Rgb3) {
+        self.fill(c);
+        self.ops.push(Op::DrawRectangle {
+            rectangle: Rect {
+                x: Pt(x),
+                y: Pt(PAGE_H - top - h),
+                width: Pt(w),
+                height: Pt(h),
+                mode: Some(PaintMode::Fill),
+                winding_order: None,
+            },
+        });
+    }
+
+    /// A filled rectangle with rounded corners of radius `r`.
+    fn rounded(&mut self, x: f32, top: f32, w: f32, h: f32, r: f32, c: Rgb3) {
+        let r = r.min(w / 2.0).min(h / 2.0);
+        let k = r * 0.552_284_8; // cubic approximation of a quarter circle
+        let (l, rt) = (x, x + w);
+        let (t, b) = (PAGE_H - top, PAGE_H - top - h);
+        let p = |x: f32, y: f32, bezier: bool| LinePoint {
+            p: Point { x: Pt(x), y: Pt(y) },
+            bezier,
+        };
+        let points = vec![
+            p(l + r, t, false),
+            p(rt - r, t, false),
+            p(rt - r + k, t, true),
+            p(rt, t - r + k, true),
+            p(rt, t - r, false),
+            p(rt, b + r, false),
+            p(rt, b + r - k, true),
+            p(rt - r + k, b, true),
+            p(rt - r, b, false),
+            p(l + r, b, false),
+            p(l + r - k, b, true),
+            p(l, b + r - k, true),
+            p(l, b + r, false),
+            p(l, t - r, false),
+            p(l, t - r + k, true),
+            p(l + r - k, t, true),
+            p(l + r, t, false),
+        ];
+        self.fill(c);
+        self.ops.push(Op::DrawPolygon {
+            polygon: Polygon {
+                rings: vec![PolygonRing { points }],
+                mode: PaintMode::Fill,
+                winding_order: WindingOrder::NonZero,
+            },
+        });
+    }
+
+    fn hline(&mut self, x1: f32, x2: f32, y: f32, c: Rgb3, width: f32) {
+        self.rect(x1, y - width / 2.0, x2 - x1, width, c);
+    }
+
+    fn logo_at(&mut self, x: f32, top: f32, size: f32) {
+        // UseXobject scales an image to its pixel size at `dpi`; pick the dpi
+        // that makes LOGO_PX pixels exactly `size` points wide.
+        self.ops.push(Op::UseXobject {
+            id: self.logo.clone(),
+            transform: XObjectTransform {
+                translate_x: Some(Pt(x)),
+                translate_y: Some(Pt(PAGE_H - top - size)),
+                dpi: Some(LOGO_PX as f32 * 72.0 / size),
+                ..Default::default()
+            },
+        });
+    }
+
+    /// Word-wrap `s` to `max_w` points at `size`, breaking on spaces and, for
+    /// a word longer than a line (a hash, a long table name), inside the word.
+    fn wrap(&self, s: &str, max_w: f32, bold: bool, size: f32) -> Vec<String> {
+        let face = self.face(bold);
+        let mut out = Vec::new();
+        for hard in s.split('\n') {
+            let mut line = String::new();
+            for word in hard.split_whitespace() {
+                let candidate = if line.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{line} {word}")
+                };
+                if face.width(&candidate, size) <= max_w {
+                    line = candidate;
+                    continue;
                 }
-                let (head, tail) = line.split_at(split_at);
-                out.push(head.to_string());
-                line = tail.to_string();
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                // Hard-break a word wider than the line.
+                let mut piece = String::new();
+                for ch in word.chars() {
+                    piece.push(ch);
+                    if face.width(&piece, size) > max_w && piece.chars().count() > 1 {
+                        piece.pop();
+                        out.push(std::mem::take(&mut piece));
+                        piece.push(ch);
+                    }
+                }
+                line = piece;
             }
-        }
-        if !line.is_empty() {
             out.push(line);
         }
+        out
     }
-    out
+
+    // --- pages ---------------------------------------------------------------
+
+    /// The running header: logo, product name and report title, and a rule.
+    fn header(&mut self) {
+        self.logo_at(MARGIN_X, 26.0, 26.0);
+        self.text(MARGIN_X + 34.0, 37.0, "Dmux", true, 12.0, INK);
+        self.text(
+            MARGIN_X + 34.0,
+            50.0,
+            "Migration verification report",
+            false,
+            SMALL,
+            MUTED,
+        );
+        self.hline(MARGIN_X, PAGE_W - MARGIN_X, 62.0, RULE, 0.6);
+        self.y = CONTENT_TOP;
+    }
+
+    fn new_page(&mut self) {
+        self.pages.push(std::mem::take(&mut self.ops));
+        self.header();
+    }
+
+    /// Start a new page unless `h` points still fit on this one.
+    fn ensure(&mut self, h: f32) {
+        if self.y + h > CONTENT_BOTTOM {
+            self.new_page();
+        }
+    }
+
+    /// Close the last page and stamp every footer ("Page N of M").
+    fn finish(mut self, run_id: &str, generated: Option<&str>) -> Vec<printpdf::PdfPage> {
+        self.pages.push(std::mem::take(&mut self.ops));
+        let total = self.pages.len();
+        let pages = std::mem::take(&mut self.pages);
+        let mut out = Vec::with_capacity(total);
+        for (i, ops) in pages.into_iter().enumerate() {
+            self.ops = ops;
+            let y = PAGE_H - 36.0;
+            self.hline(MARGIN_X, PAGE_W - MARGIN_X, y - 12.0, RULE, 0.6);
+            let left = match generated {
+                Some(g) => format!("Run {run_id}  ·  Generated {g}"),
+                None => format!("Run {run_id}"),
+            };
+            self.text(MARGIN_X, y, &left, false, 7.5, FAINT);
+            let page = format!("Page {} of {total}", i + 1);
+            self.text_right(PAGE_W - MARGIN_X, y, &page, false, 7.5, FAINT);
+            out.push(printpdf::PdfPage::new(
+                printpdf::Mm(PAGE_W * 0.352_778),
+                printpdf::Mm(PAGE_H * 0.352_778),
+                std::mem::take(&mut self.ops),
+            ));
+        }
+        out
+    }
+
+    // --- blocks --------------------------------------------------------------
+
+    /// A section heading with an accent bar.  Keeps at least `keep` points of
+    /// what follows on the same page, so a heading is never orphaned.
+    fn heading(&mut self, title: &str, keep: f32) {
+        self.ensure(30.0 + keep);
+        self.y += 10.0;
+        self.rect(MARGIN_X, self.y, 3.0, 14.0, ACCENT);
+        self.text(MARGIN_X + 10.0, self.y + 11.0, title, true, 12.5, INK);
+        self.y += 24.0;
+    }
+
+    /// A wrapped paragraph at `x`, `w` wide.
+    fn para_at(&mut self, x: f32, w: f32, s: &str, bold: bool, size: f32, c: Rgb3) {
+        let leading = size * 1.45;
+        for line in self.wrap(s, w, bold, size) {
+            self.ensure(leading);
+            self.text(x, self.y + size, &line, bold, size, c);
+            self.y += leading;
+        }
+    }
+
+    fn para(&mut self, s: &str) {
+        self.para_at(MARGIN_X, CONTENT_W, s, false, BODY, INK);
+        self.y += 4.0;
+    }
+
+    fn muted(&mut self, s: &str) {
+        self.para_at(MARGIN_X, CONTENT_W, s, false, BODY, MUTED);
+        self.y += 4.0;
+    }
+
+    fn bullets(&mut self, items: &[String]) {
+        for item in items {
+            let lines = self.wrap(item, CONTENT_W - 14.0, false, BODY);
+            self.ensure(BODY * 1.45);
+            self.rounded(MARGIN_X + 3.0, self.y + 4.0, 3.5, 3.5, 1.75, ACCENT);
+            for line in lines {
+                self.ensure(BODY * 1.45);
+                self.text(MARGIN_X + 14.0, self.y + BODY, &line, false, BODY, INK);
+                self.y += BODY * 1.45;
+            }
+            self.y += 2.0;
+        }
+        self.y += 2.0;
+    }
+
+    /// A two-column label / value list (the check record, integrity hashes).
+    fn key_values(&mut self, rows: &[(&str, String)], label_w: f32, value_size: f32) {
+        let value_w = CONTENT_W - label_w - 12.0;
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let lines = self.wrap(value, value_w, false, value_size);
+            let h = lines.len().max(1) as f32 * value_size * 1.45 + 9.0;
+            self.ensure(h);
+            if i % 2 == 0 {
+                self.rect(MARGIN_X, self.y, CONTENT_W, h, ZEBRA);
+            }
+            self.text(
+                MARGIN_X + 8.0,
+                self.y + 6.0 + BODY,
+                label,
+                true,
+                SMALL + 0.5,
+                MUTED,
+            );
+            let mut ly = self.y + 6.0 + value_size;
+            for line in lines {
+                self.text(MARGIN_X + label_w, ly, &line, false, value_size, INK);
+                ly += value_size * 1.45;
+            }
+            self.y += h;
+        }
+        self.y += 8.0;
+    }
+
+    /// A data table with a shaded header row (repeated on every page it spans),
+    /// wrapped cells and light zebra rows.  `verdict_col` is the column whose
+    /// cells are verdict words, drawn bold in their tone colour.
+    fn table(&mut self, cols: &[Col], rows: &[Vec<String>], verdict_col: Option<usize>) {
+        let total: f32 = cols.iter().map(|c| c.share).sum();
+        let widths: Vec<f32> = cols.iter().map(|c| c.share / total * CONTENT_W).collect();
+        let pad = 5.0;
+        let size = SMALL + 0.5;
+        let leading = size * 1.4;
+        let header_h = 18.0;
+
+        let draw_header = |c: &mut Canvas| {
+            c.rect(MARGIN_X, c.y, CONTENT_W, header_h, HEAD_FILL);
+            let mut x = MARGIN_X;
+            for (col, w) in cols.iter().zip(&widths) {
+                if col.right {
+                    c.text_right(x + w - pad, c.y + 12.0, col.head, true, SMALL, ACCENT_DARK);
+                } else {
+                    c.text(x + pad, c.y + 12.0, col.head, true, SMALL, ACCENT_DARK);
+                }
+                x += w;
+            }
+            c.y += header_h;
+        };
+
+        // Keep the header with at least one row.
+        self.ensure(header_h + leading + 10.0);
+        draw_header(self);
+        for (ri, row) in rows.iter().enumerate() {
+            let cells: Vec<Vec<String>> = row
+                .iter()
+                .zip(&widths)
+                .enumerate()
+                .map(|(ci, (cell, w))| {
+                    let bold = verdict_col == Some(ci);
+                    self.wrap(cell, w - 2.0 * pad, bold, size)
+                })
+                .collect();
+            let lines = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            let h = lines as f32 * leading + 8.0;
+            if self.y + h > CONTENT_BOTTOM {
+                self.new_page();
+                draw_header(self);
+            }
+            if ri % 2 == 1 {
+                self.rect(MARGIN_X, self.y, CONTENT_W, h, ZEBRA);
+            }
+            let mut x = MARGIN_X;
+            for (ci, ((cell_lines, col), w)) in cells.iter().zip(cols).zip(&widths).enumerate() {
+                let is_verdict = verdict_col == Some(ci);
+                let colour = if is_verdict {
+                    tone_colours(layout::verdict_tone(&row[ci])).0
+                } else {
+                    INK
+                };
+                let mut ly = self.y + 4.0 + size;
+                for line in cell_lines {
+                    if col.right {
+                        self.text_right(x + w - pad, ly, line, is_verdict, size, colour);
+                    } else {
+                        self.text(x + pad, ly, line, is_verdict, size, colour);
+                    }
+                    ly += leading;
+                }
+                x += w;
+            }
+            self.y += h;
+            self.hline(MARGIN_X, PAGE_W - MARGIN_X, self.y, RULE, 0.4);
+        }
+        self.y += 10.0;
+    }
+
+    /// A small rounded label in a tone, e.g. a table's verdict.  Returns its width.
+    fn pill(&mut self, x: f32, top: f32, word: &str) -> f32 {
+        let (strong, tint) = tone_colours(layout::verdict_tone(word));
+        let w = self.bold.width(word, 7.5) + 12.0;
+        self.rounded(x, top, w, 13.0, 6.5, tint);
+        self.text(x + 6.0, top + 9.3, word, true, 7.5, strong);
+        w
+    }
 }
 
-/// Build the ordered list of runs (the report content).
-fn build_runs(layout: &Layout, results_sha256: &str, runs: &mut Vec<Run>) {
-    runs.push(Run::Title("Dmux migration verification report".to_string()));
+fn colour(c: Rgb3) -> Color {
+    Color::Rgb(Rgb {
+        r: c.0,
+        g: c.1,
+        b: c.2,
+        icc_profile: None,
+    })
+}
 
-    // Page 1: overall verdict, a word + text, never colour alone.
-    runs.push(Run::Heading("Overall verdict".to_string()));
-    runs.push(Run::Bold(layout::verdict_display(
+// ---------------------------------------------------------------------------
+// The report content, in reading order.
+// ---------------------------------------------------------------------------
+
+fn compose(c: &mut Canvas, layout: &Layout, results_sha256: &str) {
+    title_block(c, layout);
+    verdict_banner(c, layout);
+    stat_tiles(c, layout);
+
+    c.heading("Check record", 60.0);
+    c.key_values(&layout::record_rows(layout), 120.0, BODY);
+
+    needs_attention(c, layout);
+    page_one_lists(c, layout);
+    all_tables(c, layout);
+    table_details(c, layout);
+    connections(c, layout);
+    custom_checks(c, layout);
+    integrity(c, layout, results_sha256);
+    limits(c);
+    sign_off(c);
+}
+
+fn title_block(c: &mut Canvas, layout: &Layout) {
+    c.text(
+        MARGIN_X,
+        c.y + 20.0,
+        "Migration verification report",
+        true,
+        21.0,
+        INK,
+    );
+    c.y += 30.0;
+    let sub = match (&layout.old_source, &layout.new_source) {
+        (Some(o), Some(n)) => format!("{o}  →  {n}"),
+        _ => format!("Run {}", layout.run_id),
+    };
+    c.para_at(MARGIN_X, CONTENT_W, &sub, false, BODY, MUTED);
+    c.y += 8.0;
+}
+
+fn verdict_banner(c: &mut Canvas, layout: &Layout) {
+    let shown = layout::verdict_display(
         &layout.verdict_word,
         layout.options_applied,
         layout.options_recorded,
-    )));
-
-    runs.push(Run::Heading("Coverage".to_string()));
-    runs.push(Run::Body(layout.coverage_line.clone()));
-
-    if !layout.options_recorded {
-        runs.push(Run::Heading("Options applied".to_string()));
-        runs.push(Run::Body(layout::OPTIONS_NOT_RECORDED.to_string()));
-    } else if !layout.options_applied_lines.is_empty() {
-        runs.push(Run::Heading("Options applied".to_string()));
-        for line in &layout.options_applied_lines {
-            runs.push(Run::Body(line.clone()));
-        }
+    );
+    let (strong, tint) = tone_colours(layout::verdict_tone(&layout.verdict_word));
+    let inner_w = CONTENT_W - 40.0;
+    let word_size = if shown.chars().count() > 22 {
+        17.0
+    } else {
+        26.0
+    };
+    let word_lines = c.wrap(&shown, inner_w, true, word_size);
+    let meaning = c.wrap(
+        layout::verdict_meaning(&layout.verdict_word),
+        inner_w,
+        false,
+        BODY + 0.5,
+    );
+    let coverage = c.wrap(&layout.coverage_line, inner_w, true, BODY);
+    let h = 26.0
+        + word_lines.len() as f32 * word_size * 1.15
+        + 6.0
+        + meaning.len() as f32 * (BODY + 0.5) * 1.45
+        + 16.0
+        + coverage.len() as f32 * BODY * 1.45
+        + 14.0;
+    c.ensure(h);
+    let top = c.y;
+    c.rounded(MARGIN_X, top, CONTENT_W, h, 8.0, tint);
+    c.rounded(MARGIN_X, top, 6.0, h, 3.0, strong);
+    c.rect(MARGIN_X + 3.0, top, 3.0, h, strong);
+    let x = MARGIN_X + 24.0;
+    let mut y = top + 20.0;
+    c.text(x, y, "OVERALL VERDICT", true, 7.5, strong);
+    y += 6.0;
+    for line in &word_lines {
+        y += word_size * 1.15;
+        c.text(x, y - word_size * 0.2, line, true, word_size, strong);
     }
+    y += 6.0;
+    for line in &meaning {
+        y += (BODY + 0.5) * 1.45;
+        c.text(x, y - 3.0, line, false, BODY + 0.5, INK);
+    }
+    y += 16.0;
+    c.text(x, y + 2.0, "Coverage", false, SMALL, MUTED);
+    for line in &coverage {
+        y += BODY * 1.45;
+        c.text(x, y + 2.0, line, true, BODY, INK);
+    }
+    c.y = top + h + 12.0;
+}
 
-    runs.push(Run::Heading("Failures and findings".to_string()));
-    let failures: Vec<&layout::TableSummary> = layout
+fn stat_tiles(c: &mut Canvas, layout: &Layout) {
+    let attention = layout
+        .tables
+        .iter()
+        .filter(|t| t.verdict_word != "PASS")
+        .count();
+    let tiles = [
+        ("In scope", layout.in_scope.to_string()),
+        ("Fully checked", layout.fully_checked.to_string()),
+        ("Counts only", layout.counts_only.to_string()),
+        ("Structure only", layout.structure_only.to_string()),
+        ("Ignored", layout.ignored.to_string()),
+        ("Tables not passing", attention.to_string()),
+    ];
+    let gap = 6.0;
+    let w = (CONTENT_W - gap * (tiles.len() as f32 - 1.0)) / tiles.len() as f32;
+    let h = 46.0;
+    c.ensure(h + 6.0);
+    let top = c.y;
+    for (i, (label, value)) in tiles.iter().enumerate() {
+        let x = MARGIN_X + i as f32 * (w + gap);
+        let flagged = i == tiles.len() - 1 && attention > 0;
+        let (fg, bg) = if flagged {
+            tone_colours(Tone::Bad)
+        } else {
+            (INK, ZEBRA)
+        };
+        c.rounded(x, top, w, h, 6.0, bg);
+        c.text(x + 9.0, top + 22.0, value, true, 16.0, fg);
+        c.text(x + 9.0, top + 36.0, label, false, 7.5, MUTED);
+    }
+    c.y = top + h + 6.0;
+}
+
+fn needs_attention(c: &mut Canvas, layout: &Layout) {
+    let failing: Vec<&TableSummary> = layout
         .tables
         .iter()
         .filter(|t| t.verdict_word != "PASS")
         .collect();
-    if failures.is_empty() {
-        runs.push(Run::Body("None.".to_string()));
-    } else {
-        for t in &failures {
-            runs.push(Run::Body(format!(
-                "{} — {} ({}): {}",
-                t.table,
-                t.verdict_word,
-                t.level,
-                if t.reasons.is_empty() {
-                    "no reason recorded".to_string()
-                } else {
-                    t.reasons.join("; ")
-                }
-            )));
+    c.heading("Failures and findings", 40.0);
+    if failing.is_empty() {
+        c.muted("None. Every table that was checked passed at its level.");
+        return;
+    }
+    for t in failing {
+        let reasons: Vec<String> = if t.reasons.is_empty() {
+            vec!["no reason recorded".to_string()]
+        } else {
+            t.reasons.clone()
+        };
+        let name_lines = c.wrap(&t.table, CONTENT_W - 150.0, true, 10.0);
+        c.ensure(24.0 + reasons.len() as f32 * BODY * 1.45);
+        let top = c.y;
+        let pw = c.pill(MARGIN_X, top, &t.verdict_word);
+        let mut y = top;
+        for line in &name_lines {
+            c.text(MARGIN_X + pw + 8.0, y + 10.0, line, true, 10.0, INK);
+            y += 13.0;
         }
+        c.text_right(PAGE_W - MARGIN_X, top + 10.0, &t.level, false, SMALL, MUTED);
+        c.y = y + 4.0;
+        c.bullets(&reasons);
+        c.y += 6.0;
+    }
+}
+
+fn page_one_lists(c: &mut Canvas, layout: &Layout) {
+    if !layout.options_recorded {
+        c.heading("Options applied", 30.0);
+        c.para(layout::OPTIONS_NOT_RECORDED);
+    } else if !layout.options_applied_lines.is_empty() {
+        c.heading("Options applied", 30.0);
+        c.muted(
+            "These column options loosened the comparison. Each is part of what was signed off.",
+        );
+        c.bullets(&layout.options_applied_lines);
     }
 
-    runs.push(Run::Heading("Ignored items".to_string()));
+    c.heading("Ignored items", 30.0);
     if layout.ignored_items.is_empty() {
-        runs.push(Run::Body("None.".to_string()));
+        c.muted("None. Nothing in scope was skipped.");
     } else {
-        for i in &layout.ignored_items {
-            runs.push(Run::Body(format!("{} — {}", i.path, i.reason)));
-        }
+        let rows: Vec<Vec<String>> = layout
+            .ignored_items
+            .iter()
+            .map(|i| vec![i.path.clone(), i.reason.clone()])
+            .collect();
+        c.table(
+            &[col("Item", 2.0, false), col("Reason", 3.0, false)],
+            &rows,
+            None,
+        );
     }
 
-    runs.push(Run::Heading("Structure findings".to_string()));
+    c.heading("Structure findings", 30.0);
     if layout.structure_findings.is_empty() {
-        runs.push(Run::Body("None.".to_string()));
+        c.muted("None. The structure matched after the mapping was applied.");
     } else {
-        for f in &layout.structure_findings {
-            runs.push(Run::Body(format!(
-                "{} — {}: {}",
-                f.object, f.verdict, f.message
-            )));
-        }
+        let rows: Vec<Vec<String>> = layout
+            .structure_findings
+            .iter()
+            .map(|f| vec![f.object.clone(), f.verdict.clone(), f.message.clone()])
+            .collect();
+        c.table(
+            &[
+                col("Object", 2.2, false),
+                col("Verdict", 1.1, false),
+                col("Finding", 3.0, false),
+            ],
+            &rows,
+            Some(1),
+        );
+    }
+
+    let mut warnings = layout.warnings.clone();
+    for t in &layout.changed_during_check {
+        warnings.push(format!("{t} changed during the check"));
+    }
+    if !warnings.is_empty() {
+        c.heading("Warnings", 30.0);
+        c.bullets(&warnings);
     }
 
     if !layout.suggestions.is_empty() {
-        runs.push(Run::Heading("Suggested matches".to_string()));
-        for s in &layout.suggestions {
-            runs.push(Run::Body(format!(
-                "{} -> {} (confidence {})",
-                s.path, s.candidate, s.confidence
-            )));
-        }
-    }
-
-    runs.push(Run::Heading("Run identity".to_string()));
-    runs.push(labeled_run("Run ID", &layout.run_id));
-    runs.push(labeled_run("Tool version", &layout.tool_version));
-    runs.push(labeled_run("Mapping hash", &layout.mapping_hash));
-    runs.push(labeled_run("Results SHA-256", results_sha256));
-    runs.push(labeled_run(
-        "Results schema version",
-        &layout.results_version,
-    ));
-    if !layout.definition_hash.is_empty() {
-        runs.push(labeled_run("Definition hash", &layout.definition_hash));
-    }
-    if let Some(old) = &layout.capture_sha256_old {
-        runs.push(labeled_run("Old capture SHA-256", old));
-    }
-    if let Some(new) = &layout.capture_sha256_new {
-        runs.push(labeled_run("New capture SHA-256", new));
-    }
-    if let Some(wls) = &layout.wal_start_lsn {
-        runs.push(labeled_run("Write-ahead log start", wls));
-    }
-    if let Some(wle) = &layout.wal_end_lsn {
-        runs.push(labeled_run("Write-ahead log end", wle));
-    }
-
-    if !layout.connections.is_empty() {
-        runs.push(Run::Heading("Connections".to_string()));
-        for line in &layout.connections {
-            runs.push(Run::Body(line.clone()));
-        }
-    }
-
-    runs.push(Run::Heading("What a PASS does not prove".to_string()));
-    runs.push(Run::Body(layout::WHAT_PASS_DOES_NOT_PROVE.to_string()));
-    runs.push(Run::Heading("Limit of the row hashes".to_string()));
-    runs.push(Run::Body(layout::MD5_THREAT_MODEL.to_string()));
-    runs.push(Run::Heading("Trust and audit".to_string()));
-    runs.push(Run::Body(layout::TAMPER_EVIDENT_NOT_PROOF.to_string()));
-
-    runs.push(Run::Heading("Per-table results".to_string()));
-    for t in &layout.tables {
-        runs.push(Run::Bold(format!("{} — {}", t.table, t.verdict_word)));
-        runs.push(labeled_run("Level", &t.level));
-        runs.push(labeled_run(
-            "Old rows",
-            t.old_rows.as_deref().unwrap_or("-"),
-        ));
-        runs.push(labeled_run(
-            "New rows",
-            t.new_rows.as_deref().unwrap_or("-"),
-        ));
-        runs.push(labeled_run("Differing buckets", &t.differing_buckets));
-        runs.push(labeled_run("Missing buckets", &t.missing_buckets));
-        runs.push(labeled_run("Extra buckets", &t.extra_buckets));
-        runs.push(labeled_run("Missing rows", &t.missing_rows));
-        runs.push(labeled_run("Extra rows", &t.extra_rows));
-        runs.push(labeled_run("Changed rows", &t.changed_rows));
-        if !t.keys.is_empty() {
-            runs.push(labeled_run("Keys / covered columns", &t.keys.join(", ")));
-        }
-        let reasons = if t.reasons.is_empty() {
-            "none recorded".to_string()
-        } else {
-            t.reasons.join("; ")
-        };
-        runs.push(labeled_run("Reasons", &reasons));
-        if !t.changed_columns.is_empty() {
-            runs.push(labeled_run(
-                "Changed columns",
-                &t.changed_columns.join(", "),
-            ));
-        }
-        for word in &t.plain_words {
-            runs.push(labeled_run("Note", word));
-        }
-        for note in &t.column_notes {
-            runs.push(labeled_run("Column note", note));
-        }
-        for ct in &t.control_totals {
-            runs.push(labeled_run("Control total", ct));
-        }
-        for key in &t.keyed_rows {
-            runs.push(labeled_run("Key", key));
-        }
-    }
-
-    // Hook custom checks, marked as such, with each script's hash.
-    if !layout.custom_checks.is_empty() || !layout.hook_scripts.is_empty() {
-        runs.push(Run::Heading("Custom checks (Python hooks)".to_string()));
-        for c in &layout.custom_checks {
-            let scope = c
-                .table
-                .as_deref()
-                .map(|t| format!(" ({t})"))
-                .unwrap_or_default();
-            runs.push(Run::Body(format!(
-                "[{}] {}{}: {}",
-                c.id, c.severity, scope, c.message
-            )));
-        }
-        for w in &layout.hook_warnings {
-            runs.push(Run::Body(format!("hook warning: {w}")));
-        }
-        for s in &layout.hook_scripts {
-            runs.push(Run::Body(format!(
-                "script {} — SHA-256 {}",
-                s.script, s.sha256
-            )));
-        }
-    }
-
-    runs.push(Run::Heading("Sign-off".to_string()));
-    for line in layout::sign_off_block() {
-        runs.push(Run::Body(line.to_string()));
+        c.heading("Suggested matches", 30.0);
+        let rows: Vec<Vec<String>> = layout
+            .suggestions
+            .iter()
+            .map(|s| vec![s.path.clone(), s.candidate.clone(), s.confidence.clone()])
+            .collect();
+        c.table(
+            &[
+                col("Unmapped", 2.0, false),
+                col("Possible match", 2.0, false),
+                col("Confidence", 1.0, true),
+            ],
+            &rows,
+            None,
+        );
     }
 }
 
-fn labeled_run(label: &str, value: &str) -> Run {
-    Run::Body(format!("{label}: {value}"))
+fn all_tables(c: &mut Canvas, layout: &Layout) {
+    c.heading("Per-table results", 50.0);
+    if layout.tables.is_empty() {
+        c.muted("No tables were compared.");
+        return;
+    }
+    let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+    let rows: Vec<Vec<String>> = layout
+        .tables
+        .iter()
+        .map(|t| {
+            vec![
+                t.table.clone(),
+                t.level.clone(),
+                t.verdict_word.clone(),
+                dash(&t.old_rows),
+                dash(&t.new_rows),
+                t.missing_rows.clone(),
+                t.extra_rows.clone(),
+                t.changed_rows.clone(),
+            ]
+        })
+        .collect();
+    c.table(
+        &[
+            col("Table", 2.8, false),
+            col("Level", 1.3, false),
+            col("Verdict", 1.9, false),
+            col("Old rows", 1.1, true),
+            col("New rows", 1.1, true),
+            col("Missing", 0.95, true),
+            col("Extra", 0.85, true),
+            col("Changed", 0.95, true),
+        ],
+        &rows,
+        Some(2),
+    );
+}
+
+/// Detail for every table that has more to say than its row in the table:
+/// reasons, bucket counts, changed columns, notes, control totals, keys.
+fn table_details(c: &mut Canvas, layout: &Layout) {
+    let detailed: Vec<&TableSummary> = layout
+        .tables
+        .iter()
+        .filter(|t| {
+            t.verdict_word != "PASS"
+                || !t.changed_columns.is_empty()
+                || !t.plain_words.is_empty()
+                || !t.column_notes.is_empty()
+                || !t.control_totals.is_empty()
+                || !t.keyed_rows.is_empty()
+                || !t.keys.is_empty()
+        })
+        .collect();
+    if detailed.is_empty() {
+        return;
+    }
+    c.heading("Table details", 60.0);
+    for t in detailed {
+        let key_label = if t.keyed_rows.len() == 1 {
+            "Row key".to_string()
+        } else {
+            format!("Row keys ({})", t.keyed_rows.len())
+        };
+        let mut rows: Vec<(&str, String)> = vec![("Level", t.level.clone())];
+        rows.push((
+            "Buckets",
+            format!(
+                "{} differing, {} missing, {} extra",
+                t.differing_buckets, t.missing_buckets, t.extra_buckets
+            ),
+        ));
+        rows.push((
+            "Rows",
+            format!(
+                "{} missing, {} extra, {} changed",
+                t.missing_rows, t.extra_rows, t.changed_rows
+            ),
+        ));
+        if !t.reasons.is_empty() {
+            rows.push(("Reasons", t.reasons.join("; ")));
+        }
+        if !t.changed_columns.is_empty() {
+            rows.push(("Changed columns", t.changed_columns.join(", ")));
+        }
+        for w in &t.plain_words {
+            rows.push(("Note", w.clone()));
+        }
+        for n in &t.column_notes {
+            rows.push(("Column note", n.clone()));
+        }
+        for ct in &t.control_totals {
+            rows.push(("Control total", ct.clone()));
+        }
+        if !t.keys.is_empty() {
+            rows.push(("Keys / covered columns", t.keys.join(", ")));
+        }
+        if !t.keyed_rows.is_empty() {
+            rows.push((&key_label, t.keyed_rows.join(";  ")));
+        }
+        c.ensure(40.0);
+        let top = c.y;
+        let pw = c.pill(MARGIN_X, top, &t.verdict_word);
+        let name_lines = c.wrap(&t.table, CONTENT_W - pw - 10.0, true, 10.5);
+        let mut y = top;
+        for line in &name_lines {
+            c.text(MARGIN_X + pw + 8.0, y + 10.0, line, true, 10.5, INK);
+            y += 14.0;
+        }
+        c.y = y + 4.0;
+        c.key_values(&rows, 120.0, SMALL + 0.5);
+    }
+}
+
+fn connections(c: &mut Canvas, layout: &Layout) {
+    if layout.connections.is_empty() {
+        return;
+    }
+    c.heading("Connections", 40.0);
+    c.bullets(&layout.connections);
+}
+
+fn custom_checks(c: &mut Canvas, layout: &Layout) {
+    if layout.custom_checks.is_empty() && layout.hook_scripts.is_empty() {
+        return;
+    }
+    c.heading("Custom checks (Python hooks)", 40.0);
+    c.muted("These checks are scripts your team supplied. Their results count toward the overall verdict.");
+    if !layout.custom_checks.is_empty() {
+        let rows: Vec<Vec<String>> = layout
+            .custom_checks
+            .iter()
+            .map(|k| {
+                vec![
+                    k.id.clone(),
+                    k.severity.to_uppercase(),
+                    k.table.clone().unwrap_or_else(|| "-".to_string()),
+                    k.message.clone(),
+                ]
+            })
+            .collect();
+        c.table(
+            &[
+                col("Check", 1.2, false),
+                col("Result", 0.9, false),
+                col("Table", 1.8, false),
+                col("Message", 3.0, false),
+            ],
+            &rows,
+            None,
+        );
+    }
+    let warnings: Vec<String> = layout
+        .hook_warnings
+        .iter()
+        .map(|w| format!("hook warning: {w}"))
+        .collect();
+    c.bullets(&warnings);
+    if !layout.hook_scripts.is_empty() {
+        let rows: Vec<(&str, String)> = layout
+            .hook_scripts
+            .iter()
+            .map(|s| ("Script", format!("{}  SHA-256 {}", s.script, s.sha256)))
+            .collect();
+        c.key_values(&rows, 70.0, SMALL);
+    }
+}
+
+fn integrity(c: &mut Canvas, layout: &Layout, results_sha256: &str) {
+    c.heading("Run identity and integrity", 80.0);
+    let mut rows: Vec<(&str, String)> = vec![
+        ("Run ID", layout.run_id.clone()),
+        ("Tool version", layout.tool_version.clone()),
+        ("Results SHA-256", results_sha256.to_string()),
+        ("Mapping hash", layout.mapping_hash.clone()),
+        ("Results schema version", layout.results_version.clone()),
+    ];
+    if !layout.definition_hash.is_empty() {
+        rows.push(("Definition hash", layout.definition_hash.clone()));
+    }
+    if let Some(v) = &layout.capture_sha256_old {
+        rows.push(("Old capture SHA-256", v.clone()));
+    }
+    if let Some(v) = &layout.capture_sha256_new {
+        rows.push(("New capture SHA-256", v.clone()));
+    }
+    if let Some(v) = &layout.wal_start_lsn {
+        rows.push(("Write-ahead log start", v.clone()));
+    }
+    if let Some(v) = &layout.wal_end_lsn {
+        rows.push(("Write-ahead log end", v.clone()));
+    }
+    c.key_values(&rows, 130.0, SMALL + 0.5);
+}
+
+fn limits(c: &mut Canvas) {
+    c.heading("What a PASS does not prove", 40.0);
+    c.para(layout::WHAT_PASS_DOES_NOT_PROVE);
+    c.heading("Limit of the row hashes", 40.0);
+    c.para(layout::MD5_THREAT_MODEL);
+    c.heading("Trust and audit", 40.0);
+    c.para(layout::TAMPER_EVIDENT_NOT_PROOF);
+}
+
+fn sign_off(c: &mut Canvas) {
+    let block = layout::sign_off_block();
+    let (title, statement, fields) = (block[0], block[1], &block[2..]);
+    c.heading(title, 150.0);
+    c.para(statement);
+    c.y += 6.0;
+    // Two columns of signature fields: a label above a line to write on.
+    let gap = 24.0;
+    let w = (CONTENT_W - gap) / 2.0;
+    for pair in fields.chunks(2) {
+        c.ensure(40.0);
+        for (i, field) in pair.iter().enumerate() {
+            let label = field.split(':').next().unwrap_or(field).trim();
+            let x = MARGIN_X + i as f32 * (w + gap);
+            c.text(x, c.y + 10.0, label, true, SMALL, MUTED);
+            c.hline(x, x + w, c.y + 34.0, MUTED, 0.7);
+        }
+        c.y += 46.0;
+    }
 }
 
 /// Make the rendered bytes deterministic by overwriting the wall-clock values
-/// printpdf writes — the Info dictionary's creation/modification dates and the
-/// trailer's random document ID — with fixed same-length values.
+/// printpdf writes (the Info dictionary's creation/modification dates and the
+/// trailer's random document ID) with fixed same-length values.
 fn neutralise_volatile(mut pdf: Vec<u8>) -> Vec<u8> {
     let fixed_date: &[u8] = b"D:19700101000000+00'00'";
     for key in [b"/CreationDate(".as_slice(), b"/ModDate(".as_slice()] {
@@ -595,7 +1216,14 @@ mod tests {
     fn pdf_omits_drilldown_keys_by_default_and_includes_them_when_ticked() {
         let r = fixture();
         let without = build(&r, None, &ReportOptions::default());
-        let with = build(&r, None, &ReportOptions { include_keys: true });
+        let with = build(
+            &r,
+            None,
+            &ReportOptions {
+                include_keys: true,
+                ..Default::default()
+            },
+        );
 
         let t_without = extract_texts(&render_bytes(&without, "abc").unwrap());
         let t_with = extract_texts(&render_bytes(&with, "abc").unwrap());
@@ -682,6 +1310,57 @@ mod tests {
         assert!(any_contains(&texts, "hook.py"), "{texts:?}");
         let joined = texts.concat();
         assert!(joined.contains(&"ab".repeat(32)), "script hash present");
+    }
+
+    #[test]
+    fn pdf_carries_the_check_record_logo_and_page_numbers() {
+        let mut r = fixture();
+        r.started_at = Some("2026-11-18T09:00:00Z".into());
+        r.finished_at = Some("2026-11-18T09:02:05Z".into());
+        r.old_source = Some("bank on old-db:5432 (login dmux)".into());
+        r.new_source = Some("bank on new-db:5432 (login dmux)".into());
+        let r = finalise(r);
+        let opts = ReportOptions {
+            generated_at: Some("2026-11-18T10:00:00Z".into()),
+            ..Default::default()
+        };
+        let bytes = render_bytes(&build(&r, None, &opts), "abc").unwrap();
+        let texts = extract_texts(&bytes);
+        for needle in [
+            "Check record",
+            "18 Nov 2026, 09:00:00 UTC",
+            "18 Nov 2026, 09:02:05 UTC",
+            "2 min 5 s",
+            "18 Nov 2026, 10:00:00 UTC",
+            "bank on old-db:5432 (login dmux)",
+            "Page 1 of",
+            "OVERALL VERDICT",
+        ] {
+            assert!(any_contains(&texts, needle), "{needle} missing: {texts:?}");
+        }
+        assert!(
+            find_bytes(&bytes, b"XLOGO", 0).is_some(),
+            "logo image embedded"
+        );
+    }
+
+    #[test]
+    fn an_older_results_file_says_the_record_was_not_kept() {
+        let layout = build(&fixture(), None, &ReportOptions::default());
+        let texts = extract_texts(&render_bytes(&layout, "abc").unwrap());
+        assert!(any_contains(&texts, "not recorded (older results file)"));
+        // No generated time was given, so none is printed.
+        assert!(!any_contains(&texts, "Report generated"), "{texts:?}");
+    }
+
+    #[test]
+    fn long_text_wraps_inside_the_page() {
+        let mut r = fixture();
+        r.tables.get_mut("demo_bank.accounts").unwrap().reasons = vec!["word ".repeat(400)];
+        let r = finalise(r);
+        let layout = build(&r, None, &ReportOptions::default());
+        let doc = build_document(&layout, "abc").unwrap();
+        assert!(doc.pages.len() >= 2, "long content paginates");
     }
 
     #[test]

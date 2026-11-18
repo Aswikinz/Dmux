@@ -15,6 +15,8 @@
 //!   lists longer than Excel's 1,048,576 row limit overflow to CSV, noted in the
 //!   workbook.
 //! - a run log (`log`): plain text and JSON.
+//! - an interactive HTML report (`html`): one offline file with the PDF's
+//!   content plus search, filters, sorting and expandable per-table detail.
 //!
 //! The engine's report contract is that **no row value ever leaves the database**:
 //! `RunResults` carries counts, hashes and names only, never row data.  This crate
@@ -23,6 +25,7 @@
 //! row values into the fixture and assert they never appear in the PDF text or
 //! the XLSX XML.
 
+pub mod html;
 pub mod layout;
 pub mod log;
 pub mod pdf;
@@ -77,6 +80,8 @@ pub enum ReportError {
     Xlsx(#[from] xlsx::XlsxError),
     #[error("log error: {0}")]
     Log(#[from] log::LogError),
+    #[error("HTML render error: {0}")]
+    Html(#[from] html::HtmlError),
 }
 
 /// Write `bytes` to `path` with owner-only permissions on Unix (audit L3: a
@@ -252,6 +257,7 @@ mod tests {
 
         let options = ReportOptions {
             include_keys: false,
+            ..Default::default()
         };
         render_all(&verification, &options, &pdf, &xlsx, &log).unwrap();
 
@@ -293,6 +299,7 @@ mod tests {
 
         let options = ReportOptions {
             include_keys: false,
+            ..Default::default()
         };
         let layout = build_layout(&verification, &options);
         assert_eq!(
@@ -308,6 +315,7 @@ mod tests {
         let verification = verify::verify_results(&results).unwrap();
         let options = ReportOptions {
             include_keys: false,
+            ..Default::default()
         };
         let layout = build_layout(&verification, &options);
 
@@ -338,6 +346,7 @@ mod tests {
         let log_path = dir.join("report.txt");
         let options = ReportOptions {
             include_keys: false,
+            ..Default::default()
         };
         render_all(&verification, &options, &pdf_path, &xlsx_path, &log_path).unwrap();
         for p in [&pdf_path, &xlsx_path, &log_path] {

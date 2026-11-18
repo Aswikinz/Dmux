@@ -8,9 +8,15 @@ import { ErrorCard } from '../design/ErrorCard';
 import { StatusBadge } from '../design/StatusBadge';
 import { qualifiedVerdictLabel } from '../components/VerdictBanner';
 import { coverageLabel } from './ResultsScreen';
-import { FileSpreadsheet, FileText } from 'lucide-react';
+import { FileCode2, FileSpreadsheet, FileText } from 'lucide-react';
 import type { Engine } from '../api/engine';
 import type { ReportFormat, Results } from '../api/contract';
+
+const FORMAT_LABEL: Record<ReportFormat, string> = {
+  pdf: 'PDF',
+  excel: 'Excel',
+  html: 'HTML',
+};
 
 interface ReportScreenProps {
   engine: Engine;
@@ -36,7 +42,9 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
     };
   }, [engine]);
   const [exporting, setExporting] = useState<ReportFormat | null>(null);
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [resultMessage, setResultMessage] = useState<{ text: string; saved: boolean } | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   async function exportReport(format: ReportFormat) {
@@ -49,15 +57,16 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
         format,
         includeKeys,
       });
-      const label = format === 'pdf' ? 'PDF' : 'Excel';
+      const label = FORMAT_LABEL[format];
       if (res.ok) {
-        setResultMessage(`${label} report saved to ${res.filePath}`);
+        setResultMessage({ text: `${label} report saved to ${res.filePath}`, saved: true });
       } else if (res.cancelled) {
-        setResultMessage(`${label} export cancelled. Nothing was saved.`);
+        setResultMessage({ text: `${label} export cancelled. Nothing was saved.`, saved: false });
       } else if (res.demoOnly) {
-        setResultMessage(
-          `This is the browser demo, so no ${label} file was saved. In the Dmux desktop app, you choose where to save it.`,
-        );
+        setResultMessage({
+          text: `This is the browser demo, so no ${label} file was saved. In the Dmux desktop app, you choose where to save it.`,
+          saved: false,
+        });
       } else {
         setError(res.error ?? 'The report could not be saved.');
       }
@@ -70,7 +79,10 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
 
   return (
     <div className="space-y-6">
-      <ScreenHeader title="Report" subtitle="Save this check as a PDF summary to sign, or as an Excel workbook with the detail." />
+      <ScreenHeader
+        title="Report"
+        subtitle="Save this check as a PDF summary to sign, an Excel workbook with the detail, or a web page you can search and filter."
+      />
       <Panel>
         <div className="flex flex-wrap items-center gap-4">
           <StatusBadge
@@ -122,9 +134,30 @@ export function ReportScreen({ engine, results, onBack, onRestart }: ReportScree
             <FileSpreadsheet className="h-4 w-4" />
             Export Excel
           </Button>
+          <Button
+            onClick={() => exportReport('html')}
+            disabled={exporting !== null}
+            variant="secondary"
+          >
+            <FileCode2 className="h-4 w-4" />
+            Export HTML
+          </Button>
         </div>
+        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+          Every report shows when the check ran, when the report was made and which databases were
+          compared. The HTML report is one file that opens in any browser, works offline, and lets
+          you search, filter and sort the tables.
+        </p>
         {resultMessage && (
-          <p className="mt-3 text-sm text-emerald-700 dark:text-emerald-300">{resultMessage}</p>
+          <p
+            className={
+              resultMessage.saved
+                ? 'mt-3 text-sm text-emerald-700 dark:text-emerald-300'
+                : 'mt-3 text-sm text-slate-700 dark:text-slate-300'
+            }
+          >
+            {resultMessage.text}
+          </p>
         )}
         {error && (
           <ErrorCard title="Export failed" className="mt-3">

@@ -278,6 +278,9 @@ struct ReportArgs {
     /// Write the run log to this path (`.json` for JSON, text otherwise).
     #[arg(long, value_name = "FILE")]
     log: Option<PathBuf>,
+    /// Write the interactive HTML report (search, filters, sorting) to this path.
+    #[arg(long, value_name = "FILE")]
+    html: Option<PathBuf>,
     /// Include key / covered-column names in the detail (default: off).
     #[arg(long)]
     include_keys: bool,
@@ -594,6 +597,7 @@ fn run_report(args: ReportArgs) -> ExitCode {
 
     let options = dmux_report::ReportOptions {
         include_keys: args.include_keys,
+        generated_at: Some(dmux_report::layout::now_utc()),
     };
     let layout = dmux_report::build_layout(&verification, &options);
     let sha256 = verification.sha256;
@@ -622,8 +626,15 @@ fn run_report(args: ReportArgs) -> ExitCode {
         }
     }
 
-    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() {
-        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx and/or --log)");
+    if let Some(html) = args.html.as_deref() {
+        if let Err(e) = dmux_report::html::write_html_layout(&layout, &sha256, html) {
+            eprintln!("dmux report: {e}");
+            return ExitCode::from(EXIT_FAIL);
+        }
+    }
+
+    if args.pdf.is_none() && args.xlsx.is_none() && args.log.is_none() && args.html.is_none() {
+        eprintln!("dmux report: nothing to do (pass --pdf, --xlsx, --html and/or --log)");
         return ExitCode::from(EXIT_FAIL);
     }
 

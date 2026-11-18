@@ -26,6 +26,8 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 hex = "0.4.3"
 thiserror = "2.0.21"
+# Compliance timestamps (check start/end, report generated), same as the engine.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Read a generated .xlsx back (it is a ZIP) to assert keys/row-values never leak.

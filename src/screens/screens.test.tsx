@@ -1194,6 +1194,36 @@ describe('ReportScreen', () => {
     expect(screen.queryByText(/report saved/)).toBeNull();
   });
 
+  it('exports the interactive HTML report for this run', async () => {
+    const exportReport = vi.fn(async () => ({ ok: true, filePath: '/home/u/dmux-run-pass.html' }));
+    const engine: Engine = { ...createMockEngine(), exportReport };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export html/i }));
+    expect(
+      await screen.findByText('HTML report saved to /home/u/dmux-run-pass.html'),
+    ).toBeDefined();
+    expect(exportReport).toHaveBeenCalledWith({
+      runId: 'run-pass',
+      format: 'html',
+      includeKeys: false,
+    });
+  });
+
+  it('does not show a cancelled export in the saved (green) style', async () => {
+    const engine: Engine = {
+      ...createMockEngine(),
+      exportReport: async () => ({ ok: false, cancelled: true }),
+    };
+    wrap(
+      <ReportScreen engine={engine} results={passResults} onBack={() => {}} onRestart={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /export html/i }));
+    const msg = await screen.findByText('HTML export cancelled. Nothing was saved.');
+    expect(msg.className).not.toMatch(/emerald/);
+  });
+
   it('sends the key choice only when the user ticks it', async () => {
     const exportReport = vi.fn(async () => ({ ok: true, filePath: '/r.xlsx' }));
     const engine: Engine = { ...createMockEngine(), exportReport };

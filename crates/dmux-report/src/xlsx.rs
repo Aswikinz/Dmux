@@ -151,6 +151,17 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
                 ),
             ),
             ("Coverage".into(), layout.coverage_line.clone()),
+        ];
+        // The compliance record (when the check ran, which databases), minus
+        // the run ID and version, which follow with the integrity fields.
+        let mut pairs = pairs;
+        pairs.extend(
+            layout::record_rows(layout)
+                .into_iter()
+                .filter(|(k, _)| *k != "Run ID" && *k != "Dmux version")
+                .map(|(k, v)| (k.to_string(), v)),
+        );
+        pairs.extend::<Vec<(String, String)>>(vec![
             ("Fully checked".into(), layout.fully_checked.to_string()),
             ("Counts only".into(), layout.counts_only.to_string()),
             ("Structure only".into(), layout.structure_only.to_string()),
@@ -165,7 +176,7 @@ pub fn build_workbook(layout: &Layout, row_limit: usize) -> Result<BuiltWorkbook
                 layout.results_version.clone(),
             ),
             ("Definition hash".into(), layout.definition_hash.clone()),
-        ];
+        ]);
         for (k, v) in pairs {
             summary.write_string(row, 0, &k)?;
             summary.write_string(row, 1, &v)?;
@@ -579,6 +590,7 @@ mod tests {
             custom_checks: vec![],
             hook_scripts: vec![],
             hook_warnings: vec![],
+            ..Default::default()
         }
     }
 
@@ -764,7 +776,14 @@ mod tests {
             "drill-down key leaked without --include-keys"
         );
 
-        let with_keys = build(&results, None, &ReportOptions { include_keys: true });
+        let with_keys = build(
+            &results,
+            None,
+            &ReportOptions {
+                include_keys: true,
+                ..Default::default()
+            },
+        );
         let with_keys_xml = shared_strings(&workbook_bytes(&with_keys)).unwrap();
         assert!(
             with_keys_xml.contains(SENTINEL),

@@ -23,12 +23,14 @@ use dmux_report::ReportOptions;
 use crate::error::CommandError;
 use crate::state::AppState;
 
-/// The two export formats the Report screen offers.
+/// The export formats the Report screen offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportFormat {
     Pdf,
     Excel,
+    /// The interactive HTML report: one offline file with filters and sorting.
+    Html,
 }
 
 impl ReportFormat {
@@ -36,6 +38,7 @@ impl ReportFormat {
         match self {
             ReportFormat::Pdf => "pdf",
             ReportFormat::Excel => "xlsx",
+            ReportFormat::Html => "html",
         }
     }
 
@@ -43,6 +46,7 @@ impl ReportFormat {
         match self {
             ReportFormat::Pdf => "PDF report",
             ReportFormat::Excel => "Excel workbook",
+            ReportFormat::Html => "HTML report",
         }
     }
 }
@@ -100,7 +104,13 @@ pub(crate) fn verified_layout(
     state: &AppState,
 ) -> Result<(Layout, String), CommandError> {
     let verification = verification_for(run_id, state)?;
-    let layout = dmux_report::build_layout(&verification, &ReportOptions { include_keys });
+    let layout = dmux_report::build_layout(
+        &verification,
+        &ReportOptions {
+            include_keys,
+            generated_at: Some(dmux_report::layout::now_utc()),
+        },
+    );
     Ok((layout, verification.sha256))
 }
 
@@ -137,6 +147,8 @@ pub(crate) fn render_report(
             .map_err(|e| failed(e.to_string())),
         ReportFormat::Excel => dmux_report::xlsx::write_detail_layout(&layout, &sha256, path)
             .map_err(|e| failed(e.to_string())),
+        ReportFormat::Html => dmux_report::html::write_html_layout(&layout, &sha256, path)
+            .map_err(|e| failed(e.to_string())),
     }
 }
 
@@ -151,7 +163,7 @@ fn suggested_name(run_id: &str, format: ReportFormat) -> String {
     format!("dmux-{stem}.{}", format.extension())
 }
 
-/// Export the current run's report as PDF or Excel through a native save
+/// Export the current run's report as PDF, Excel or HTML through a native save
 /// dialog.  The run is checked before the dialog opens, so a run that cannot
 /// be reported never asks for a location.
 #[tauri::command]
@@ -290,13 +302,14 @@ mod tests {
         let s = state();
         let id = finished(&s, Ok(results(Verdict::Pass)));
         assert_eq!(s.runs.phase(&id), Some(RunPhase::Done));
-        for format in [ReportFormat::Pdf, ReportFormat::Excel] {
+        for format in [ReportFormat::Pdf, ReportFormat::Excel, ReportFormat::Html] {
             let path = tmp(&format!("r.{}", format.extension()));
             render_report(&id, format, false, &s, &path).expect("render");
             let bytes = std::fs::read(&path).unwrap();
             match format {
                 ReportFormat::Pdf => assert!(bytes.starts_with(b"%PDF")),
                 ReportFormat::Excel => assert!(bytes.starts_with(b"PK")),
+                ReportFormat::Html => assert!(bytes.starts_with(b"<!doctype html>")),
             }
         }
         // The layout comes from the engine-held results.
@@ -311,7 +324,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let s = state();
         let id = finished(&s, Ok(results(Verdict::Fail)));
-        for format in [ReportFormat::Pdf, ReportFormat::Excel] {
+        for format in [ReportFormat::Pdf, ReportFormat::Excel, ReportFormat::Html] {
             let path = tmp(&format!("m.{}", format.extension()));
             render_report(&id, format, false, &s, &path).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -487,6 +500,9 @@ mod tests {
         let input: ExportReportInput =
             serde_json::from_str(r#"{"run_id":"run-1","format":"pdf"}"#).unwrap();
         assert!(!input.include_keys);
+        let html: ExportReportInput =
+            serde_json::from_str(r#"{"run_id":"run-1","format":"html"}"#).unwrap();
+        assert_eq!(html.format, ReportFormat::Html);
     }
 
     #[test]

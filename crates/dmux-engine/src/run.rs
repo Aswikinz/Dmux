@@ -548,7 +548,8 @@ pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
             "the parallel-scan limits must be at least 1".into(),
         ));
     }
-    match (&config.old, &config.new) {
+    let started = jiff::Timestamp::now();
+    let outcome = match (&config.old, &config.new) {
         (Input::Live(o), Input::Live(n)) => run_live(config, o, n).await,
         (Input::File(o), Input::File(n)) => compare_files::compare_two_files_with(o, n, config),
         (Input::File(f), Input::Live(p)) => {
@@ -557,7 +558,45 @@ pub async fn run(config: &RunConfig) -> Result<RunOutcome, RunError> {
         (Input::Live(p), Input::File(f)) => {
             compare_files::compare_file_to_live(f, Side::New, p, config).await
         }
+    }?;
+    Ok(stamp_record(
+        outcome,
+        started,
+        jiff::Timestamp::now(),
+        &config.old,
+        &config.new,
+    ))
+}
+
+/// A UTC instant as RFC 3339 with whole seconds ("2026-11-18T09:14:03Z").
+pub fn utc_rfc3339(t: jiff::Timestamp) -> String {
+    t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// One side in plain words for the compliance record.  Never the password.
+pub fn source_label(input: &Input) -> String {
+    match input {
+        Input::Live(p) => format!("{} on {}:{} (login {})", p.dbname, p.host, p.port, p.user),
+        Input::File(f) => format!("saved capture file (made by Dmux {})", f.tool_version),
     }
+}
+
+/// Record when the check ran and what it compared, then re-stamp the results
+/// SHA-256 so the file stays self-verifying.  The verdict is untouched.
+pub(crate) fn stamp_record(
+    mut outcome: RunOutcome,
+    started: jiff::Timestamp,
+    finished: jiff::Timestamp,
+    old: &Input,
+    new: &Input,
+) -> RunOutcome {
+    let r = &mut outcome.results;
+    r.started_at = Some(utc_rfc3339(started));
+    r.finished_at = Some(utc_rfc3339(finished));
+    r.old_source = Some(source_label(old));
+    r.new_source = Some(source_label(new));
+    outcome.results = crate::results::finalise(std::mem::take(&mut outcome.results));
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,6 +2091,54 @@ async fn spot_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live(password: &str) -> Input {
+        Input::Live(ConnProfile::new(
+            "db1.internal",
+            5432,
+            "bank",
+            "dmux_reader",
+            password,
+            crate::db::TlsMode::VerifyFull,
+        ))
+    }
+
+    #[test]
+    fn the_record_names_both_sides_and_the_times_but_never_a_password() {
+        // Built at runtime: no credential literal reaches a password parameter.
+        let secret: String = ["pw", "-", "sentinel", "-", "77"].concat();
+        let outcome = RunOutcome {
+            results: crate::results::finalise(RunResults::default()),
+            exit_code: 0,
+        };
+        let started = jiff::Timestamp::from_second(1_795_000_000).unwrap();
+        let finished = jiff::Timestamp::from_second(1_795_000_125).unwrap();
+        let out = stamp_record(outcome, started, finished, &live(&secret), &live(&secret));
+        let r = &out.results;
+        assert_eq!(r.started_at.as_deref(), Some("2026-11-18T11:06:40Z"));
+        assert_eq!(r.finished_at.as_deref(), Some("2026-11-18T11:08:45Z"));
+        assert_eq!(
+            r.old_source.as_deref(),
+            Some("bank on db1.internal:5432 (login dmux_reader)")
+        );
+        let json = serde_json::to_string(r).unwrap();
+        assert!(!json.contains(&secret), "password leaked into results");
+        // The SHA-256 is re-stamped over the new fields.
+        assert_eq!(r.results_sha256, crate::results::sha256_of(r));
+    }
+
+    #[test]
+    fn a_results_file_without_the_record_still_verifies() {
+        let r = crate::results::finalise(RunResults::default());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("started_at"),
+            "absent fields are not written"
+        );
+        let back: RunResults = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.started_at, None);
+        assert_eq!(back.results_sha256, crate::results::sha256_of(&back));
+    }
 
     fn mapping(
         old: crate::core::normalise::PgType,
