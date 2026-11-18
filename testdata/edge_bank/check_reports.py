@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """edge_bank: check that every report tells the truth, in every leave-out choice.
 
-    python3 testdata/edge_bank/check_reports.py <dmux binary> <results.json> <out dir>
+    python3 testdata/edge_bank/check_reports.py <results.json> <out dir>
+
+The dmux binary is always this checkout's own build (the newer of target/release/dmux
+and target/debug/dmux). The results file and the output folder must be inside this
+checkout or the system temp folder; anything else is refused.
 
 Owner tool (not a CI test). It classifies every table straight from the results
 file (data difference, not mapped, structure, other, pass), renders the HTML and
@@ -14,9 +18,34 @@ Excel reports for all 16 combinations of --leave-out, and checks that:
   - the tiles and the workbook agree with the results file.
 It exits 1 and lists each problem when any check fails.
 """
-import json, re, subprocess, sys, itertools, zipfile, html as htmllib, os
-DMUX, RES, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
-r = json.load(open(RES))
+import json, re, subprocess, sys, itertools, zipfile, html as htmllib, os, tempfile
+
+ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+ALLOWED = [ROOT, os.path.realpath(tempfile.gettempdir())]
+
+
+def inside_allowed(arg, want_dir):
+    """The real path of a command-line path, refused unless it lies inside this
+    checkout or the temp folder and is an existing file (or folder)."""
+    path = os.path.realpath(arg)
+    if not any(path == base or path.startswith(base + os.sep) for base in ALLOWED):
+        sys.exit(f"refused: {arg} is outside this checkout and the temp folder")
+    if not (os.path.isdir(path) if want_dir else os.path.isfile(path)):
+        sys.exit(f"refused: {arg} is not an existing {'folder' if want_dir else 'file'}")
+    return path
+
+
+if len(sys.argv) != 3:
+    sys.exit(__doc__)
+# The newest of this checkout's own builds, so a stale release binary is never used.
+BUILDS = [b for b in (os.path.join(ROOT, 'target', d, 'dmux') for d in ('release', 'debug')) if os.access(b, os.X_OK)]
+DMUX = max(BUILDS, key=os.path.getmtime) if BUILDS else None
+if DMUX is None:
+    sys.exit("build dmux first: cargo build -p dmux-cli")
+RES = inside_allowed(sys.argv[1], want_dir=False)
+OUT = inside_allowed(sys.argv[2], want_dir=True)
+with open(RES) as f:
+    r = json.load(f)
 fails = []
 def bad(msg): fails.append(msg)
 
@@ -48,11 +77,12 @@ for combo in itertools.product([0, 1], repeat=4):
     st, ot, wa, pa = combo
     parts = [n for n, on in zip(('structure', 'other', 'warnings', 'passing'), combo) if on]
     tag = ','.join(parts) or 'nothing'
-    html_p, xlsx_p = f"{OUT}/r-{tag}.html", f"{OUT}/r-{tag}.xlsx"
+    html_p, xlsx_p = os.path.join(OUT, f"r-{tag}.html"), os.path.join(OUT, f"r-{tag}.xlsx")
     args = [DMUX, 'report', '--results', RES, '--html', html_p, '--xlsx', xlsx_p]
     if parts: args += ['--leave-out', ','.join(parts)]
     subprocess.run(args, check=True, capture_output=True)
-    h = open(html_p).read()
+    with open(html_p) as f:
+        h = f.read()
 
     # expected kept tables (data and not-mapped always)
     def kept(p):
