@@ -3,15 +3,48 @@
 All notable changes to Dmux. Dates are release dates; versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.3.1 (2026-11-18)
 
-### Fixed
+Data differences first, everywhere, and less noise.
+
+### Results
+
+- Every failure says what kind of problem it is: **data differences** (rows or values
+  differ), **structure differences**, or **other reasons** (a tool fault, data changing
+  during the check, an item to review). Data differences are listed first. A table that
+  changed during the check is never counted as a data difference.
+- A **Kind of problem** filter with an **Only data differences** button sits next to the
+  verdict filter. The screen says how many results are hidden; the verdict never changes.
+
+### Reports
+
+- **What goes into the report** on the Report screen: data differences are always included
+  and always first; structure differences, other failures, warnings and tables that passed
+  can each be left out, or press **Only data differences**. Whatever is left out is named
+  on the report's first page, and the verdict, coverage and counts still include it. The
+  run log always lists everything. On the command line: `dmux report --leave-out
+  structure,other,warnings,passing`.
+- The PDF and HTML reports open with a **Data differences** section, then **Other
+  failures** grouped by kind, and two new tiles: data differences and other failures. The
+  Excel workbook has a "Kind of problem" column.
+- The HTML report has a search and filter bar for the whole report, which stays in view as
+  you scroll: one search box across failures, tables, structure findings, ignored items
+  and warnings, a box per kind, and **Only data differences**.
+
+### Compare structure
+
+- A **Show** filter hides indexes and constraints, or other PostgreSQL objects
+  (extensions, functions, sequences, views, triggers), so table and column changes stand
+  out. **Tables and columns only** does it in one click, and the count says how many
+  differences are in the hidden kinds.
+
+### Choose checks
 
 - After a run, going back to Choose checks, changing the tables or levels and pressing
-  **Run** starts a new run. Before, it showed the finished run again. Changing the choices
-  also clears the old run's results from the steps (they stay in History), and a run that
-  is still going is never left running unseen: Run takes you back to it, and the screen
-  says so.
+  **Run** starts a new run. Before, it showed the finished run again. A run that is still
+  going is never left running unseen: Run takes you back to it.
+- Both search boxes are labelled, and the list of levels can be searched by level ("full
+  values") or by control-total column ("amount") as well as by name.
 
 ## 1.3.0 (2026-11-18)
 
